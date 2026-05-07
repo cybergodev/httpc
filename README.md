@@ -9,7 +9,7 @@
 
 A fast, secure HTTP client library for Go with sensible defaults, minimal dependencies, and built-in resilience.
 
-**[中文文档](README_zh-CN.md)**
+**[中文文档](README_zh-CN.md)** | **[www.cybergo.dev/httpc](https://www.cybergo.dev/httpc)**
 
 ---
 

@@ -967,9 +967,168 @@ func TestWriteDownloadBody_ChecksumVerification(t *testing.T) {
 	})
 }
 
-func TestDownloadConfig_DefaultChecksumAlgorithm(t *testing.T) {
-	cfg := DefaultDownloadConfig()
-	if cfg.ChecksumAlgorithm != ChecksumSHA256 {
-		t.Errorf("default checksum algorithm should be sha256, got: %s", cfg.ChecksumAlgorithm)
+// ============================================================================
+// Boundary condition tests for download helpers
+// ============================================================================
+
+func TestCalculateSpeed_BoundaryConditions(t *testing.T) {
+	tests := []struct {
+		name     string
+		bytes    int64
+		duration time.Duration
+		want     float64
+	}{
+		{"zero duration", 1024, 0, 0},
+		{"zero bytes", 0, time.Second, 0},
+		{"1 second", 1024, time.Second, 1024},
+		{"500ms", 512, 500 * time.Millisecond, 1024},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := calculateSpeed(tt.bytes, tt.duration)
+			if tt.want == 0 && got != 0 {
+				t.Errorf("calculateSpeed() = %v, want 0", got)
+			} else if tt.want > 0 && got <= 0 {
+				t.Errorf("calculateSpeed() = %v, want > 0", got)
+			}
+		})
+	}
+}
+
+func TestProgressWriter_BoundaryConditions(t *testing.T) {
+	t.Run("write triggers callback after interval", func(t *testing.T) {
+		var callbackCalled bool
+		var callbackOffset, callbackTotal int64
+		var callbackSpeed float64
+
+		pw := &progressWriter{
+			w: io.Discard,
+			callback: func(offset, total int64, speed float64) {
+				callbackCalled = true
+				callbackOffset = offset
+				callbackTotal = total
+				callbackSpeed = speed
+			},
+			total:        2048,
+			startTime:    time.Now().Add(-500 * time.Millisecond),
+			lastCallback: time.Now().Add(-500 * time.Millisecond), // Old enough to trigger
+		}
+
+		data := make([]byte, 1024)
+		n, err := pw.Write(data)
+		if err != nil {
+			t.Fatalf("Write() error: %v", err)
+		}
+		if n != 1024 {
+			t.Errorf("Write() = %d, want 1024", n)
+		}
+		if !callbackCalled {
+			t.Error("expected progress callback to be called")
+		}
+		if callbackTotal != 2048 {
+			t.Errorf("callback total = %d, want 2048", callbackTotal)
+		}
+		if callbackOffset != 1024 {
+			t.Errorf("callback offset = %d, want 1024", callbackOffset)
+		}
+		if callbackSpeed <= 0 {
+			t.Error("callback speed should be > 0")
+		}
+	})
+
+	t.Run("write skips callback if interval not elapsed", func(t *testing.T) {
+		var callCount int
+		now := time.Now()
+		pw := &progressWriter{
+			w: io.Discard,
+			callback: func(offset, total int64, speed float64) {
+				callCount++
+			},
+			total:        2048,
+			startTime:    now,
+			lastCallback: now, // Just called, should not trigger again
+		}
+
+		data := make([]byte, 100)
+		_, _ = pw.Write(data)
+		if callCount != 0 {
+			t.Error("callback should not fire within progressInterval")
+		}
+	})
+
+	t.Run("zero-length write no callback", func(t *testing.T) {
+		var called bool
+		now := time.Now().Add(-1 * time.Second)
+		pw := &progressWriter{
+			w: io.Discard,
+			callback: func(offset, total int64, speed float64) {
+				called = true
+			},
+			total:        100,
+			startTime:    now,
+			lastCallback: now,
+		}
+
+		n, err := pw.Write([]byte{})
+		if err != nil {
+			t.Fatalf("Write() error: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("Write() = %d, want 0", n)
+		}
+		if called {
+			t.Error("no callback expected for zero-length write")
+		}
+	})
+}
+
+func TestGetSystemPaths_TableDriven(t *testing.T) {
+	paths := getSystemPaths()
+	if len(paths) == 0 {
+		t.Error("getSystemPaths() should return at least one path")
+	}
+
+	// Verify all paths end with separator
+	for _, p := range paths {
+		if !(strings.HasPrefix(p, "%") && strings.HasSuffix(p, "%")) && !strings.HasSuffix(p, "/") && !strings.HasSuffix(p, "\\") {
+			t.Errorf("system path %q should end with separator", p)
+		}
+	}
+}
+
+func TestIsSystemPath_CurrentDirectory(t *testing.T) {
+	// Current working directory should NOT be a system path
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Skip("cannot get cwd")
+	}
+	if isSystemPath(cwd) {
+		t.Errorf("CWD %q should not be a system path", cwd)
+	}
+}
+
+func TestPrepareFilePath_BoundaryConditions(t *testing.T) {
+	tests := []struct {
+		name    string
+		path    string
+		wantErr bool
+	}{
+		{"empty path", "", true},
+		{"path too long", strings.Repeat("a", 4097), true},
+		{"max length path", strings.Repeat("a", 4096), false},
+		{"UNC path forward slash", "//server/share/file", true},
+		{"UNC path backslash", "\\\\server\\share", true},
+		{"control char", "file\x00name", true},
+		{"DEL char", "file\x7fname", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := prepareFilePath(tt.path)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("prepareFilePath(%q) error = %v, wantErr %v", tt.path[:min(len(tt.path), 30)], err, tt.wantErr)
+			}
+		})
 	}
 }

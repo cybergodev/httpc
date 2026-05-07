@@ -716,3 +716,105 @@ func TestValidateConfig_AdditionalBoundaries(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================================
+// Boundary condition tests for config_convert helpers
+// ============================================================================
+
+func TestParseExemptCIDRs_TableDriven(t *testing.T) {
+	tests := []struct {
+		name    string
+		cidrs   []string
+		wantLen int
+		wantErr bool
+	}{
+		{"nil slice", nil, 0, false},
+		{"empty slice", []string{}, 0, false},
+		{"valid CIDR", []string{"10.0.0.0/8"}, 1, false},
+		{"multiple valid", []string{"10.0.0.0/8", "172.16.0.0/12"}, 2, false},
+		{"invalid CIDR", []string{"not-a-cidr"}, 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			nets, err := parseExemptCIDRs(tt.cidrs)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseExemptCIDRs(%v) error = %v, wantErr %v", tt.cidrs, err, tt.wantErr)
+				return
+			}
+			if len(nets) != tt.wantLen {
+				t.Errorf("parseExemptCIDRs(%v) returned %d nets, want %d", tt.cidrs, len(nets), tt.wantLen)
+			}
+		})
+	}
+}
+
+func TestCalculateIdleConnsPerHost_TableDriven(t *testing.T) {
+	tests := []struct {
+		name            string
+		maxConnsPerHost int
+		want            int
+	}{
+		{"unlimited uses cap", 0, 10},
+		{"very small rounds to min", 1, 2},
+		{"small rounds to min", 3, 2},
+		{"medium value halved", 8, 4},
+		{"large capped", 30, 10},
+		{"exact min", 4, 2},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := calculateIdleConnsPerHost(tt.maxConnsPerHost)
+			if got != tt.want {
+				t.Errorf("calculateIdleConnsPerHost(%d) = %d, want %d", tt.maxConnsPerHost, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCalculateMaxRetryDelay_TableDriven(t *testing.T) {
+	tests := []struct {
+		name    string
+		delay   time.Duration
+		backoff float64
+		wantMin time.Duration
+		wantMax time.Duration
+	}{
+		{"zero delay uses default", 0, 2.0, 5 * time.Second, 5 * time.Second},
+		{"zero backoff uses default", 100 * time.Millisecond, 0, 5 * time.Second, 5 * time.Second},
+		{"small product uses default min", 100 * time.Millisecond, 1.0, 5 * time.Second, 5 * time.Second},
+		{"medium product", 1 * time.Second, 2.0, 6 * time.Second, 7 * time.Second},
+		{"large product capped at absolute max", 10 * time.Second, 5.0, 30 * time.Second, 30 * time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{}
+			cfg.Retry.Delay = tt.delay
+			cfg.Retry.BackoffFactor = tt.backoff
+			got := calculateMaxRetryDelay(cfg)
+			if got < tt.wantMin || got > tt.wantMax {
+				t.Errorf("calculateMaxRetryDelay() = %v, want between %v and %v", got, tt.wantMin, tt.wantMax)
+			}
+		})
+	}
+}
+
+func TestIsTestEnvironment(t *testing.T) {
+	// In test environment, should return true
+	if !isTestEnvironment() {
+		t.Error("isTestEnvironment() should return true during testing")
+	}
+}
+
+func TestConvertToEngineConfig_NilConfig(t *testing.T) {
+	// nil config should use defaults
+	engCfg, err := convertToEngineConfig(nil)
+	if err != nil {
+		t.Fatalf("convertToEngineConfig(nil) error: %v", err)
+	}
+	if engCfg == nil {
+		t.Fatal("expected non-nil engine config")
+	}
+}

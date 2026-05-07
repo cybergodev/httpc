@@ -209,8 +209,7 @@ func (c *certificatePinnerChain) VerifyPeerCertificate(rawCerts [][]byte, verifi
 	return fmt.Errorf("certificate pinning failed: no pinner matched")
 }
 
-// noOpPinner is a pinner that accepts all certificates.
-// Exported for testing only. Do NOT use in production.
+// noOpPinner accepts all certificates. For testing only.
 type noOpPinner struct{}
 
 // Pin returns "no-op" to indicate no pinning.

@@ -380,53 +380,6 @@ func TestClient_ErrorHandling(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// Utility Function Tests
-// ----------------------------------------------------------------------------
-
-func TestUtilityFunctions(t *testing.T) {
-	t.Run("FormatBytes", func(t *testing.T) {
-		tests := []struct {
-			input    int64
-			expected string
-		}{
-			{0, "0 B"},
-			{512, "512 B"},
-			{1024, "1.00 KB"},
-			{1536, "1.50 KB"},
-			{1048576, "1.00 MB"},
-			{1073741824, "1.00 GB"},
-		}
-
-		for _, test := range tests {
-			result := FormatBytes(test.input)
-			if result != test.expected {
-				t.Errorf("FormatBytes(%d) = %s, expected %s", test.input, result, test.expected)
-			}
-		}
-	})
-
-	t.Run("FormatSpeed", func(t *testing.T) {
-		tests := []struct {
-			input    float64
-			expected string
-		}{
-			{0, "0 B/s"},
-			{512, "512 B/s"},
-			{1024, "1.00 KB/s"},
-			{1048576, "1.00 MB/s"},
-		}
-
-		for _, test := range tests {
-			result := FormatSpeed(test.input)
-			if result != test.expected {
-				t.Errorf("FormatSpeed(%f) = %s, expected %s", test.input, result, test.expected)
-			}
-		}
-	})
-
-}
-
-// ----------------------------------------------------------------------------
 // Result Pool Tests
 // ----------------------------------------------------------------------------
 

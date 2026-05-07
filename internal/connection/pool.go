@@ -610,7 +610,14 @@ func (pm *PoolManager) evictStaleHosts() {
 	pm.hostConns.Range(func(key, value any) bool {
 		if stats, ok := value.(*hostStats); ok && stats != nil {
 			if atomic.LoadInt64(&stats.LastUsed) < cutoff && atomic.LoadInt64(&stats.ActiveConns) == 0 {
-				pm.hostConns.Delete(key)
+				// Use LoadAndDelete to atomically remove the entry. If a concurrent
+				// connection incremented ActiveConns between the check above and here,
+				// re-insert the entry to avoid orphaning in-use stats.
+				if oldStats, loaded := pm.hostConns.LoadAndDelete(key); loaded {
+					if s, ok := oldStats.(*hostStats); ok && atomic.LoadInt64(&s.ActiveConns) > 0 {
+						pm.hostConns.Store(key, oldStats)
+					}
+				}
 			}
 		}
 		return true
@@ -622,15 +629,19 @@ func (pm *PoolManager) GetTransport() *http.Transport {
 }
 
 func (pm *PoolManager) GetMetrics() metrics {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
 	total := atomic.LoadInt64(&pm.totalConns)
 	rejected := atomic.LoadInt64(&pm.rejectedConns)
+	active := atomic.LoadInt64(&pm.activeConns)
 	hitRate := 0.0
 	if total+rejected > 0 {
 		hitRate = float64(total) / float64(total+rejected)
 	}
 
 	return metrics{
-		ActiveConnections:   atomic.LoadInt64(&pm.activeConns),
+		ActiveConnections:   active,
 		TotalConnections:    total,
 		RejectedConnections: rejected,
 		ConnectionHitRate:   hitRate,

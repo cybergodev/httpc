@@ -4,6 +4,32 @@ All notable changes to the cybergodev/httpc library will be documented in this f
 
 ---
 
+## v1.4.2 - Bug Fixes, Concurrency Safety & Code Quality (2026-05-07)
+
+### Fixed
+- ErrClientClosed sentinel not detectable via `errors.Is()` — bare string wrapping replaced with `%w`
+- URL cache storing sensitive query parameter values (token, api_key, password, etc.) as raw map keys
+- Custom TLS configurations (CA certs, client certs, cipher suites) silently ignored — TLSConfig not forwarded to connection pool
+- Non-transactional `GetMetrics()` producing inconsistent snapshots (e.g., activeConns > totalConns) under concurrent reads
+- hostStats eviction race orphaning entries when connections acquired during eviction window
+- Nil pointer dereference in security request pool test when `getSecurityRequest` returns nil
+- Duplicate sensitive query param map in engine missing entries (`idtoken`, `private-key`)
+- Misaligned indentation in streaming response block (merge artifact)
+- Misleading "Exported" comment on unexported `noOpPinner`
+
+### Changed
+- Replaced custom `roundTripper` interface with stdlib `http.RoundTripper` in transport manager
+- Added `maxDepth=32` guard to symlink directory check preventing unbounded recursion
+- Removed hardcoded function count from `doc.go` to prevent staleness
+- Consolidated test coverage: removed duplicates, added boundary and nil-receiver tests
+- Applied `gofmt` formatting across all `.go` files
+
+### Removed
+- 7 unused engine verb methods (get/post/put/patch/delete/head/options) — tests use `client.Request` directly
+- 2 redundant test files (`coverage_gap_test.go`, `response_test.go`) merged into `coverage_test.go`
+
+---
+
 ## v1.4.1 - Bug Fixes, Concurrency Safety & Performance (2026-04-28)
 
 ### Fixed

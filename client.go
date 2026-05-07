@@ -322,7 +322,7 @@ var middlewareRequestPool = sync.Pool{
 // release the response via engine.ReleaseResponse() or convert it via convertResponseToResult().
 func (c *clientImpl) executeRequest(ctx context.Context, method, url string, options []RequestOption) (ResponseMutator, error) {
 	if c.engine.IsClosed() {
-		return nil, fmt.Errorf("client is closed")
+		return nil, fmt.Errorf("%w", ErrClientClosed)
 	}
 	if !c.hasMiddlewares {
 		return c.engine.Request(ctx, method, url, options...)

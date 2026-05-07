@@ -497,7 +497,7 @@ func prepareFilePath(filePath string) (string, error) {
 	// This prevents TOCTOU attacks where a directory is replaced with a symlink
 	dir := filepath.Dir(absPath)
 	if dir != absPath { // Avoid infinite recursion at root
-		if err := checkParentDirSymlinks(dir); err != nil {
+		if err := checkParentDirSymlinks(dir, 0); err != nil {
 			return "", err
 		}
 	}
@@ -511,8 +511,13 @@ func prepareFilePath(filePath string) (string, error) {
 }
 
 // checkParentDirSymlinks recursively checks if any parent directory is a symlink
-// to prevent symlink-based path traversal attacks
-func checkParentDirSymlinks(dir string) error {
+// to prevent symlink-based path traversal attacks.
+func checkParentDirSymlinks(dir string, depth int) error {
+	const maxDepth = 32
+	if depth > maxDepth {
+		return fmt.Errorf("directory depth limit exceeded")
+	}
+
 	// Resolve the directory to its real path
 	resolvedDir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
@@ -521,7 +526,7 @@ func checkParentDirSymlinks(dir string) error {
 			// Check parent recursively
 			parent := filepath.Dir(dir)
 			if parent != dir {
-				return checkParentDirSymlinks(parent)
+				return checkParentDirSymlinks(parent, depth+1)
 			}
 			return nil
 		}

@@ -36,6 +36,12 @@ func IsSensitiveQueryParam(name string) bool {
 	return sensitiveQueryParamNames[strings.ToLower(name)]
 }
 
+// SensitiveQueryParamNames returns the set of sensitive query parameter names.
+// Used internally to check URLs for sensitive content without importing the map directly.
+func SensitiveQueryParamNames() map[string]bool {
+	return sensitiveQueryParamNames
+}
+
 // SanitizeURL removes credentials and redacts sensitive query parameters from a URL
 // for safe logging. URLs with credentials are transformed from user:pass@host to
 // ***:***@host. Sensitive query parameters (token, api_key, password, etc.) have

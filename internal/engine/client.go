@@ -337,6 +337,7 @@ func NewClient(config *Config, opts ...clientOption) (*Client, error) {
 		connConfig.ExemptNets = config.ExemptNets
 		connConfig.EnableDoH = config.EnableDoH
 		connConfig.DoHCacheTTL = config.DoHCacheTTL
+		connConfig.TLSConfig = config.TLSConfig
 
 		if config.CertificatePinner != nil {
 			connConfig.SetCertPinner(config.CertificatePinner)
@@ -463,35 +464,6 @@ func (c *Client) getExecRequest() *Request {
 // putExecRequest returns a Request object to the exec pool
 func (c *Client) putExecRequest(req *Request) {
 	c.execRequestPool.put(req)
-}
-
-// Internal convenience methods — thin wrappers over Request for use by tests within this package.
-func (c *Client) get(url string, options ...RequestOption) (*Response, error) {
-	return c.Request(backgroundCtx, "GET", url, options...)
-}
-
-func (c *Client) post(url string, options ...RequestOption) (*Response, error) {
-	return c.Request(backgroundCtx, "POST", url, options...)
-}
-
-func (c *Client) put(url string, options ...RequestOption) (*Response, error) {
-	return c.Request(backgroundCtx, "PUT", url, options...)
-}
-
-func (c *Client) patch(url string, options ...RequestOption) (*Response, error) {
-	return c.Request(backgroundCtx, "PATCH", url, options...)
-}
-
-func (c *Client) delete(url string, options ...RequestOption) (*Response, error) {
-	return c.Request(backgroundCtx, "DELETE", url, options...)
-}
-
-func (c *Client) head(url string, options ...RequestOption) (*Response, error) {
-	return c.Request(backgroundCtx, "HEAD", url, options...)
-}
-
-func (c *Client) options(url string, options ...RequestOption) (*Response, error) {
-	return c.Request(backgroundCtx, "OPTIONS", url, options...)
 }
 
 func (c *Client) sleepWithContext(ctx context.Context, duration time.Duration) error {
@@ -781,11 +753,11 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 		resp.SetProto(httpResp.Proto)
 		resp.SetCookies(httpResp.Cookies())
 		streamLimit := c.config.MaxResponseBodySize
-	if streamLimit <= 0 {
-		streamLimit = defaultMaxDecompressedSize
-	}
-	lr := getLimitReader(httpResp.Body, streamLimit)
-	resp.rawBodyReader = &streamBodyReader{reader: lr, source: httpResp.Body}
+		if streamLimit <= 0 {
+			streamLimit = defaultMaxDecompressedSize
+		}
+		lr := getLimitReader(httpResp.Body, streamLimit)
+		resp.rawBodyReader = &streamBodyReader{reader: lr, source: httpResp.Body}
 		resp.cancelFunc = streamCancel
 		setCancelFuncToNil() // Prevent deferred cancel; ReleaseResponse handles cleanup
 
