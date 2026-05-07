@@ -9,7 +9,7 @@
 
 一个快速、安全的 Go HTTP 客户端库，具备合理的默认配置、极简依赖和内置弹性机制。
 
-**[English Document](README.md)**
+**[English Documentation](README.md)** | **[www.cybergo.dev/httpc](https://www.cybergo.dev/httpc)**
 
 ---
 

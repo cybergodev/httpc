@@ -1,5 +1,5 @@
-// Package httpc provides a high-performance HTTP client library with enterprise-grade
-// security and production-ready defaults.
+// Package httpc provides a high-performance HTTP client library with secure
+// defaults.
 //
 // # Key Features
 //
@@ -56,7 +56,7 @@
 //
 // # Request Options
 //
-// Core options (26 functions):
+// Core options:
 //
 //	// Headers
 //	httpc.WithHeader("Authorization", "Bearer token")

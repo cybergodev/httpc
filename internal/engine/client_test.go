@@ -155,7 +155,7 @@ func TestClient_RequestWithOptions(t *testing.T) {
 		return nil
 	}
 
-	resp, err := client.get(server.URL, headerOption)
+	resp, err := client.Request(backgroundCtx, "GET", server.URL, headerOption)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -241,7 +241,7 @@ func TestClient_ConcurrentRequests(t *testing.T) {
 
 	for i := 0; i < numRequests; i++ {
 		go func() {
-			_, err := client.get(server.URL)
+			_, err := client.Request(backgroundCtx, "GET", server.URL)
 			results <- err
 		}()
 	}
@@ -279,7 +279,7 @@ func TestClient_TLSConfig(t *testing.T) {
 	}
 	defer func() { _ = client.Close() }()
 
-	resp, err := client.get(server.URL)
+	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	if err != nil {
 		t.Fatalf("HTTPS request failed: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestClient_LargeResponse(t *testing.T) {
 	}
 	defer func() { _ = client.Close() }()
 
-	resp, err := client.get(server.URL)
+	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -332,14 +332,13 @@ func TestClient_ConvenienceMethods(t *testing.T) {
 	methods := []struct {
 		name   string
 		method string
-		fn     func(*Client, string, ...RequestOption) (*Response, error)
 	}{
-		{"Post", "POST", (*Client).post},
-		{"Put", "PUT", (*Client).put},
-		{"Patch", "PATCH", (*Client).patch},
-		{"Delete", "DELETE", (*Client).delete},
-		{"Head", "HEAD", (*Client).head},
-		{"Options", "OPTIONS", (*Client).options},
+		{"Post", "POST"},
+		{"Put", "PUT"},
+		{"Patch", "PATCH"},
+		{"Delete", "DELETE"},
+		{"Head", "HEAD"},
+		{"Options", "OPTIONS"},
 	}
 
 	for _, tt := range methods {
@@ -363,7 +362,7 @@ func TestClient_ConvenienceMethods(t *testing.T) {
 			}
 			defer client.Close()
 
-			resp, err := tt.fn(client, server.URL)
+			resp, err := client.Request(backgroundCtx, tt.method, server.URL)
 			if err != nil {
 				t.Fatalf("%s failed: %v", tt.name, err)
 			}
@@ -582,7 +581,7 @@ func TestClient_ResponseProcessing(t *testing.T) {
 			}
 			defer client.Close()
 
-			resp, err := client.get(server.URL)
+			resp, err := client.Request(backgroundCtx, "GET", server.URL)
 			if err != nil {
 				t.Fatalf("Request failed: %v", err)
 			}
@@ -673,7 +672,7 @@ func TestClient_ErrorHandling(t *testing.T) {
 			}
 			defer client.Close()
 
-			_, err = client.get(server.URL)
+			_, err = client.Request(backgroundCtx, "GET", server.URL)
 
 			if tt.expectError && err == nil {
 				t.Error("Expected error, got nil")
@@ -754,7 +753,7 @@ func TestClient_OnResponseErrorReleasesResponse(t *testing.T) {
 	}
 
 	// This should return error but NOT leak the pooled Response
-	_, err = client.get(server.URL, onRespOption)
+	_, err = client.Request(backgroundCtx, "GET", server.URL, onRespOption)
 	if err == nil {
 		t.Fatal("expected error from onResponse callback")
 	}
@@ -763,7 +762,7 @@ func TestClient_OnResponseErrorReleasesResponse(t *testing.T) {
 	}
 
 	// Verify the response pool is still functional by making another request
-	resp, err := client.get(server.URL)
+	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	if err != nil {
 		t.Fatalf("subsequent request failed: %v", err)
 	}

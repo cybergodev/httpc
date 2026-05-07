@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/cybergodev/httpc/internal/types"
+	"github.com/cybergodev/httpc/internal/validation"
 )
 
 // stringsReaderPool reduces allocations for strings.Reader used in request bodies
@@ -237,7 +238,7 @@ func sanitizeURLKey(u *url.URL) string {
 	q := u.Query()
 	redacted := false
 	for key := range q {
-		if sensitiveQueryParams[strings.ToLower(key)] {
+		if validation.IsSensitiveQueryParam(key) {
 			q.Set(key, "[REDACTED]")
 			redacted = true
 		}
@@ -250,26 +251,20 @@ func sanitizeURLKey(u *url.URL) string {
 	return clone.String()
 }
 
-// sensitiveQueryParams contains query parameter names whose values should be
-// redacted from URL cache keys to prevent credential persistence in memory.
-var sensitiveQueryParams = map[string]bool{
-	"token": true, "access_token": true, "refresh_token": true,
-	"id_token": true, "bearer": true,
-	"api_key": true, "apikey": true,
-	"secret": true, "secret_key": true, "client_secret": true,
-	"private_key": true, "privatekey": true,
-	"password": true, "passwd": true, "pass": true, "pwd": true,
-	"credential": true, "credentials": true,
-	"session_id": true, "sessionid": true,
-	"jwt": true, "signature": true, "sign": true, "sig": true,
-}
-
 // hasSensitiveContent returns true if the raw URL string contains credentials
-// or query parameters that should not be stored in the raw string cache.
+// or sensitive query parameters that should not be stored in the raw string cache.
 func hasSensitiveContent(rawURL string) bool {
 	// '@' in the URL indicates user:pass credentials before the host
 	if strings.Contains(rawURL, "@") {
 		return true
+	}
+	// Check for sensitive query parameter names (e.g., token=, api_key=)
+	// to prevent secret values from persisting as raw cache map keys.
+	lower := strings.ToLower(rawURL)
+	for name := range validation.SensitiveQueryParamNames() {
+		if strings.Contains(lower, name+"=") {
+			return true
+		}
 	}
 	return false
 }

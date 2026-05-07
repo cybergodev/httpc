@@ -13,6 +13,7 @@ func TestFormatBytes(t *testing.T) {
 		{"zero bytes", 0, "0 B"},
 		{"bytes", 500, "500 B"},
 		{"kilobytes", 1024, "1.00 KB"},
+		{"kilobytes with fraction", 1536, "1.50 KB"},
 		{"megabytes", 1048576, "1.00 MB"},
 		{"gigabytes", 1073741824, "1.00 GB"},
 		{"terabytes", 1099511627776, "1.00 TB"},
@@ -36,6 +37,7 @@ func TestFormatSpeed(t *testing.T) {
 		want           string
 	}{
 		{"zero", 0, "0 B/s"},
+		{"bytes per second", 512, "512 B/s"},
 		{"kilobytes per second", 1024, "1.00 KB/s"},
 		{"megabytes per second", 1048576, "1.00 MB/s"},
 		{"gigabytes per second", 1073741824, "1.00 GB/s"},

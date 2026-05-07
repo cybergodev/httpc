@@ -1606,3 +1606,30 @@ func TestDomainClient_BuildURL(t *testing.T) {
 		_ = resp
 	})
 }
+func TestDomainClient_NilReceiver(t *testing.T) {
+	var dc *httpc.DomainClient
+
+	t.Run("URL returns empty", func(t *testing.T) {
+		if dc.URL() != "" {
+			t.Errorf("nil URL() = %q, want empty", dc.URL())
+		}
+	})
+
+	t.Run("Domain returns empty", func(t *testing.T) {
+		if dc.Domain() != "" {
+			t.Errorf("nil Domain() = %q, want empty", dc.Domain())
+		}
+	})
+
+	t.Run("Session returns nil", func(t *testing.T) {
+		if dc.Session() != nil {
+			t.Error("nil Session() should be nil")
+		}
+	})
+
+	t.Run("Close returns nil", func(t *testing.T) {
+		if err := dc.Close(); err != nil {
+			t.Errorf("nil Close() = %v, want nil", err)
+		}
+	})
+}

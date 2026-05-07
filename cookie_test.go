@@ -606,3 +606,66 @@ func TestCookie_Inspection(t *testing.T) {
 		t.Errorf("Missing cookies: cookie1=%v cookie2=%v, received=%v", found1, found2, receivedCookies)
 	}
 }
+
+// ============================================================================
+// Cookie pool and parseCookieHeader boundary tests
+// ============================================================================
+
+func TestCookieSlicePool_BoundaryConditions(t *testing.T) {
+	t.Run("get and return normal slice", func(t *testing.T) {
+		slice := getCookiesSlice()
+		if slice == nil {
+			t.Fatal("expected non-nil slice")
+		}
+		if len(*slice) != 0 {
+			t.Error("expected empty slice from pool")
+		}
+		*slice = append(*slice, &http.Cookie{Name: "test", Value: "val"})
+		putCookiesSlice(slice)
+	})
+
+	t.Run("oversized slice not pooled", func(t *testing.T) {
+		s := make([]*http.Cookie, 0, 128)
+		slice := &s
+		for i := range 100 {
+			*slice = append(*slice, &http.Cookie{Name: "c" + strings.Repeat("x", 1), Value: strings.Repeat("v", 1)})
+			_ = i
+		}
+		// cap > 64, should not be pooled
+		preCap := cap(*slice)
+		if preCap <= 64 {
+			t.Skip("slice cap too small to test oversized path")
+		}
+		putCookiesSlice(slice)
+		// No panic = success
+	})
+}
+
+func TestParseCookieHeader_BoundaryConditions(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		wantN int
+	}{
+		{"empty string", "", 0},
+		{"just semicolons", ";;;", 0},
+		{"whitespace only", "   ", 0},
+		{"single pair no value", "name", 0},
+		{"single pair with equals", "name=value", 1},
+		{"leading whitespace", "  name=value", 1},
+		{"trailing whitespace", "name=value  ", 1},
+		{"multiple pairs", "a=1; b=2; c=3", 3},
+		{"tab as whitespace", "name=	val	ue", 1},
+		{"empty name", "=value", 0},
+		{"pair with spaces around equals", "name = value", 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cookies := parseCookieHeader(tt.input)
+			if len(cookies) != tt.wantN {
+				t.Errorf("parseCookieHeader(%q) returned %d cookies, want %d", tt.input, len(cookies), tt.wantN)
+			}
+		})
+	}
+}
