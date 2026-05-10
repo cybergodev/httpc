@@ -463,3 +463,68 @@ func TestFilterAllowedIPs(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateAndParseURL_BoundaryConditions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		url         string
+		wantErr     bool
+		errContains string
+	}{
+		{"empty URL", "", true, "cannot be empty"},
+		{"URL too long", "https://example.com/" + strings.Repeat("a", 30000), true, "too long"},
+		{"invalid URL parse", "http://[::1:bad", true, "invalid URL"},
+		{"missing scheme", "example.com/path", true, "scheme is required"},
+		{"missing host", "http://", true, "host is required"},
+		{"unsupported scheme ftp", "ftp://example.com/file", true, "unsupported URL scheme"},
+		{"valid HTTP", "http://example.com/path", false, ""},
+		{"valid HTTPS", "https://example.com/path?q=1", false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := ValidateAndParseURL(tt.url)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error")
+				} else if !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("error = %q, want to contain %q", err.Error(), tt.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if u == nil {
+					t.Error("expected non-nil URL")
+				}
+			}
+		})
+	}
+}
+
+func TestValidateSSRFHost_BoundaryConditions(t *testing.T) {
+	t.Parallel()
+	t.Run("host with port", func(t *testing.T) {
+		err := ValidateSSRFHost("example.com:8080", nil, false)
+		if err != nil {
+			t.Errorf("public host with port should pass: %v", err)
+		}
+	})
+	t.Run("domain without DNS resolution", func(t *testing.T) {
+		err := ValidateSSRFHost("example.com", nil, false)
+		if err != nil {
+			t.Errorf("domain with resolveDNS=false should pass: %v", err)
+		}
+	})
+	t.Run("DNS resolution failure", func(t *testing.T) {
+		// Use a domain under .test (RFC 2606 reserved) with random suffix
+		// to avoid DNS cache/proxy interference
+		err := ValidateSSRFHost("nonexistent-dns-test-xyz123.test", nil, true)
+		if err == nil {
+			t.Skip("DNS resolved unexpectedly; skipping DNS failure test")
+		}
+		if !strings.Contains(err.Error(), "DNS") {
+			t.Errorf("error should mention DNS, got: %v", err)
+		}
+	})
+}

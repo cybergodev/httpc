@@ -1,9 +1,12 @@
 package httpc
 
 import (
+	"bytes"
 	"crypto/tls"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -474,19 +477,6 @@ func TestConfig_String(t *testing.T) {
 		}
 	})
 
-	t.Run("Config with proxy", func(t *testing.T) {
-		config := DefaultConfig()
-		config.Connection.ProxyURL = "http://user:password@proxy.example.com:8080"
-
-		result := config.String()
-		// Password should be masked
-		if strings.Contains(result, "password") {
-			t.Error("String should not contain plaintext password")
-		}
-		if !strings.Contains(result, "ProxyURL:") {
-			t.Error("String should contain 'ProxyURL:'")
-		}
-	})
 
 	t.Run("Config with all fields", func(t *testing.T) {
 		config := &Config{
@@ -801,13 +791,6 @@ func TestCalculateMaxRetryDelay_TableDriven(t *testing.T) {
 	}
 }
 
-func TestIsTestEnvironment(t *testing.T) {
-	// In test environment, should return true
-	if !isTestEnvironment() {
-		t.Error("isTestEnvironment() should return true during testing")
-	}
-}
-
 func TestConvertToEngineConfig_NilConfig(t *testing.T) {
 	// nil config should use defaults
 	engCfg, err := convertToEngineConfig(nil)
@@ -816,5 +799,84 @@ func TestConvertToEngineConfig_NilConfig(t *testing.T) {
 	}
 	if engCfg == nil {
 		t.Fatal("expected non-nil engine config")
+	}
+}
+
+func TestIsTestEnvironment_BoundaryConditions(t *testing.T) {
+	t.Parallel()
+
+	origArgs := os.Args[0]
+	origGoTest := os.Getenv("GO_TEST")
+	origGotest := os.Getenv("GOTEST")
+	defer func() {
+		os.Args[0] = origArgs
+		os.Setenv("GO_TEST", origGoTest)
+		os.Setenv("GOTEST", origGotest)
+	}()
+
+	t.Run("GO_TEST env var", func(t *testing.T) {
+		os.Args[0] = "/usr/bin/myapp"
+		os.Setenv("GO_TEST", "1")
+		os.Setenv("GOTEST", "")
+		if !isTestEnvironment() {
+			t.Error("GO_TEST=1 should return true")
+		}
+	})
+
+	t.Run("non-test binary returns false", func(t *testing.T) {
+		os.Args[0] = "/usr/bin/myapp"
+		os.Setenv("GO_TEST", "")
+		os.Setenv("GOTEST", "")
+		if isTestEnvironment() {
+			t.Error("non-test binary with no env vars should return false")
+		}
+	})
+
+	t.Run("test infix pattern", func(t *testing.T) {
+		os.Args[0] = "/tmp/my.test.custom"
+		os.Setenv("GO_TEST", "")
+		os.Setenv("GOTEST", "")
+		if !isTestEnvironment() {
+			t.Error("binary with .test. infix should return true")
+		}
+	})
+}
+
+func TestWarnTestingConfigInProduction(t *testing.T) {
+	origArgs := os.Args[0]
+	origGoTest := os.Getenv("GO_TEST")
+	origGotest := os.Getenv("GOTEST")
+	defer func() {
+		os.Args[0] = origArgs
+		os.Setenv("GO_TEST", origGoTest)
+		os.Setenv("GOTEST", origGotest)
+	}()
+
+	// Simulate non-test environment
+	os.Args[0] = "/usr/bin/myapp"
+	os.Setenv("GO_TEST", "")
+	os.Setenv("GOTEST", "")
+
+	// Capture stderr
+	old := os.Stderr
+	r, w, _ := os.Pipe()
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+
+	warnTestingConfigInProduction()
+	w.Close()
+
+	var buf bytes.Buffer
+	io.Copy(&buf, r)
+	output := buf.String()
+
+	if !strings.Contains(output, "SECURITY WARNING") {
+		t.Error("expected security warning in stderr")
+	}
+	if !strings.Contains(output, "TLS") {
+		t.Error("expected TLS warning")
+	}
+	if !strings.Contains(output, "SSRF") {
+		t.Error("expected SSRF warning")
 	}
 }

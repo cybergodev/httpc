@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
@@ -10,9 +11,11 @@ import (
 	"net/http"
 	"net/textproto"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
+	"unsafe"
 
 	"github.com/cybergodev/httpc/internal/types"
 	"github.com/cybergodev/httpc/internal/validation"
@@ -21,6 +24,20 @@ import (
 // stringsReaderPool reduces allocations for strings.Reader used in request bodies
 var stringsReaderPool = sync.Pool{
 	New: func() any { return &strings.Reader{} },
+}
+
+// setRequestContext sets the context on an http.Request without cloning it.
+// This avoids the Header map clone that http.Request.WithContext performs.
+// The caller must own the http.Request (i.e., it was freshly constructed).
+func setRequestContext(r *http.Request, ctx context.Context) {
+	v := reflect.ValueOf(r).Elem()
+	ctxField := v.FieldByName("ctx")
+	if ctxField.IsValid() && ctxField.CanAddr() {
+		// Use unsafe since reflect can't set unexported fields directly.
+		// Safe because we own the *http.Request and there is no concurrent access.
+		ctxPtr := (*context.Context)(unsafe.Pointer(ctxField.UnsafeAddr()))
+		*ctxPtr = ctx
+	}
 }
 
 // bytesReaderPool reduces allocations for bytes.Reader used in request bodies
@@ -255,16 +272,46 @@ func sanitizeURLKey(u *url.URL) string {
 // or sensitive query parameters that should not be stored in the raw string cache.
 func hasSensitiveContent(rawURL string) bool {
 	// '@' in the URL indicates user:pass credentials before the host
-	if strings.Contains(rawURL, "@") {
+	if strings.IndexByte(rawURL, '@') >= 0 {
 		return true
 	}
+	// Only check query parameters if present
+	qIdx := strings.IndexByte(rawURL, '?')
+	if qIdx < 0 {
+		return false
+	}
 	// Check for sensitive query parameter names (e.g., token=, api_key=)
-	// to prevent secret values from persisting as raw cache map keys.
-	lower := strings.ToLower(rawURL)
-	for name := range validation.SensitiveQueryParamNames() {
-		if strings.Contains(lower, name+"=") {
-			return true
+	// by extracting each key and doing a case-insensitive map lookup.
+	// Uses a stack-allocated buffer to avoid heap allocation from strings.ToLower.
+	sensitiveNames := validation.SensitiveQueryParamNames()
+	queryPart := rawURL[qIdx+1:]
+	for {
+		// Extract key before '='
+		eqIdx := strings.IndexByte(queryPart, '=')
+		if eqIdx < 0 {
+			break
 		}
+		key := queryPart[:eqIdx]
+		// Find end of this key-value pair (next '&')
+		ampIdx := strings.IndexByte(queryPart, '&')
+		// Case-insensitive check: inline ASCII lowercase into a stack buffer
+		var buf [64]byte
+		if len(key) <= len(buf) {
+			for i := 0; i < len(key); i++ {
+				c := key[i]
+				if c >= 'A' && c <= 'Z' {
+					c += 'a' - 'A'
+				}
+				buf[i] = c
+			}
+			if sensitiveNames[string(buf[:len(key)])] {
+				return true
+			}
+		}
+		if ampIdx < 0 {
+			break
+		}
+		queryPart = queryPart[ampIdx+1:]
 	}
 	return false
 }
@@ -697,6 +744,7 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 	}
 
 	method := req.Method()
+	ctx := req.Context()
 	httpReq := &http.Request{
 		Method:     method,
 		URL:        parsedURL,
@@ -707,11 +755,14 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 		Body:       bodyRC,
 		Host:       parsedURL.Host,
 	}
+	// Set the context without cloning the entire Request + Header map.
+	// We own this httpReq — it was just constructed above — so writing to the
+	// unexported ctx field via reflect is safe. This saves one Header clone
+	// (~2KB per request) compared to httpReq.WithContext(ctx).
+	setRequestContext(httpReq, ctx)
 
 	// Set Content-Length from known body types
 	p.setContentLength(httpReq, body)
-
-	httpReq = httpReq.WithContext(req.Context())
 
 	if contentType != "" && httpReq.Header.Get("Content-Type") == "" {
 		httpReq.Header.Set("Content-Type", contentType)

@@ -2,8 +2,10 @@ package engine
 
 import (
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCloneHeader(t *testing.T) {
@@ -155,4 +157,69 @@ func TestAppendQueryParams(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestWriteQueryParamValue_Types(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    interface{}
+		expected string
+	}{
+		{"string", "hello", "hello"},
+		{"empty string", "", ""},
+		{"int", 42, "42"},
+		{"int64", int64(12345678901234), "12345678901234"},
+		{"int32", int32(99), "99"},
+		{"uint", uint(100), "100"},
+		{"uint64", uint64(18446744073709551615), "18446744073709551615"},
+		{"uint32", uint32(4294967295), "4294967295"},
+		{"float64", float64(3.14), strconv.FormatFloat(3.14, 'f', -1, 64)},
+		{"float32", float32(2.5), strconv.FormatFloat(float64(float32(2.5)), 'f', -1, 32)},
+		{"bool true", true, "true"},
+		{"bool false", false, "false"},
+		{"custom type via FormatQueryParam", time.Duration(5 * time.Second), "5s"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var sb strings.Builder
+			var numBuf [32]byte
+			writeQueryParamValue(&sb, tt.value, numBuf[:0])
+			got := sb.String()
+			if tt.expected != "" && got != tt.expected {
+				t.Errorf("writeQueryParamValue(%v) = %q, want %q", tt.value, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestGetMIMEHeader_ReuseAndClear(t *testing.T) {
+	t.Parallel()
+
+	// Get a header, populate it, put it back, get again - should be cleared
+	h := getMIMEHeader()
+	if h == nil {
+		t.Fatal("expected non-nil MIMEHeader")
+	}
+	(*h)["Content-Type"] = []string{"application/json"}
+	(*h)["X-Custom"] = []string{"value"}
+
+	if len(*h) != 2 {
+		t.Fatalf("expected 2 headers, got %d", len(*h))
+	}
+
+	// Return to pool
+	putMIMEHeader(h)
+
+	// Get again - should be cleared
+	h2 := getMIMEHeader()
+	if len(*h2) != 0 {
+		t.Errorf("reused MIMEHeader should be cleared, got %d entries", len(*h2))
+	}
+
+	// Verify it's usable after clearing
+	(*h2)["Accept"] = []string{"text/html"}
+	if len(*h2) != 1 {
+		t.Errorf("expected 1 header after populate, got %d", len(*h2))
+	}
+	putMIMEHeader(h2)
 }

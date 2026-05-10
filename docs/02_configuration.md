@@ -53,6 +53,7 @@ Retry:
 - Retry.MaxRetries: 3
 - Retry.Delay: 1 second
 - Retry.BackoffFactor: 2.0
+- Retry.EnableJitter: true
 
 Middleware:
 - Middleware.UserAgent: "httpc/1.0"
@@ -199,6 +200,7 @@ defer client.Close()
 - Retry.MaxRetries: 0 (disabled)
 - Retry.Delay: 0
 - Retry.BackoffFactor: 1.0
+- Retry.EnableJitter: false
 - Middleware.FollowRedirects: false
 
 **Use Cases:**
@@ -402,16 +404,17 @@ client, err := httpc.New(config)
 
 ### Connection
 
-| Field                          | Type            | Default | Description                      |
-|--------------------------------|-----------------|---------|----------------------------------|
-| `Connection.MaxIdleConns`      | `int`           | 50      | Max idle connections (all hosts) |
-| `Connection.MaxConnsPerHost`   | `int`           | 10      | Max connections per host         |
-| `Connection.ProxyURL`          | `string`        | ""      | Proxy server URL                 |
-| `Connection.EnableSystemProxy` | `bool`          | false   | Use system proxy settings        |
-| `Connection.EnableHTTP2`       | `bool`          | true    | Enable HTTP/2                    |
-| `Connection.EnableCookies`     | `bool`          | false   | Enable automatic cookie jar      |
-| `Connection.EnableDoH`         | `bool`          | false   | Enable DNS-over-HTTPS resolution |
-| `Connection.DoHCacheTTL`       | `time.Duration` | 5m      | DoH DNS cache TTL                |
+| Field                              | Type            | Default | Description                                  |
+|------------------------------------|-----------------|---------|----------------------------------------------|
+| `Connection.MaxIdleConns`          | `int`           | 50      | Max idle connections (all hosts)             |
+| `Connection.MaxConnsPerHost`       | `int`           | 10      | Max connections per host                     |
+| `Connection.ProxyURL`              | `string`        | ""      | Proxy server URL                             |
+| `Connection.EnableSystemProxy`     | `bool`          | false   | Use system proxy settings                    |
+| `Connection.EnableHTTP2`           | `bool`          | true    | Enable HTTP/2                                |
+| `Connection.EnableCookies`         | `bool`          | false   | Enable automatic cookie jar                  |
+| `Connection.EnableDoH`             | `bool`          | false   | Enable DNS-over-HTTPS resolution             |
+| `Connection.DoHCacheTTL`           | `time.Duration` | 5m      | DoH DNS cache TTL                            |
+| `Connection.MaxResponseHeaderBytes`| `int64`         | 0       | Max server response header size (0 = Go stdlib default 10MB) |
 
 ### Security
 

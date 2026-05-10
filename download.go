@@ -166,12 +166,12 @@ func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *Downloa
 	if err != nil {
 		return nil, fmt.Errorf("failed to prepare file path: %w", err)
 	}
-	opts.FilePath = validatedPath
+	filePath := validatedPath
 
 	var resumeOffset int64
-	if fileInfo, err := os.Stat(opts.FilePath); err == nil {
+	if fileInfo, err := os.Stat(filePath); err == nil {
 		if !opts.Overwrite && !opts.ResumeDownload {
-			return nil, fmt.Errorf("%w: %s", ErrFileExists, opts.FilePath)
+			return nil, fmt.Errorf("%w: %s", ErrFileExists, filePath)
 		}
 		// ResumeDownload takes precedence over Overwrite when both are set:
 		// the existing file is extended rather than replaced.
@@ -241,7 +241,7 @@ func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *Downloa
 		return nil, fmt.Errorf("download response has no body reader")
 	}
 
-	return writeDownloadBody(bodyReader, opts, resumed, resumeOffset, statusCode, contentLength, downloadStart, responseCookies)
+	return writeDownloadBody(bodyReader, filePath, opts, resumed, resumeOffset, statusCode, contentLength, downloadStart, responseCookies)
 }
 
 // handleDownloadStatus validates the HTTP response status for a download request.
@@ -280,13 +280,13 @@ func handleDownloadStatus(statusCode int, bodyReader io.Reader, resumeOffset int
 }
 
 // writeDownloadBody streams the response body to a file and returns download statistics.
-func writeDownloadBody(bodyReader io.Reader, opts *DownloadConfig, resumed bool, resumeOffset int64, statusCode int, contentLength int64, downloadStart time.Time, responseCookies []*http.Cookie) (*DownloadResult, error) {
+func writeDownloadBody(bodyReader io.Reader, filePath string, opts *DownloadConfig, resumed bool, resumeOffset int64, statusCode int, contentLength int64, downloadStart time.Time, responseCookies []*http.Cookie) (*DownloadResult, error) {
 	var file *os.File
 	var err error
 	if resumed {
-		file, err = os.OpenFile(opts.FilePath, os.O_WRONLY|os.O_APPEND, filePermissions)
+		file, err = os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND, filePermissions)
 	} else {
-		file, err = os.OpenFile(opts.FilePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, filePermissions)
+		file, err = os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, filePermissions)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
@@ -318,7 +318,7 @@ func writeDownloadBody(bodyReader io.Reader, opts *DownloadConfig, resumed bool,
 	if err != nil {
 		_ = file.Close()
 		if !resumed {
-			_ = os.Remove(opts.FilePath) // best-effort cleanup of partial file
+			_ = os.Remove(filePath) // best-effort cleanup of partial file
 		}
 		return nil, fmt.Errorf("failed to write file: %w", err)
 	}
@@ -340,7 +340,7 @@ func writeDownloadBody(bodyReader io.Reader, opts *DownloadConfig, resumed bool,
 
 	// Verify checksum if expected value is provided
 	if opts.Checksum != "" && actualChecksum != strings.ToLower(opts.Checksum) {
-		_ = os.Remove(opts.FilePath)
+		_ = os.Remove(filePath)
 		return nil, fmt.Errorf("checksum mismatch: expected %s, got %s", strings.ToLower(opts.Checksum), actualChecksum)
 	}
 
@@ -357,7 +357,7 @@ func writeDownloadBody(bodyReader io.Reader, opts *DownloadConfig, resumed bool,
 	}
 
 	return &DownloadResult{
-		FilePath:        opts.FilePath,
+		FilePath:        filePath,
 		BytesWritten:    bytesWritten,
 		Duration:        duration,
 		AverageSpeed:    avgSpeed,
@@ -471,7 +471,8 @@ func prepareFilePath(filePath string) (string, error) {
 		}
 	}
 
-	// Check for system path access
+	// Check for system path access (direct path check; symlink targets
+	// are checked separately by checkParentDirSymlinks below).
 	if isSystemPath(absPath) {
 		return "", fmt.Errorf("system path access denied for security")
 	}

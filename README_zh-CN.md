@@ -232,6 +232,12 @@ httpc.WithStreamBody(true)
 // 单个 Cookie
 httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"})
 
+// 批量设置多个 Cookie (高效，预分配容量)
+httpc.WithCookies([]http.Cookie{
+    {Name: "session_id", Value: "abc123"},
+    {Name: "user_pref", Value: "dark_mode"},
+})
+
 // 从 Map 设置多个 Cookie
 httpc.WithCookieMap(map[string]string{
     "session_id": "abc123",
@@ -288,7 +294,7 @@ httpc.WithOnResponse(func(resp httpc.ResponseMutator) error {
 | **认证** | `WithBearerToken(token)`, `WithBasicAuth(user, pass)` |
 | **查询参数** | `WithQuery(key, value)`, `WithQueryMap(map)` |
 | **请求体** | `WithJSON(data)`, `WithXML(data)`, `WithForm(map)`, `WithFormData(*FormData)`, `WithFile(field, filename, content)`, `WithBody(data, ...BodyKind)`, `WithBinary([]byte, ...contentType)`, `WithStreamBody(bool)` |
-| **Cookie** | `WithCookie(cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
+| **Cookie** | `WithCookie(cookie)`, `WithCookies([]Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
 | **控制** | `WithTimeout(dur)`, `WithMaxRetries(n)`, `WithContext(ctx)` |
 | **重定向** | `WithFollowRedirects(bool)`, `WithMaxRedirects(n)` |
 | **回调** | `WithOnRequest(fn)`, `WithOnResponse(fn)` |
@@ -435,6 +441,8 @@ result, _ := httpc.DownloadWithOptionsWithContext(ctx, url, opts)
 | `ProgressCallback` | `DownloadProgressCallback` | 进度回调: `func(downloaded, total int64, speed float64)` |
 | `Overwrite` | `bool` | 覆盖已存在文件 (默认: `false`) |
 | `ResumeDownload` | `bool` | 断点续传 (默认: `false`) |
+| `Checksum` | `string` | 用于校验的预期校验和 |
+| `ChecksumAlgorithm` | `ChecksumAlgorithm` | 校验算法 (如 `httpc.ChecksumSHA256`) |
 
 ### 下载函数
 
@@ -456,6 +464,7 @@ result, _ := httpc.DownloadWithOptionsWithContext(ctx, url, opts)
 | `StatusCode` | `int` | HTTP 状态码 |
 | `ContentLength` | `int64` | 服务器返回的 Content-Length |
 | `Resumed` | `bool` | 是否从断点恢复 |
+| `ActualChecksum` | `string` | 下载文件的实际校验和 |
 | `ResponseCookies` | `[]*http.Cookie` | 响应中的 Cookie |
 
 ---
@@ -1018,7 +1027,7 @@ _ = httpc.CloseDefaultClient()
 运行示例：
 
 ```bash
-go run examples/01_basic_usage.go
+go run -tags examples examples/01_basic_usage.go
 ```
 
 ---

@@ -305,6 +305,9 @@ func AuditMiddlewareWithConfig(onAudit func(event AuditEvent), config *AuditMidd
 		config = DefaultAuditMiddlewareConfig()
 	}
 
+	// Pre-compute mask set once at middleware creation time instead of per-request.
+	precomputedMaskSet := buildMaskSet(config.MaskHeaders)
+
 	return func(next Handler) Handler {
 		return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
 			start := time.Now()
@@ -337,9 +340,9 @@ func AuditMiddlewareWithConfig(onAudit func(event AuditEvent), config *AuditMidd
 
 			// Include headers if configured
 			if config.IncludeHeaders {
-				event.ReqHeaders = maskStringHeaders(req.Headers(), config.MaskHeaders)
+				event.ReqHeaders = maskStringHeaders(req.Headers(), precomputedMaskSet)
 				if resp != nil {
-					event.RespHeaders = maskHTTPHeaders(resp.Headers(), config.MaskHeaders)
+					event.RespHeaders = maskHTTPHeaders(resp.Headers(), precomputedMaskSet)
 				}
 			}
 
@@ -368,11 +371,11 @@ func buildMaskSet(maskList []string) map[string]bool {
 
 // maskStringHeaders masks sensitive values in a map[string]string header map.
 // Converts string values to single-element slices for uniform output format.
-func maskStringHeaders(headers map[string]string, maskList []string) map[string][]string {
+// Accepts a pre-computed mask set for zero per-request overhead.
+func maskStringHeaders(headers map[string]string, maskSet map[string]bool) map[string][]string {
 	if len(headers) == 0 {
 		return nil
 	}
-	maskSet := buildMaskSet(maskList)
 	result := make(map[string][]string, len(headers))
 	for k, v := range headers {
 		if maskSet[http.CanonicalHeaderKey(k)] {
@@ -385,11 +388,11 @@ func maskStringHeaders(headers map[string]string, maskList []string) map[string]
 }
 
 // maskHTTPHeaders masks sensitive values in an http.Header.
-func maskHTTPHeaders(headers http.Header, maskList []string) map[string][]string {
+// Accepts a pre-computed mask set for zero per-request overhead.
+func maskHTTPHeaders(headers http.Header, maskSet map[string]bool) map[string][]string {
 	if len(headers) == 0 {
 		return nil
 	}
-	maskSet := buildMaskSet(maskList)
 	result := make(map[string][]string, len(headers))
 	for k, vv := range headers {
 		if maskSet[http.CanonicalHeaderKey(k)] {

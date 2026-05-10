@@ -226,11 +226,15 @@ result, err := client.DownloadFile(
 opts := &httpc.DownloadConfig{
     // Required
     FilePath: "downloads/file.zip",
-    
+
     // File handling
     Overwrite:      true,      // Overwrite existing files
     ResumeDownload: false,     // Resume partial downloads
-    
+
+    // Integrity verification (optional)
+    Checksum:         "a1b2c3...",              // Expected hex-encoded checksum
+    ChecksumAlgorithm: httpc.ChecksumSHA256,    // Hash algorithm (default: sha256)
+
     // Progress tracking
     ProgressCallback: func(downloaded, total int64, speed float64) {
         // Your progress handler
@@ -244,6 +248,8 @@ result, err := client.DownloadWithOptions(url, opts)
 - `FilePath` (string) - Destination file path (required)
 - `Overwrite` (bool) - Overwrite existing files (default: false)
 - `ResumeDownload` (bool) - Resume partial downloads (default: false)
+- `Checksum` (string) - Expected hex-encoded checksum for integrity verification (optional)
+- `ChecksumAlgorithm` (ChecksumAlgorithm) - Hash algorithm for verification (default: `httpc.ChecksumSHA256`)
 - `ProgressCallback` (func) - Progress tracking callback (optional)
 
 **DownloadResult Fields:**
@@ -255,6 +261,7 @@ result, err := client.DownloadWithOptions(url, opts)
 - `ContentLength` (int64) - Content-Length from the response header
 - `Resumed` (bool) - Whether the download was resumed from a partial file
 - `ResponseCookies` ([]*http.Cookie) - Cookies returned by the server
+- `ActualChecksum` (string) - Computed checksum of the downloaded file (only set when `Checksum` is provided)
 
 ### Save Response to File
 

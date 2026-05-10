@@ -232,6 +232,12 @@ httpc.WithStreamBody(true)
 // Single cookie
 httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"})
 
+// Batch multiple cookies (efficient, pre-allocates capacity)
+httpc.WithCookies([]http.Cookie{
+    {Name: "session_id", Value: "abc123"},
+    {Name: "user_pref", Value: "dark_mode"},
+})
+
 // Multiple cookies from map
 httpc.WithCookieMap(map[string]string{
     "session_id": "abc123",
@@ -288,7 +294,7 @@ httpc.WithOnResponse(func(resp httpc.ResponseMutator) error {
 | **Auth** | `WithBearerToken(token)`, `WithBasicAuth(user, pass)` |
 | **Query** | `WithQuery(key, value)`, `WithQueryMap(map)` |
 | **Body** | `WithJSON(data)`, `WithXML(data)`, `WithForm(map)`, `WithFormData(*FormData)`, `WithFile(field, filename, content)`, `WithBody(data, ...BodyKind)`, `WithBinary([]byte, ...contentType)`, `WithStreamBody(bool)` |
-| **Cookies** | `WithCookie(cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
+| **Cookies** | `WithCookie(cookie)`, `WithCookies([]Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
 | **Control** | `WithTimeout(dur)`, `WithMaxRetries(n)`, `WithContext(ctx)` |
 | **Redirects** | `WithFollowRedirects(bool)`, `WithMaxRedirects(n)` |
 | **Callbacks** | `WithOnRequest(fn)`, `WithOnResponse(fn)` |
@@ -435,6 +441,8 @@ result, _ := httpc.DownloadWithOptionsWithContext(ctx, url, opts)
 | `ProgressCallback` | `DownloadProgressCallback` | Progress callback: `func(downloaded, total int64, speed float64)` |
 | `Overwrite` | `bool` | Overwrite existing file (default: `false`) |
 | `ResumeDownload` | `bool` | Resume interrupted download (default: `false`) |
+| `Checksum` | `string` | Expected checksum for verification |
+| `ChecksumAlgorithm` | `ChecksumAlgorithm` | Checksum algorithm (e.g., `httpc.ChecksumSHA256`) |
 
 ### Download Functions
 
@@ -456,6 +464,7 @@ result, _ := httpc.DownloadWithOptionsWithContext(ctx, url, opts)
 | `StatusCode` | `int` | HTTP status code |
 | `ContentLength` | `int64` | Content-Length from server |
 | `Resumed` | `bool` | Whether download was resumed |
+| `ActualChecksum` | `string` | Computed checksum of downloaded file |
 | `ResponseCookies` | `[]*http.Cookie` | Cookies from response |
 
 ---
@@ -984,7 +993,7 @@ _ = httpc.CloseDefaultClient()
 **Thread Safety Guarantees:**
 - All `Client` methods are safe for concurrent use
 - Package-level functions safely use a shared default client
-- Response objects can be safely read from multiple goroutines
+- `Result` objects are NOT safe for concurrent access — each goroutine should use its own `Result`
 - Internal metrics use atomic operations
 
 ---
@@ -1018,7 +1027,7 @@ _ = httpc.CloseDefaultClient()
 Run any example:
 
 ```bash
-go run examples/01_basic_usage.go
+go run -tags examples examples/01_basic_usage.go
 ```
 
 ---

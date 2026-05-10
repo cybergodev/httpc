@@ -913,7 +913,7 @@ func TestMaskStringHeaders(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := maskStringHeaders(tt.headers, tt.maskList)
+			result := maskStringHeaders(tt.headers, buildMaskSet(tt.maskList))
 			if len(tt.headers) == 0 {
 				if result != nil {
 					t.Error("expected nil for empty/nil headers")
@@ -929,6 +929,41 @@ func TestMaskStringHeaders(t *testing.T) {
 				if v, ok := result[k]; !ok || len(v) != 1 || v[0] == "[REDACTED]" {
 					t.Errorf("header %q should be plain, got %v", k, v)
 				}
+			}
+		})
+	}
+}
+
+func TestSanitizeCallbackError(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		err          error
+		rawURL       string
+		sanitizedURL string
+		wantContains string // substring expected in result error
+		wantNil      bool
+	}{
+		{"nil error returns nil", nil, "http://user:pass@host", "http://user:***@host", "", true},
+		{"empty rawURL returns err unchanged", fmt.Errorf("some error"), "", "http://host", "some error", false},
+		{"identical URLs returns err unchanged", fmt.Errorf("fail: http://host/path"), "http://host/path", "http://host/path", "http://host/path", false},
+		{"error containing raw URL gets sanitized", fmt.Errorf("connection to http://user:pass@host/path failed"), "http://user:pass@host/path", "http://user:***@host/path", "http://user:***@host/path", false},
+		{"error not containing raw URL passes through", fmt.Errorf("network timeout"), "http://user:pass@host/path", "http://user:***@host/path", "network timeout", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := sanitizeCallbackError(tt.err, tt.rawURL, tt.sanitizedURL)
+			if tt.wantNil {
+				if result != nil {
+					t.Errorf("expected nil, got %v", result)
+				}
+				return
+			}
+			if result == nil {
+				t.Fatal("expected non-nil error")
+			}
+			if !strings.Contains(result.Error(), tt.wantContains) {
+				t.Errorf("sanitizeCallbackError() = %q, want to contain %q", result.Error(), tt.wantContains)
 			}
 		})
 	}

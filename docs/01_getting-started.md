@@ -226,6 +226,11 @@ result, err := client.Request(ctx, "DELETE", url,
 // Package-level functions (use default client)
 result, err := httpc.Put(url, httpc.WithJSON(data))
 result, err := httpc.Delete(url)
+
+// Package-level Request with full control
+result, err := httpc.Request(ctx, "DELETE", url,
+    httpc.WithBearerToken(token),
+)
 ```
 
 ### File Downloads

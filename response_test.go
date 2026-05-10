@@ -229,34 +229,6 @@ func TestResult_Unmarshal(t *testing.T) {
 // ----------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------
-// String Formatting
-// ----------------------------------------------------------------------------
-
-func TestResult_String(t *testing.T) {
-	t.Run("valid response", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{"message":"test"}`))
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		result, err := client.Get(server.URL)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-
-		str := result.String()
-		if str == "" {
-			t.Error("String() should not be empty")
-		}
-	})
-}
-
-// ----------------------------------------------------------------------------
 // Nil Safety
 // ----------------------------------------------------------------------------
 

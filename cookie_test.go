@@ -63,6 +63,131 @@ func TestCookie_RequestBasicOperations(t *testing.T) {
 		}
 	})
 
+	t.Run("WithCookies_batch", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cookie1, _ := r.Cookie("cookie1")
+			cookie2, _ := r.Cookie("cookie2")
+			cookie3, _ := r.Cookie("cookie3")
+			if cookie1 == nil || cookie2 == nil || cookie3 == nil {
+				t.Error("Cookies not found")
+			}
+			if cookie1 != nil && cookie1.Value != "value1" {
+				t.Errorf("cookie1: expected value1, got %s", cookie1.Value)
+			}
+			if cookie2 != nil && cookie2.Value != "value2" {
+				t.Errorf("cookie2: expected value2, got %s", cookie2.Value)
+			}
+			if cookie3 != nil && cookie3.Value != "value3" {
+				t.Errorf("cookie3: expected value3, got %s", cookie3.Value)
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client, _ := newTestClient()
+		defer client.Close()
+
+		_, err := client.Get(server.URL, WithCookies([]http.Cookie{
+			{Name: "cookie1", Value: "value1"},
+			{Name: "cookie2", Value: "value2"},
+			{Name: "cookie3", Value: "value3"},
+		}))
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+	})
+
+	t.Run("WithCookies_empty_slice", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cookies := r.Cookies()
+			if len(cookies) != 0 {
+				t.Errorf("Expected 0 cookies, got %d", len(cookies))
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client, _ := newTestClient()
+		defer client.Close()
+
+		_, err := client.Get(server.URL, WithCookies([]http.Cookie{}))
+		if err != nil {
+			t.Fatalf("Request with empty slice should not fail: %v", err)
+		}
+	})
+
+	t.Run("WithCookies_nil_slice", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client, _ := newTestClient()
+		defer client.Close()
+
+		_, err := client.Get(server.URL, WithCookies(nil))
+		if err != nil {
+			t.Fatalf("Request with nil slice should not fail: %v", err)
+		}
+	})
+
+	t.Run("WithCookies_invalid_cookie", func(t *testing.T) {
+		client, _ := newTestClient()
+		defer client.Close()
+
+		_, err := client.Get("http://localhost",
+			WithCookies([]http.Cookie{
+				{Name: "valid", Value: "ok"},
+				{Name: "", Value: "empty-name"},
+			}),
+		)
+		if err == nil {
+			t.Fatal("Expected error for invalid cookie name")
+		}
+	})
+
+	t.Run("WithCookies_combined_with_WithCookie", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cookies := r.Cookies()
+			if len(cookies) != 3 {
+				t.Errorf("Expected 3 cookies, got %d", len(cookies))
+			}
+
+			expected := map[string]string{
+				"cookie1": "value1",
+				"cookie2": "value2",
+				"cookie3": "value3",
+			}
+
+			for name, expectedValue := range expected {
+				cookie, err := r.Cookie(name)
+				if err != nil {
+					t.Errorf("Cookie %s not found", name)
+					continue
+				}
+				if cookie.Value != expectedValue {
+					t.Errorf("Cookie %s: expected %s, got %s", name, expectedValue, cookie.Value)
+				}
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client, _ := newTestClient()
+		defer client.Close()
+
+		_, err := client.Get(server.URL,
+			WithCookie(http.Cookie{Name: "cookie1", Value: "value1"}),
+			WithCookies([]http.Cookie{
+				{Name: "cookie2", Value: "value2"},
+				{Name: "cookie3", Value: "value3"},
+			}),
+		)
+		if err != nil {
+			t.Fatalf("Request failed: %v", err)
+		}
+	})
+
 	t.Run("WithCookieValue", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cookie, err := r.Cookie("simple")

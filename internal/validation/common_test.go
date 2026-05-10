@@ -761,7 +761,7 @@ func TestValidateURL_Boundaries(t *testing.T) {
 			t.Fatalf("test URL length %d != maxURLLen %d", len(urlStr), maxURLLen)
 		}
 
-		err := ValidateURL(urlStr)
+		err := func() error { _, err := ValidateAndParseURL(urlStr); return err }()
 		if err != nil {
 			t.Errorf("unexpected error for URL at exact max length: %v", err)
 		}
@@ -776,7 +776,7 @@ func TestValidateURL_Boundaries(t *testing.T) {
 			t.Fatalf("test URL length %d != maxURLLen+1 %d", len(urlStr), maxURLLen+1)
 		}
 
-		err := ValidateURL(urlStr)
+		err := func() error { _, err := ValidateAndParseURL(urlStr); return err }()
 		if err == nil {
 			t.Error("expected error for URL exceeding max length")
 		}

@@ -770,6 +770,21 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 			}
 			resp.SetRequestMethod(httpResp.Request.Method)
 		}
+
+		// Capture redirect metadata for streaming responses
+		if redirectChain := c.transport.GetRedirectChain(reqCopy.context); len(redirectChain) > 0 {
+			resp.SetRedirectChain(redirectChain)
+			resp.SetRedirectCount(len(redirectChain))
+		}
+
+		// Invoke OnResponse callback for streaming responses
+		if reqCopy.onResponse != nil {
+			if err := reqCopy.onResponse(resp); err != nil {
+				ReleaseResponse(resp)
+				return nil, classifyErrorWithSanitizedURL(fmt.Errorf("onResponse callback failed: %w", err), sanitizedURL, req.Method(), 0)
+			}
+		}
+
 		return resp, nil
 	}
 

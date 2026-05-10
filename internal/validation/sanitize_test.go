@@ -264,3 +264,20 @@ func min(a, b int) int {
 	}
 	return b
 }
+
+func TestSensitiveQueryParamNames(t *testing.T) {
+	t.Parallel()
+	names := SensitiveQueryParamNames()
+	if len(names) == 0 {
+		t.Error("SensitiveQueryParamNames() should return non-empty map")
+	}
+	expectedKeys := []string{"token", "access_token", "api_key", "password", "secret", "jwt", "session_id"}
+	for _, key := range expectedKeys {
+		if !names[key] {
+			t.Errorf("expected %q in sensitive query param names", key)
+		}
+	}
+	if len(names) < 20 {
+		t.Errorf("expected at least 20 sensitive param names, got %d", len(names))
+	}
+}

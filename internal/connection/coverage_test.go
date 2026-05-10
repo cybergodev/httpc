@@ -581,53 +581,70 @@ func TestCreateDialer_ContextCancellation(t *testing.T) {
 	}
 }
 
-// TestResolveAndValidateAddress_PublicIP verifies that public IPs pass validation.
-func TestResolveAndValidateAddress_PublicIP(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	result, err := pm.resolveAndValidateAddress("8.8.8.8:443")
-	if err != nil {
-		t.Fatalf("expected no error for public IP, got: %v", err)
-	}
-	if result != "8.8.8.8:443" {
-		t.Errorf("result = %q, want %q", result, "8.8.8.8:443")
-	}
-}
-
-// TestResolveAndValidateAddress_PublicIPNoPort verifies that a bare public IP
-// without a port is validated and returned as-is (the IP early return path).
-func TestResolveAndValidateAddress_PublicIPNoPort(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	result, err := pm.resolveAndValidateAddress("8.8.8.8")
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-	// Bare IP goes through ParseIP path and returns original address
-	if result != "8.8.8.8" {
-		t.Errorf("result = %q, want %q", result, "8.8.8.8")
-	}
-}
-
-// TestResolveAndValidateAddress_PrivateIP verifies that private IPs are rejected.
-func TestResolveAndValidateAddress_PrivateIP(t *testing.T) {
+// TestResolveAndValidateAddress verifies address resolution and validation
+// including public IPs, private IP rejection, domain resolution, and error cases.
+func TestResolveAndValidateAddress(t *testing.T) {
 	tests := []struct {
 		name    string
 		address string
+		wantErr bool
+		skipOK  bool   // if true, a nil error is acceptable (skip instead of fail)
+		want    string // expected result string (exact match, empty means custom validation)
 	}{
-		{"10.x", "10.0.0.1:443"},
-		{"172.16.x", "172.16.0.1:443"},
-		{"192.168.x", "192.168.1.1:443"},
-		{"127.x", "127.0.0.1:443"},
-		{"169.254.x", "169.254.1.1:443"},
+		// Public IP with port
+		{
+			name:    "Public IP with port",
+			address: "8.8.8.8:443",
+			wantErr: false,
+			want:    "8.8.8.8:443",
+		},
+		// Public IP without port (bare IP early return path)
+		{
+			name:    "Public IP without port",
+			address: "8.8.8.8",
+			wantErr: false,
+			want:    "8.8.8.8",
+		},
+		// Private IPs are rejected
+		{
+			name:    "Private IP 10.x",
+			address: "10.0.0.1:443",
+			wantErr: true,
+		},
+		{
+			name:    "Private IP 172.16.x",
+			address: "172.16.0.1:443",
+			wantErr: true,
+		},
+		{
+			name:    "Private IP 192.168.x",
+			address: "192.168.1.1:443",
+			wantErr: true,
+		},
+		{
+			name:    "Loopback 127.x",
+			address: "127.0.0.1:443",
+			wantErr: true,
+		},
+		{
+			name:    "Link-local 169.254.x",
+			address: "169.254.1.1:443",
+			wantErr: true,
+		},
+		// Unresolvable domain
+		{
+			name:    "Domain resolution failure",
+			address: "this-domain-does-not-exist-xyz123.invalid:443",
+			wantErr: true,
+			skipOK:  true, // DNS resolver may intercept queries
+		},
+		// Public domain resolution (custom validation in test body)
+		{
+			name:    "Public domain resolution",
+			address: "public-domain",
+			wantErr: false,
+			want:    "", // custom validation below
+		},
 	}
 
 	for _, tt := range tests {
@@ -638,9 +655,55 @@ func TestResolveAndValidateAddress_PrivateIP(t *testing.T) {
 			}
 			defer func() { _ = pm.Close() }()
 
-			_, err = pm.resolveAndValidateAddress(tt.address)
-			if err == nil {
-				t.Errorf("expected error for private IP %s, got nil", tt.address)
+			// Special handling for public domain resolution test
+			if tt.address == "public-domain" {
+				domains := []string{
+					"one.one.one.one:443",
+					"dns.google:443",
+					"cloudflare.com:443",
+				}
+
+				var lastErr error
+				for _, domain := range domains {
+					result, resolveErr := pm.resolveAndValidateAddress(domain)
+					if resolveErr == nil {
+						host, port, splitErr := net.SplitHostPort(result)
+						if splitErr != nil {
+							t.Fatalf("result %q is not a valid host:port: %v", result, splitErr)
+						}
+						if port != "443" {
+							t.Errorf("port = %q, want %q", port, "443")
+						}
+						if net.ParseIP(host) == nil {
+							t.Errorf("host %q is not a valid IP address", host)
+						}
+						return
+					}
+					lastErr = resolveErr
+				}
+
+				t.Logf("No test domain resolved to a public IP (likely network restriction): %v", lastErr)
+				return
+			}
+
+			result, err := pm.resolveAndValidateAddress(tt.address)
+
+			if tt.wantErr {
+				if err == nil {
+					if tt.skipOK {
+						t.Skip("DNS resolver intercepts queries - unresolvable domain resolved to an IP")
+					}
+					t.Errorf("expected error for %s, got nil", tt.address)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			if tt.want != "" && result != tt.want {
+				t.Errorf("result = %q, want %q", result, tt.want)
 			}
 		})
 	}
@@ -842,61 +905,6 @@ func TestClose_WithDoHResolver(t *testing.T) {
 	if err != nil {
 		t.Errorf("Close() error: %v", err)
 	}
-}
-
-// TestResolveAndValidateAddress_DomainResolutionFailure verifies handling of
-// DNS resolution failures for unresolvable domains.
-func TestResolveAndValidateAddress_DomainResolutionFailure(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	_, err = pm.resolveAndValidateAddress("this-domain-does-not-exist-xyz123.invalid:443")
-	if err == nil {
-		t.Skip("DNS resolver intercepts queries - unresolvable domain resolved to an IP")
-	}
-}
-
-// TestResolveAndValidateAddress_PublicDomain verifies that a resolvable public
-// domain returns a validated IP:port string (exercising the DNS + JoinHostPort path).
-func TestResolveAndValidateAddress_PublicDomain(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	// Try multiple well-known domains since DNS resolution varies by environment
-	domains := []string{
-		"one.one.one.one:443",
-		"dns.google:443",
-		"cloudflare.com:443",
-	}
-
-	var lastErr error
-	for _, domain := range domains {
-		result, resolveErr := pm.resolveAndValidateAddress(domain)
-		if resolveErr == nil {
-			// Verify result is an IP:port string
-			host, port, splitErr := net.SplitHostPort(result)
-			if splitErr != nil {
-				t.Fatalf("result %q is not a valid host:port: %v", result, splitErr)
-			}
-			if port != "443" {
-				t.Errorf("port = %q, want %q", port, "443")
-			}
-			if net.ParseIP(host) == nil {
-				t.Errorf("host %q is not a valid IP address", host)
-			}
-			return
-		}
-		lastErr = resolveErr
-	}
-
-	// If no domain resolved to a public IP, skip the test
-	t.Logf("No test domain resolved to a public IP (likely network restriction): %v", lastErr)
 }
 
 // TestCreateDialer_SSRFSuccessPath verifies that when SSRF protection is enabled

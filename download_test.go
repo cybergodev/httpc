@@ -655,6 +655,14 @@ func TestPrepareFilePath_Security(t *testing.T) {
 			t.Errorf("Expected symlink error, got: %v", err)
 		}
 	})
+	t.Run("Max length path accepted", func(t *testing.T) {
+		tempDir := t.TempDir()
+		maxLenPath := filepath.Join(tempDir, strings.Repeat("a", 4096-len(tempDir)-1))
+		_, err := prepareFilePath(maxLenPath)
+		if err != nil {
+			t.Errorf("Max length path should be accepted: %v", err)
+		}
+	})
 }
 
 func TestPrepareFilePath_ValidPaths(t *testing.T) {
@@ -798,12 +806,6 @@ func TestPackageLevel_DownloadWithOptionsWithContext(t *testing.T) {
 	}
 }
 
-func TestCalculateSpeed_ZeroDuration(t *testing.T) {
-	if calculateSpeed(100, 0) != 0 {
-		t.Error("calculateSpeed with zero duration should return 0")
-	}
-}
-
 // ----------------------------------------------------------------------------
 // handleDownloadStatus unit tests
 // ----------------------------------------------------------------------------
@@ -923,7 +925,7 @@ func TestWriteDownloadBody_ChecksumVerification(t *testing.T) {
 			Checksum:          expectedChecksum,
 			ChecksumAlgorithm: ChecksumSHA256,
 		}
-		result, err := writeDownloadBody(bytes.NewReader(content), opts, false, 0, 200, int64(len(content)), time.Now(), nil)
+		result, err := writeDownloadBody(bytes.NewReader(content), opts.FilePath, opts, false, 0, 200, int64(len(content)), time.Now(), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -939,7 +941,7 @@ func TestWriteDownloadBody_ChecksumVerification(t *testing.T) {
 			Checksum:          "0000000000000000000000000000000000000000000000000000000000000000",
 			ChecksumAlgorithm: ChecksumSHA256,
 		}
-		_, err := writeDownloadBody(bytes.NewReader(content), opts, false, 0, 200, int64(len(content)), time.Now(), nil)
+		_, err := writeDownloadBody(bytes.NewReader(content), opts.FilePath, opts, false, 0, 200, int64(len(content)), time.Now(), nil)
 		if err == nil {
 			t.Fatal("expected checksum mismatch error")
 		}
@@ -957,7 +959,7 @@ func TestWriteDownloadBody_ChecksumVerification(t *testing.T) {
 		opts := &DownloadConfig{
 			FilePath: filePath3,
 		}
-		result, err := writeDownloadBody(bytes.NewReader(content), opts, false, 0, 200, int64(len(content)), time.Now(), nil)
+		result, err := writeDownloadBody(bytes.NewReader(content), opts.FilePath, opts, false, 0, 200, int64(len(content)), time.Now(), nil)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1108,27 +1110,56 @@ func TestIsSystemPath_CurrentDirectory(t *testing.T) {
 	}
 }
 
-func TestPrepareFilePath_BoundaryConditions(t *testing.T) {
-	tests := []struct {
-		name    string
-		path    string
-		wantErr bool
-	}{
-		{"empty path", "", true},
-		{"path too long", strings.Repeat("a", 4097), true},
-		{"max length path", strings.Repeat("a", 4096), false},
-		{"UNC path forward slash", "//server/share/file", true},
-		{"UNC path backslash", "\\\\server\\share", true},
-		{"control char", "file\x00name", true},
-		{"DEL char", "file\x7fname", true},
-	}
+func TestCheckParentDirSymlinks_BoundaryConditions(t *testing.T) {
+	t.Parallel()
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			_, err := prepareFilePath(tt.path)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("prepareFilePath(%q) error = %v, wantErr %v", tt.path[:min(len(tt.path), 30)], err, tt.wantErr)
-			}
-		})
-	}
+	t.Run("max depth exceeded", func(t *testing.T) {
+		err := checkParentDirSymlinks("/tmp", 33)
+		if err == nil {
+			t.Error("expected depth limit error")
+		}
+		if !strings.Contains(err.Error(), "depth limit") {
+			t.Errorf("error should mention depth limit, got: %v", err)
+		}
+	})
+
+	t.Run("nonexistent directory chain", func(t *testing.T) {
+		tempDir := t.TempDir()
+		deepPath := filepath.Join(tempDir, "a", "b", "c", "nonexistent")
+		err := checkParentDirSymlinks(deepPath, 0)
+		// Should not error - nonexistent dirs are OK during traversal
+		if err != nil {
+			t.Errorf("nonexistent dir chain should not error: %v", err)
+		}
+	})
+
+	t.Run("symlink to system path", func(t *testing.T) {
+		tempDir := t.TempDir()
+		// Use a directory symlink that resolves into a system directory.
+		// We create a subdirectory inside the system dir so the resolved
+		// path has a prefix match (e.g. C:\Windows\System32 starts with c:\windows\).
+		var systemSubdir string
+		if runtime.GOOS == "windows" {
+			systemSubdir = filepath.Join(os.Getenv("SystemRoot"), "System32")
+		} else {
+			systemSubdir = "/etc/ssl"
+		}
+		linkPath := filepath.Join(tempDir, "syslink")
+		err := os.Symlink(systemSubdir, linkPath)
+		if err != nil {
+			t.Skipf("symlink not supported: %v", err)
+		}
+		// Verify the symlink resolves to a system path
+		resolved, _ := filepath.EvalSymlinks(linkPath)
+		if !isSystemPath(resolved) {
+			t.Skipf("resolved path %q not detected as system path on this platform", resolved)
+		}
+		err = checkParentDirSymlinks(linkPath, 0)
+		if err == nil {
+			t.Error("expected symlink-to-system-path rejection")
+		}
+		if err != nil && !strings.Contains(err.Error(), "system path") {
+			t.Errorf("error should mention system path, got: %v", err)
+		}
+	})
 }

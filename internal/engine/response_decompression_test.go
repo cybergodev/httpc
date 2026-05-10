@@ -15,7 +15,7 @@ import (
 // RESPONSE DECOMPRESSION TESTS
 // ============================================================================
 
-func TestResponseProcessor_GzipDecompression(t *testing.T) {
+func TestResponseProcessor_Decompression(t *testing.T) {
 	config := &Config{
 		Timeout:             30 * time.Second,
 		MaxResponseBodySize: 50 * 1024 * 1024,
@@ -24,236 +24,130 @@ func TestResponseProcessor_GzipDecompression(t *testing.T) {
 	processor := newResponseProcessor(config)
 
 	tests := []struct {
-		name         string
-		originalData string
-		validate     func(*testing.T, *Response)
+		name       string
+		encoding   string
+		content    string
+		wantBody   string
+		wantErr    bool
+		errContains string
 	}{
+		// Gzip cases
 		{
-			name:         "Simple gzip compressed text",
-			originalData: "Hello, World! This is a test of gzip compression.",
-			validate: func(t *testing.T, resp *Response) {
-				expected := "Hello, World! This is a test of gzip compression."
-				if resp.Body() != expected {
-					t.Errorf("Expected body '%s', got '%s'", expected, resp.Body())
-				}
-				if string(resp.RawBody()) != expected {
-					t.Errorf("Expected RawBody '%s', got '%s'", expected, string(resp.RawBody()))
-				}
-			},
+			name:     "Gzip simple compressed text",
+			encoding: "gzip",
+			content:  "Hello, World! This is a test of gzip compression.",
+			wantBody: "Hello, World! This is a test of gzip compression.",
+			wantErr:  false,
 		},
 		{
-			name:         "Gzip compressed JSON",
-			originalData: `{"message":"success","data":{"id":123,"name":"test user","active":true}}`,
-			validate: func(t *testing.T, resp *Response) {
-				expected := `{"message":"success","data":{"id":123,"name":"test user","active":true}}`
-				if resp.Body() != expected {
-					t.Errorf("Expected body '%s', got '%s'", expected, resp.Body())
-				}
-			},
+			name:     "Gzip compressed JSON",
+			encoding: "gzip",
+			content:  `{"message":"success","data":{"id":123,"name":"test user","active":true}}`,
+			wantBody: `{"message":"success","data":{"id":123,"name":"test user","active":true}}`,
+			wantErr:  false,
 		},
 		{
-			name:         "Large gzip compressed data",
-			originalData: strings.Repeat("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 100),
-			validate: func(t *testing.T, resp *Response) {
-				expected := strings.Repeat("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 100)
-				if resp.Body() != expected {
-					t.Errorf("Body length mismatch: expected %d, got %d", len(expected), len(resp.Body()))
-				}
-			},
+			name:     "Gzip large compressed data",
+			encoding: "gzip",
+			content:  strings.Repeat("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 100),
+			wantBody: strings.Repeat("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", 100),
+			wantErr:  false,
 		},
 		{
-			name:         "Empty gzip compressed data",
-			originalData: "",
-			validate: func(t *testing.T, resp *Response) {
-				if resp.Body() != "" {
-					t.Errorf("Expected empty body, got '%s'", resp.Body())
-				}
-			},
+			name:     "Gzip empty compressed data",
+			encoding: "gzip",
+			content:  "",
+			wantBody: "",
+			wantErr:  false,
+		},
+		// Deflate cases
+		{
+			name:     "Deflate simple compressed text",
+			encoding: "deflate",
+			content:  "Hello, World! This is a test of deflate compression.",
+			wantBody: "Hello, World! This is a test of deflate compression.",
+			wantErr:  false,
+		},
+		{
+			name:     "Deflate compressed JSON",
+			encoding: "deflate",
+			content:  `{"status":"ok","count":42,"items":["a","b","c"]}`,
+			wantBody: `{"status":"ok","count":42,"items":["a","b","c"]}`,
+			wantErr:  false,
+		},
+		{
+			name:     "Deflate large compressed data",
+			encoding: "deflate",
+			content:  strings.Repeat("The quick brown fox jumps over the lazy dog. ", 50),
+			wantBody: strings.Repeat("The quick brown fox jumps over the lazy dog. ", 50),
+			wantErr:  false,
+		},
+		// Brotli case
+		{
+			name:        "Brotli not supported",
+			encoding:    "br",
+			content:     "fake brotli data",
+			wantErr:     true,
+			errContains: "brotli",
+		},
+		// No encoding / identity / unknown cases
+		{
+			name:     "No Content-Encoding header",
+			encoding: "",
+			content:  "Plain text without compression",
+			wantBody: "Plain text without compression",
+			wantErr:  false,
+		},
+		{
+			name:     "Unknown encoding",
+			encoding: "unknown-encoding",
+			content:  "Data with unknown encoding",
+			wantBody: "Data with unknown encoding",
+			wantErr:  false,
+		},
+		{
+			name:     "Identity encoding",
+			encoding: "identity",
+			content:  "Data with identity encoding",
+			wantBody: "Data with identity encoding",
+			wantErr:  false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Compress the data using gzip
-			var buf bytes.Buffer
-			gzipWriter := gzip.NewWriter(&buf)
-			_, err := gzipWriter.Write([]byte(tt.originalData))
-			if err != nil {
-				t.Fatalf("Failed to write gzip data: %v", err)
-			}
-			if err := gzipWriter.Close(); err != nil {
-				t.Fatalf("Failed to close gzip writer: %v", err)
-			}
+			var bodyReader io.Reader
+			bodyReader = strings.NewReader(tt.content)
 
-			// Create HTTP response with gzip-compressed body
-			httpResponse := &http.Response{
-				StatusCode: 200,
-				Status:     "200 OK",
-				Header: http.Header{
-					"Content-Type":     []string{"text/plain"},
-					"Content-Encoding": []string{"gzip"},
-				},
-				Body:    io.NopCloser(&buf),
-				Request: &http.Request{},
-			}
-
-			resp, err := processor.Process(httpResponse)
-			if err != nil {
-				t.Fatalf("Failed to process response: %v", err)
-			}
-
-			tt.validate(t, resp)
-		})
-	}
-}
-
-func TestResponseProcessor_DeflateDecompression(t *testing.T) {
-	config := &Config{
-		Timeout:             30 * time.Second,
-		MaxResponseBodySize: 50 * 1024 * 1024,
-	}
-
-	processor := newResponseProcessor(config)
-
-	tests := []struct {
-		name         string
-		originalData string
-		validate     func(*testing.T, *Response)
-	}{
-		{
-			name:         "Simple deflate compressed text",
-			originalData: "Hello, World! This is a test of deflate compression.",
-			validate: func(t *testing.T, resp *Response) {
-				expected := "Hello, World! This is a test of deflate compression."
-				if resp.Body() != expected {
-					t.Errorf("Expected body '%s', got '%s'", expected, resp.Body())
+			// Compress content if encoding requires it
+			switch tt.encoding {
+			case "gzip":
+				var buf bytes.Buffer
+				gzipWriter := gzip.NewWriter(&buf)
+				_, err := gzipWriter.Write([]byte(tt.content))
+				if err != nil {
+					t.Fatalf("Failed to write gzip data: %v", err)
 				}
-			},
-		},
-		{
-			name:         "Deflate compressed JSON",
-			originalData: `{"status":"ok","count":42,"items":["a","b","c"]}`,
-			validate: func(t *testing.T, resp *Response) {
-				expected := `{"status":"ok","count":42,"items":["a","b","c"]}`
-				if resp.Body() != expected {
-					t.Errorf("Expected body '%s', got '%s'", expected, resp.Body())
+				if err := gzipWriter.Close(); err != nil {
+					t.Fatalf("Failed to close gzip writer: %v", err)
 				}
-			},
-		},
-		{
-			name:         "Large deflate compressed data",
-			originalData: strings.Repeat("The quick brown fox jumps over the lazy dog. ", 50),
-			validate: func(t *testing.T, resp *Response) {
-				expected := strings.Repeat("The quick brown fox jumps over the lazy dog. ", 50)
-				if resp.Body() != expected {
-					t.Errorf("Body length mismatch: expected %d, got %d", len(expected), len(resp.Body()))
+				bodyReader = &buf
+			case "deflate":
+				var buf bytes.Buffer
+				deflateWriter, err := flate.NewWriter(&buf, flate.DefaultCompression)
+				if err != nil {
+					t.Fatalf("Failed to create deflate writer: %v", err)
 				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// Compress the data using deflate
-			var buf bytes.Buffer
-			deflateWriter, err := flate.NewWriter(&buf, flate.DefaultCompression)
-			if err != nil {
-				t.Fatalf("Failed to create deflate writer: %v", err)
-			}
-			_, err = deflateWriter.Write([]byte(tt.originalData))
-			if err != nil {
-				t.Fatalf("Failed to write deflate data: %v", err)
-			}
-			if err := deflateWriter.Close(); err != nil {
-				t.Fatalf("Failed to close deflate writer: %v", err)
+				_, err = deflateWriter.Write([]byte(tt.content))
+				if err != nil {
+					t.Fatalf("Failed to write deflate data: %v", err)
+				}
+				if err := deflateWriter.Close(); err != nil {
+					t.Fatalf("Failed to close deflate writer: %v", err)
+				}
+				bodyReader = &buf
 			}
 
-			// Create HTTP response with deflate-compressed body
-			httpResponse := &http.Response{
-				StatusCode: 200,
-				Status:     "200 OK",
-				Header: http.Header{
-					"Content-Type":     []string{"text/plain"},
-					"Content-Encoding": []string{"deflate"},
-				},
-				Body:    io.NopCloser(&buf),
-				Request: &http.Request{},
-			}
-
-			resp, err := processor.Process(httpResponse)
-			if err != nil {
-				t.Fatalf("Failed to process response: %v", err)
-			}
-
-			tt.validate(t, resp)
-		})
-	}
-}
-
-func TestResponseProcessor_BrotliDecompression(t *testing.T) {
-	config := &Config{
-		Timeout:             30 * time.Second,
-		MaxResponseBodySize: 50 * 1024 * 1024,
-	}
-
-	processor := newResponseProcessor(config)
-
-	// Test that brotli returns an appropriate error since it's not supported
-	// without external dependencies
-	t.Run("Brotli not supported", func(t *testing.T) {
-		httpResponse := &http.Response{
-			StatusCode: 200,
-			Status:     "200 OK",
-			Header: http.Header{
-				"Content-Type":     []string{"text/plain"},
-				"Content-Encoding": []string{"br"},
-			},
-			Body:    io.NopCloser(strings.NewReader("fake brotli data")),
-			Request: &http.Request{},
-		}
-
-		_, err := processor.Process(httpResponse)
-		if err == nil {
-			t.Error("Expected error for brotli decompression, got nil")
-		}
-		if !strings.Contains(err.Error(), "brotli") {
-			t.Errorf("Expected brotli error message, got: %v", err)
-		}
-	})
-}
-
-func TestResponseProcessor_NoDecompression(t *testing.T) {
-	config := &Config{
-		Timeout:             30 * time.Second,
-		MaxResponseBodySize: 50 * 1024 * 1024,
-	}
-
-	processor := newResponseProcessor(config)
-
-	tests := []struct {
-		name         string
-		encoding     string
-		originalData string
-	}{
-		{
-			name:         "No Content-Encoding header",
-			encoding:     "",
-			originalData: "Plain text without compression",
-		},
-		{
-			name:         "Unknown encoding",
-			encoding:     "unknown-encoding",
-			originalData: "Data with unknown encoding",
-		},
-		{
-			name:         "Identity encoding",
-			encoding:     "identity",
-			originalData: "Data with identity encoding",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
 			headers := http.Header{
 				"Content-Type": []string{"text/plain"},
 			}
@@ -265,17 +159,85 @@ func TestResponseProcessor_NoDecompression(t *testing.T) {
 				StatusCode: 200,
 				Status:     "200 OK",
 				Header:     headers,
-				Body:       io.NopCloser(strings.NewReader(tt.originalData)),
+				Body:       io.NopCloser(bodyReader),
 				Request:    &http.Request{},
 			}
 
 			resp, err := processor.Process(httpResponse)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("Expected error, got nil")
+				}
+				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("Expected error containing '%s', got: %v", tt.errContains, err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("Failed to process response: %v", err)
 			}
 
-			if resp.Body() != tt.originalData {
-				t.Errorf("Expected body '%s', got '%s'", tt.originalData, resp.Body())
+			// Special validation for gzip simple text: also check RawBody
+			if tt.encoding == "gzip" && tt.name == "Gzip simple compressed text" {
+				if string(resp.RawBody()) != tt.wantBody {
+					t.Errorf("Expected RawBody '%s', got '%s'", tt.wantBody, string(resp.RawBody()))
+				}
+			}
+
+			if resp.Body() != tt.wantBody {
+				bodyLen := len(resp.Body())
+				wantLen := len(tt.wantBody)
+				if bodyLen != wantLen {
+					t.Errorf("Body length mismatch: expected %d, got %d", wantLen, bodyLen)
+				} else {
+					t.Errorf("Expected body '%s', got '%s'", tt.wantBody, resp.Body())
+				}
+			}
+		})
+	}
+}
+
+func TestResponseProcessor_InvalidCompressedData(t *testing.T) {
+	config := &Config{
+		Timeout:             30 * time.Second,
+		MaxResponseBodySize: 50 * 1024 * 1024,
+	}
+
+	processor := newResponseProcessor(config)
+
+	tests := []struct {
+		name       string
+		encoding   string
+		rawData    string
+	}{
+		{
+			name:     "Invalid gzip data",
+			encoding: "gzip",
+			rawData:  "This is not valid gzip data",
+		},
+		{
+			name:     "Invalid deflate data",
+			encoding: "deflate",
+			rawData:  "This is not valid deflate data",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			httpResponse := &http.Response{
+				StatusCode: 200,
+				Status:     "200 OK",
+				Header: http.Header{
+					"Content-Type":     []string{"text/plain"},
+					"Content-Encoding": []string{tt.encoding},
+				},
+				Body:    io.NopCloser(strings.NewReader(tt.rawData)),
+				Request: &http.Request{},
+			}
+
+			_, err := processor.Process(httpResponse)
+			if err == nil {
+				t.Error("Expected error for invalid compressed data, got nil")
 			}
 		})
 	}
@@ -319,56 +281,6 @@ func TestResponseProcessor_DecompressionWithSizeLimit(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "exceeds limit") {
 		t.Errorf("Expected size limit error, got: %v", err)
-	}
-}
-
-func TestResponseProcessor_InvalidGzipData(t *testing.T) {
-	config := &Config{
-		Timeout:             30 * time.Second,
-		MaxResponseBodySize: 50 * 1024 * 1024,
-	}
-
-	processor := newResponseProcessor(config)
-
-	httpResponse := &http.Response{
-		StatusCode: 200,
-		Status:     "200 OK",
-		Header: http.Header{
-			"Content-Type":     []string{"text/plain"},
-			"Content-Encoding": []string{"gzip"},
-		},
-		Body:    io.NopCloser(strings.NewReader("This is not valid gzip data")),
-		Request: &http.Request{},
-	}
-
-	_, err := processor.Process(httpResponse)
-	if err == nil {
-		t.Error("Expected error for invalid gzip data, got nil")
-	}
-}
-
-func TestResponseProcessor_InvalidDeflateData(t *testing.T) {
-	config := &Config{
-		Timeout:             30 * time.Second,
-		MaxResponseBodySize: 50 * 1024 * 1024,
-	}
-
-	processor := newResponseProcessor(config)
-
-	httpResponse := &http.Response{
-		StatusCode: 200,
-		Status:     "200 OK",
-		Header: http.Header{
-			"Content-Type":     []string{"text/plain"},
-			"Content-Encoding": []string{"deflate"},
-		},
-		Body:    io.NopCloser(strings.NewReader("This is not valid deflate data")),
-		Request: &http.Request{},
-	}
-
-	_, err := processor.Process(httpResponse)
-	if err == nil {
-		t.Error("Expected error for invalid deflate data, got nil")
 	}
 }
 
@@ -551,5 +463,50 @@ func BenchmarkResponseProcessor_DeflateDecompression(b *testing.B) {
 		if err != nil {
 			b.Fatalf("Failed to process response: %v", err)
 		}
+	}
+}
+
+func TestCreateDecompressor_UnsupportedEncodings(t *testing.T) {
+	t.Parallel()
+	config := &Config{
+		Timeout:             30 * time.Second,
+		MaxResponseBodySize: 50 * 1024 * 1024,
+	}
+	proc := newResponseProcessor(config)
+
+	tests := []struct {
+		name        string
+		encoding    string
+		wantErr     bool
+		errContains string
+	}{
+		{"brotli rejected", "br", true, "brotli"},
+		{"compress rejected", "compress", true, "LZW"},
+		{"x-compress rejected", "x-compress", true, "LZW"},
+		{"identity pass-through", "identity", false, ""},
+		{"empty encoding pass-through", "", false, ""},
+		{"unknown encoding pass-through", "zstd", false, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reader := strings.NewReader("test data")
+			rc, err := proc.createDecompressor(reader, tt.encoding)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error")
+				} else if !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("error = %q, want to contain %q", err.Error(), tt.errContains)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if rc == nil {
+					t.Error("expected non-nil ReadCloser")
+				} else {
+					rc.Close()
+				}
+			}
+		})
 	}
 }
