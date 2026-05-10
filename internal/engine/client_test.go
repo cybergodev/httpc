@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -769,4 +770,52 @@ func TestClient_OnResponseErrorReleasesResponse(t *testing.T) {
 	if resp.StatusCode() != 200 {
 		t.Errorf("expected status 200, got %d", resp.StatusCode())
 	}
+}
+
+func TestClient_SetRawBodyReader(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(fmt.Sprintf("body=%s,content-type=%s", string(body), r.Header.Get("Content-Type"))))
+	}))
+	defer server.Close()
+
+	cfg := &Config{
+		Timeout:         30 * time.Second,
+		AllowPrivateIPs: true,
+		MaxRetries:      1,
+		UserAgent:       "test-client/1.0",
+	}
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatalf("NewClient error: %v", err)
+	}
+	defer client.Close()
+
+	resp, err := client.Request(backgroundCtx, "GET", server.URL)
+	if err != nil {
+		t.Fatalf("Request error: %v", err)
+	}
+
+	// Test SetRawBodyReader on the response
+	originalReader := resp.RawBodyReader()
+
+	// Create a new io.ReadCloser and set it
+	newReader := io.NopCloser(strings.NewReader("replacement body"))
+	resp.SetRawBodyReader(newReader)
+
+	// Verify it was set
+	gotReader := resp.RawBodyReader()
+	if gotReader != newReader {
+		t.Error("expected RawBodyReader to be the new reader after SetRawBodyReader")
+	}
+
+	// Test setting to nil (ownership transfer scenario)
+	resp.SetRawBodyReader(nil)
+	if resp.RawBodyReader() != nil {
+		t.Error("expected RawBodyReader to be nil after SetRawBodyReader(nil)")
+	}
+
+	// Restore original to avoid leak if it was non-nil
+	_ = originalReader
 }

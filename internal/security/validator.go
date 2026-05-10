@@ -142,7 +142,7 @@ func validateHeaderValueTokens(value string, allowed []string, headerName string
 		}
 		found := false
 		for _, a := range allowed {
-			if strings.EqualFold(token, a) {
+			if asciiEqualFold(token, a) {
 				found = true
 				break
 			}
@@ -160,20 +160,52 @@ var (
 )
 
 func validateCommonHeaderValue(key, value string) error {
-	if strings.EqualFold(key, "connection") {
-		return validateHeaderValueTokens(value, connectionAllowed, "Connection")
-	} else if strings.EqualFold(key, "transfer-encoding") {
-		return validateHeaderValueTokens(value, transferEncodingAllowed, "Transfer-Encoding")
+	// Fast path: check first byte to avoid strings.EqualFold overhead for most headers.
+	// "connection" starts with 'c'/'C', "transfer-encoding" starts with 't'/'T'.
+	// Most headers won't match either, so the byte check short-circuits immediately.
+	if len(key) == 0 {
+		return nil
+	}
+	switch key[0] | 0x20 {
+	case 'c':
+		if asciiEqualFold(key, "connection") {
+			return validateHeaderValueTokens(value, connectionAllowed, "Connection")
+		}
+	case 't':
+		if asciiEqualFold(key, "transfer-encoding") {
+			return validateHeaderValueTokens(value, transferEncodingAllowed, "Transfer-Encoding")
+		}
 	}
 	return nil
 }
 
+// asciiEqualFold reports whether s and t are equal under ASCII case-folding.
+// Avoids strings.EqualFold allocation and unicode overhead for simple ASCII comparison.
+func asciiEqualFold(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		sc := s[i]
+		tc := t[i]
+		if sc >= 'A' && sc <= 'Z' {
+			sc += 32
+		}
+		if tc >= 'A' && tc <= 'Z' {
+			tc += 32
+		}
+		if sc != tc {
+			return false
+		}
+	}
+	return true
+}
+
 // validateRequestBodySize checks the request body against the configured size limit.
+// Only validates when MaxRequestBodySize is explicitly set; does not fall back to
+// MaxResponseBodySize since they serve different purposes.
 func (v *Validator) validateRequestBodySize(body any) error {
 	limit := v.config.MaxRequestBodySize
-	if limit <= 0 {
-		limit = v.config.MaxResponseBodySize
-	}
 	if limit <= 0 {
 		return nil
 	}

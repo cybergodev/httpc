@@ -365,16 +365,9 @@ func (s *SessionManager) storeCookies(cookies []*http.Cookie) {
 // captureFromOptions extracts cookies and headers from RequestOptions
 // and stores them in the session.
 //
-// CAVEAT: RequestOption is an opaque function, so all options are applied to a
-// temporary request. Options with side effects beyond setting fields (e.g.,
-// WithOnRequest callbacks) will execute during this capture pass in addition to
-// the real request path. Options that only set cookies, headers, query params,
-// or simple body values are safe.
-//
-// WARNING: io.Reader bodies (e.g., WithBody(reader)) will be consumed twice —
-// once during capture and once during the real request. Readers that do not
-// support re-reading will fail on the second pass. Use concrete body types
-// (string, []byte, struct for JSON) with DomainClient to avoid this issue.
+// SECURITY: OnRequest/OnResponse callbacks are cleared before and after
+// option application to prevent side-effect duplication. Only cookies and
+// headers are extracted; callbacks, query params, and body data are discarded.
 func (s *SessionManager) captureFromOptions(options []RequestOption) {
 	if len(options) == 0 {
 		return
@@ -390,8 +383,8 @@ func (s *SessionManager) captureFromOptions(options []RequestOption) {
 		tempReqPool.Put(tempReq)
 	}()
 
-	// Clear callbacks to prevent any that were set by options from firing
-	// if the temp request were accidentally used for execution.
+	// Clear callbacks before applying options to prevent WithOnRequest/
+	// WithOnResponse from executing during this capture-only pass.
 	tempReq.SetOnRequest(nil)
 	tempReq.SetOnResponse(nil)
 
@@ -402,6 +395,11 @@ func (s *SessionManager) captureFromOptions(options []RequestOption) {
 			_ = opt(tempReq)
 		}
 	}
+
+	// Immediately clear callbacks set by options to prevent any deferred
+	// or lazy evaluation from triggering side effects after capture.
+	tempReq.SetOnRequest(nil)
+	tempReq.SetOnResponse(nil)
 
 	cookies := tempReq.Cookies()
 	headers := tempReq.Headers()

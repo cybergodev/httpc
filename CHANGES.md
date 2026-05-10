@@ -4,6 +4,56 @@ All notable changes to the cybergodev/httpc library will be documented in this f
 
 ---
 
+## v1.4.3 - Performance, Bug Fixes & Code Quality (2026-05-11)
+
+### Added
+- `WithCookies(cookies []http.Cookie)` batch request option for setting multiple cookies in one call
+- Boundary condition tests for 15+ low-coverage functions (checkParentDirSymlinks, isTestEnvironment, getMIMEHeader, SetRawBodyReader, etc.)
+- Benchmarks for hasSensitiveContent (NoQuery, WithQuery, WithSensitiveQuery, WithCredentials)
+
+### Changed
+- `hasSensitiveContent()` rewritten with stack-allocated buffer for zero allocations in all cases
+- `validateSameSite()` uses zero-allocation `equalFold()` instead of `strings.ToLower()`
+- `AuditMiddleware` pre-computes mask set at creation time instead of per-request
+- `WithCookieString()` pre-allocates combined cookie slice with exact capacity
+- `WithCookie` simplified to use plain append instead of manual slice capacity check
+- `WithQuery` eliminates redundant `SetQueryParams()` call when params map already exists
+- `httpReq.WithContext()` replaced with direct reflect-based context setting to avoid Header map clone (~2KB saved per request)
+- `SanitizeURL` fast path skips `url.Parse` for URLs with non-sensitive query params
+- Header validation uses zero-allocation `asciiEqualFold` instead of `strings.EqualFold`
+- `convertResponseToResult` uses unsafe string conversion to avoid body copy
+- `WithForm` uses unified `convertToForm` encoding path and validates field keys/values for control characters
+- `ReleaseResult` now clears entire response body instead of only first 64KB
+- Streaming responses now capture redirect metadata and invoke `OnResponse` callback
+- `writeDownloadBody` accepts `filePath` as explicit parameter instead of mutating `DownloadConfig`
+- `captureFromOptions` clears `OnRequest`/`OnResponse` callbacks before AND after option application
+- `executeRequest` releases middleware chain response on error to prevent pool leaks
+- `getDefaultClient` closes client on type assertion failure, preventing resource leak
+- Multiple test suites refactored to table-driven style (6 test files consolidated)
+- Examples updated with `WithCookies()` batch method demonstration
+- README/README_zh-CN synchronized with WithCookies docs, missing DownloadConfig fields, and fixed example run command
+
+### Fixed
+- Concurrency safety claim corrected — Result objects are NOT safe for concurrent access
+- Example uses `StrictCookieSecurityConfig()` instead of `DefaultCookieSecurityConfig()`
+- Missing `Retry.EnableJitter: true` added to configuration documentation
+- Removed incorrect `MaxRequestBodySize` to `MaxResponseBodySize` fallback in `validateRequestBodySize`
+- Removed inaccurate `io.Reader` consumption warning from `captureFromOptions` doc comment
+- Duplicate test functions removed across 5 test files
+
+### Performance
+- Memory: -4.3% to -5.0% reduction across all benchmarks
+- Allocations: -1.0% to -2.4% reduction (2 fewer allocs per request)
+- `hasSensitiveContent`: 0 allocs (was 1 with query params), ~50-64 ns/op
+- `validateSameSite`: -2 allocs per cookie validation
+- `AuditMiddleware`: -1 map allocation + fewer CanonicalHeaderKey calls per request
+
+### Removed
+- Unused `httpReqCtxField` global variable and `init()` function from engine/request.go
+- Unused `ValidateURL()` wrapper from validation/netutil.go
+
+---
+
 ## v1.4.2 - Bug Fixes, Concurrency Safety & Code Quality (2026-05-07)
 
 ### Fixed

@@ -181,3 +181,47 @@ func BenchmarkClientError_Error(b *testing.B) {
 		_ = err.Error()
 	}
 }
+
+func BenchmarkHasSensitiveContent_NoQuery(b *testing.B) {
+	url := "https://api.example.com/v1/users/123/profile"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = hasSensitiveContent(url)
+	}
+}
+
+func BenchmarkHasSensitiveContent_WithQuery(b *testing.B) {
+	url := "https://api.example.com/v1/users?page=1&limit=10&sort=name"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = hasSensitiveContent(url)
+	}
+}
+
+func BenchmarkHasSensitiveContent_WithSensitiveQuery(b *testing.B) {
+	url := "https://api.example.com/v1/users?page=1&token=secret123&api_key=mykey"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = hasSensitiveContent(url)
+	}
+}
+
+func BenchmarkHasSensitiveContent_WithCredentials(b *testing.B) {
+	url := "https://user:pass@api.example.com/v1/users?page=1"
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = hasSensitiveContent(url)
+	}
+}

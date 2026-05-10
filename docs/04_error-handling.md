@@ -456,7 +456,7 @@ The `ClientError` type provides structured error information:
 ```go
 var clientErr *httpc.ClientError
 if errors.As(err, &clientErr) {
-    fmt.Printf("Type: %s\n", clientErr.Type)            // ErrorType constant
+    fmt.Printf("Code: %s\n", clientErr.Code())          // String error code (e.g., "TIMEOUT", "NETWORK_ERROR")
     fmt.Printf("Message: %s\n", clientErr.Message)      // Human-readable message
     fmt.Printf("Cause: %v\n", clientErr.Cause)          // Underlying error (use with errors.Is/As)
     fmt.Printf("URL: %s\n", clientErr.URL)              // Request URL (sanitized)
@@ -465,7 +465,7 @@ if errors.As(err, &clientErr) {
     fmt.Printf("Attempts: %d\n", clientErr.Attempts)    // Retry attempts made
     fmt.Printf("StatusCode: %d\n", clientErr.StatusCode) // HTTP status (if applicable)
     fmt.Printf("Retryable: %v\n", clientErr.IsRetryable()) // Whether error is retryable
-    fmt.Printf("Code: %s\n", clientErr.Code())          // String error code (e.g., "TIMEOUT")
+    fmt.Printf("Type: %d\n", clientErr.Type)            // ErrorType constant (int)
 }
 ```
 

@@ -133,12 +133,11 @@ func ValidateCookieSecurity(cookie *http.Cookie, config *CookieSecurityConfig) e
 // validateSameSite checks if the cookie's SameSite attribute matches the required value.
 func validateSameSite(cookie *http.Cookie, required string, allowNone bool) error {
 	cookieSameSite := sameSiteToString(cookie.SameSite)
-	requiredLower := strings.ToLower(required)
 
 	// Handle empty/unknown SameSite
 	if cookieSameSite == "" || cookieSameSite == "Default" {
 		// Default mode in modern browsers is Lax
-		if requiredLower == "lax" {
+		if equalFold(required, "lax") {
 			return nil // Default is acceptable for Lax requirement
 		}
 		return fmt.Errorf("missing SameSite attribute (required: %s)", required)
@@ -149,8 +148,8 @@ func validateSameSite(cookie *http.Cookie, required string, allowNone bool) erro
 		return fmt.Errorf("SameSite=None is not allowed")
 	}
 
-	// Validate match
-	if strings.ToLower(cookieSameSite) != requiredLower {
+	// Validate match using zero-allocation case-insensitive comparison
+	if !equalFold(cookieSameSite, required) {
 		return fmt.Errorf("invalid SameSite value '%s' (required: %s)", cookieSameSite, required)
 	}
 

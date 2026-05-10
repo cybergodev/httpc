@@ -101,9 +101,9 @@ func WithQuery(key string, value any) RequestOption {
 		if params == nil {
 			// Pre-allocate with capacity for typical query params
 			params = make(map[string]any, 4)
+			r.SetQueryParams(params)
 		}
 		params[key] = value
-		r.SetQueryParams(params)
 		return nil
 	}
 }
@@ -325,15 +325,51 @@ func setAutoDetectedBody(r *engine.Request, data any) (string, error) {
 }
 
 // WithForm sets the request body as URL-encoded form data.
+// Each field key and value is validated for control characters and size limits.
 func WithForm(data map[string]string) RequestOption {
 	return func(r *engine.Request) error {
 		if data == nil {
 			return fmt.Errorf("form data cannot be nil")
 		}
-		r.SetBody(encodeFormFields(data))
+		for k, v := range data {
+			if err := validateFormField(k, v); err != nil {
+				return err
+			}
+		}
+		encoded, err := convertToForm(data)
+		if err != nil {
+			return err
+		}
+		r.SetBody(encoded)
 		r.SetHeader("Content-Type", "application/x-www-form-urlencoded")
 		return nil
 	}
+}
+
+// validateFormField checks form field key and value for control characters
+// and size limits. Less restrictive than header validation — allows
+// underscores, dots, brackets, and other characters valid in form field names.
+func validateFormField(key, value string) error {
+	if key == "" {
+		return fmt.Errorf("form field key cannot be empty")
+	}
+	if len(key) > validation.MaxHeaderKeyLen {
+		return fmt.Errorf("form field key too long: %s (max %d)", key, validation.MaxHeaderKeyLen)
+	}
+	if len(value) > validation.MaxValueLen {
+		return fmt.Errorf("form field value too long for key %s (max %d)", key, validation.MaxValueLen)
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] < 0x20 || key[i] == 0x7F {
+			return fmt.Errorf("form field key %q contains control characters", key)
+		}
+	}
+	for i := 0; i < len(value); i++ {
+		if (value[i] < 0x20 && value[i] != 0x09) || value[i] == 0x7F {
+			return fmt.Errorf("form field value for key %q contains control characters", key)
+		}
+	}
+	return nil
 }
 
 // WithFormData sets the request body as multipart/form-data.
@@ -475,15 +511,46 @@ func WithCookie(cookie http.Cookie) RequestOption {
 			return fmt.Errorf("invalid cookie: %w", err)
 		}
 
-		cookies := r.Cookies()
-		if cap(cookies) > len(cookies) {
-			cookies = append(cookies, cookie)
-		} else {
-			newCookies := make([]http.Cookie, len(cookies), len(cookies)+1)
-			copy(newCookies, cookies)
-			cookies = append(newCookies, cookie)
+		r.SetCookies(append(r.Cookies(), cookie))
+		return nil
+	}
+}
+
+// WithCookies adds multiple cookies to the request after validation.
+// It is more efficient than calling WithCookie multiple times, as it
+// pre-allocates capacity and validates all cookies in a single pass.
+//
+// Example:
+//
+//	cookies := []http.Cookie{
+//	    {Name: "session_id", Value: "abc123"},
+//	    {Name: "user_pref", Value: "dark_mode"},
+//	    {Name: "lang", Value: "en"},
+//	}
+//	result, err := client.Get("https://api.example.com",
+//	    httpc.WithCookies(cookies),
+//	)
+func WithCookies(cookies []http.Cookie) RequestOption {
+	return func(r *engine.Request) error {
+		if len(cookies) == 0 {
+			return nil
 		}
-		r.SetCookies(cookies)
+
+		existing := r.Cookies()
+		if cap(existing) < len(existing)+len(cookies) {
+			newCookies := make([]http.Cookie, len(existing), len(existing)+len(cookies))
+			copy(newCookies, existing)
+			existing = newCookies
+		}
+
+		for i := range cookies {
+			if err := validation.ValidateCookie(&cookies[i]); err != nil {
+				return fmt.Errorf("invalid cookie %s: %w", cookies[i].Name, err)
+			}
+			existing = append(existing, cookies[i])
+		}
+
+		r.SetCookies(existing)
 		return nil
 	}
 }
@@ -550,13 +617,15 @@ func WithCookieString(cookieString string) RequestOption {
 		}
 
 		existing := r.Cookies()
+		combined := make([]http.Cookie, len(existing), len(existing)+len(cookies))
+		copy(combined, existing)
 		for i := range cookies {
 			if err := validation.ValidateCookie(&cookies[i]); err != nil {
 				return fmt.Errorf("invalid cookie %s: %w", cookies[i].Name, err)
 			}
-			existing = append(existing, cookies[i])
+			combined = append(combined, cookies[i])
 		}
-		r.SetCookies(existing)
+		r.SetCookies(combined)
 
 		return nil
 	}
@@ -656,20 +725,33 @@ func WithOnResponse(callback func(resp ResponseMutator) error) RequestOption {
 	}
 }
 
-// WithSecureCookie creates a request option that enforces cookie security attributes.
-// on the cookie being added to the request. The securityConfig defines the required
+// WithSecureCookie creates a request option that enforces cookie security attributes
+// on cookies already added to the request. The securityConfig defines the required
 // security attributes (Secure, HttpOnly, SameSite).
+//
+// IMPORTANT: This option validates only cookies present at the time it is applied.
+// Place WithSecureCookie AFTER all WithCookie/WithCookieMap options:
+//
+//	// Correct order: add cookies first, then validate
+//	result, err := client.Get(url,
+//	    httpc.WithCookie(sessionCookie),
+//	    httpc.WithCookieMap(otherCookies),
+//	    httpc.WithSecureCookie(securityConfig),
+//	)
+//
+// For session-level cookie security that validates all cookies regardless of order,
+// use SessionManager.SetCookieSecurity instead.
 //
 // Example:
 //
 //	security := &validation.CookieSecurityConfig{
-//		RequireSecure:     true,
-//		RequireHttpOnly:   true,
-//		RequireSameSite:   "Strict",
-//		AllowSameSiteNone: false,
+//	    RequireSecure:     true,
+//	    RequireHttpOnly:   true,
+//	    RequireSameSite:   "Strict",
+//	    AllowSameSiteNone: false,
 //	}
 //	result, err := client.Get("https://api.example.com",
-//		httpc.WithSecureCookie(security),
+//	    httpc.WithSecureCookie(security),
 //	)
 func WithSecureCookie(securityConfig *validation.CookieSecurityConfig) RequestOption {
 	return func(r *engine.Request) error {

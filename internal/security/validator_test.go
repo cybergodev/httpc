@@ -301,7 +301,7 @@ func TestValidator_ValidateHeaders(t *testing.T) {
 func TestValidator_ValidateRequestSize(t *testing.T) {
 	validator := NewValidator()
 	// Override max size for testing
-	validator.config.MaxResponseBodySize = 1024 // 1KB limit
+	validator.config.MaxRequestBodySize = 1024 // 1KB limit
 
 	tests := []struct {
 		name      string
@@ -367,7 +367,7 @@ func TestValidator_ValidateRequestSize(t *testing.T) {
 func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 	t.Run("url.Values small", func(t *testing.T) {
 		validator := NewValidator()
-		validator.config.MaxResponseBodySize = 1024
+		validator.config.MaxRequestBodySize = 1024
 
 		values := url.Values{"key": {"value"}}
 		req := &Request{Method: "POST", URL: "http://example.com", Body: values}
@@ -380,7 +380,7 @@ func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 
 	t.Run("url.Values too large", func(t *testing.T) {
 		validator := NewValidator()
-		validator.config.MaxResponseBodySize = 10
+		validator.config.MaxRequestBodySize = 10
 
 		values := url.Values{"key": {strings.Repeat("a", 50)}}
 		req := &Request{Method: "POST", URL: "http://example.com", Body: values}
@@ -393,7 +393,7 @@ func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 
 	t.Run("FormData small", func(t *testing.T) {
 		validator := NewValidator()
-		validator.config.MaxResponseBodySize = 1024
+		validator.config.MaxRequestBodySize = 1024
 
 		form := &types.FormData{
 			Fields: map[string]string{"username": "john"},
@@ -409,7 +409,7 @@ func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 
 	t.Run("FormData too large", func(t *testing.T) {
 		validator := NewValidator()
-		validator.config.MaxResponseBodySize = 5
+		validator.config.MaxRequestBodySize = 5
 
 		form := &types.FormData{
 			Fields: map[string]string{"data": strings.Repeat("x", 100)},
@@ -424,7 +424,7 @@ func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 
 	t.Run("FormData files too large", func(t *testing.T) {
 		validator := NewValidator()
-		validator.config.MaxResponseBodySize = 10
+		validator.config.MaxRequestBodySize = 10
 
 		form := &types.FormData{
 			Files: map[string]*types.FileData{"big": {Content: make([]byte, 100)}},
@@ -742,7 +742,7 @@ func TestValidateRequestBodySize_UrlValues(t *testing.T) {
 
 // TestValidateRequestBodySize_ZeroLimitFallback verifies that when
 // MaxRequestBodySize is zero, the validator falls back to MaxResponseBodySize.
-func TestValidateRequestBodySize_ZeroLimitFallback(t *testing.T) {
+func TestValidateRequestBodySize_ZeroLimitNoValidation(t *testing.T) {
 	validator := NewValidatorWithConfig(&Config{
 		ValidateURL:         true,
 		ValidateHeaders:     true,
@@ -758,11 +758,8 @@ func TestValidateRequestBodySize_ZeroLimitFallback(t *testing.T) {
 	}
 
 	err := validator.ValidateRequest(req)
-	if err == nil {
-		t.Fatal("expected error when body exceeds fallback limit, got nil")
-	}
-	if !strings.Contains(err.Error(), "exceeds limit") {
-		t.Errorf("error should mention body size limit, got: %v", err)
+	if err != nil {
+		t.Fatalf("expected no error when MaxRequestBodySize is 0, got: %v", err)
 	}
 }
 

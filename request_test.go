@@ -308,314 +308,205 @@ func TestRequest_QueryParameters(t *testing.T) {
 // ----------------------------------------------------------------------------
 
 func TestRequest_WithBody(t *testing.T) {
+	t.Parallel()
+
 	type TestData struct {
 		Message string `json:"message" xml:"message"`
 		Code    int    `json:"code" xml:"code"`
 	}
 
-	t.Run("AutoDetect_JSON", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Content-Type") != "application/json" {
-				t.Errorf("Expected Content-Type: application/json, got %s", r.Header.Get("Content-Type"))
+	// untaggedRaw is used for the AutoDetect_UntaggedStruct test case.
+	type untaggedRaw struct {
+		Name string
+		Age  int
+	}
+
+	// bodyOption returns the RequestOption for each test case. This helper
+	// is needed because the table cannot store variadic BodyKind arguments
+	// directly alongside interface{} bodies without losing type information.
+	bodyOption := func(body interface{}, kinds []BodyKind) RequestOption {
+		switch len(kinds) {
+		case 0:
+			return WithBody(body)
+		case 1:
+			return WithBody(body, kinds[0])
+		default:
+			return WithBody(body, kinds[0])
+		}
+	}
+
+	tests := []struct {
+		name              string
+		body              interface{}
+		kinds             []BodyKind // empty = auto-detect; 1 element = explicit kind
+		needsServer       bool       // true = spin up httptest.Server and check Content-Type
+		expectedType      string     // exact Content-Type expected (used when usePrefix=false)
+		usePrefix         bool       // true = check strings.HasPrefix instead of exact match
+		expectError       bool       // true = expect non-nil error, no server needed
+	}{
+		// --- Auto-detect cases ---
+		{
+			name:         "AutoDetect_JSON",
+			body:         TestData{Message: "test", Code: 200},
+			needsServer:  true,
+			expectedType: "application/json",
+		},
+		{
+			name:         "AutoDetect_String",
+			body:         "plain text body",
+			needsServer:  true,
+			expectedType: "text/plain; charset=utf-8",
+		},
+		{
+			name:         "AutoDetect_ByteArray",
+			body:         []byte("binary data"),
+			needsServer:  true,
+			expectedType: "application/octet-stream",
+		},
+		{
+			name:         "AutoDetect_FormMap",
+			body:         map[string]string{"key": "value"},
+			needsServer:  true,
+			expectedType: "application/x-www-form-urlencoded",
+		},
+		{
+			name:         "AutoDetect_FormData",
+			body:         &FormData{Fields: map[string]string{"field1": "value1"}},
+			needsServer:  true,
+			expectedType: "multipart/form-data",
+			usePrefix:    true,
+		},
+		{
+			name:         "AutoDetect_Reader",
+			body:         strings.NewReader("reader content"),
+			needsServer:  true,
+			expectedType: "", // io.Reader should NOT set Content-Type
+		},
+		{
+			name:         "AutoDetect_UntaggedStruct",
+			body:         untaggedRaw{Name: "test", Age: 30},
+			needsServer:  true,
+			expectedType: "application/json",
+		},
+
+		// --- Explicit body-kind cases ---
+		{
+			name:         "Explicit_JSON",
+			body:         "string as json",
+			kinds:        []BodyKind{BodyJSON},
+			needsServer:  true,
+			expectedType: "application/json",
+		},
+		{
+			name:         "Explicit_XML",
+			body:         TestData{Message: "test", Code: 200},
+			kinds:        []BodyKind{BodyXML},
+			needsServer:  true,
+			expectedType: "application/xml",
+		},
+		{
+			name:         "Explicit_Form",
+			body:         map[string]string{"key": "value"},
+			kinds:        []BodyKind{BodyForm},
+			needsServer:  true,
+			expectedType: "application/x-www-form-urlencoded",
+		},
+		{
+			name:         "Explicit_Binary",
+			body:         []byte("binary"),
+			kinds:        []BodyKind{BodyBinary},
+			needsServer:  true,
+			expectedType: "application/octet-stream",
+		},
+		{
+			name:         "Explicit_Multipart",
+			body:         &FormData{Fields: map[string]string{"field1": "value1"}},
+			kinds:        []BodyKind{BodyMultipart},
+			needsServer:  true,
+			expectedType: "multipart/form-data",
+			usePrefix:    true,
+		},
+
+		// --- Error cases (no server needed) ---
+		{
+			name:        "Error_NilBody",
+			body:        nil,
+			expectError: true,
+		},
+		{
+			name:        "Error_FormWrongType",
+			body:        "not a map",
+			kinds:       []BodyKind{BodyForm},
+			expectError: true,
+		},
+		{
+			name:        "Error_BinaryWrongType",
+			body:        123,
+			kinds:       []BodyKind{BodyBinary},
+			expectError: true,
+		},
+		{
+			name:        "Error_MultipartWrongType",
+			body:        map[string]string{"key": "value"},
+			kinds:       []BodyKind{BodyMultipart},
+			expectError: true,
+		},
+		{
+			name:        "AutoDetect_NilByteArray",
+			body:        []byte(nil),
+			expectError: true,
+		},
+		{
+			name:        "AutoDetect_NilFormData",
+			body:        (*FormData)(nil),
+			expectError: true,
+		},
+		{
+			name:        "AutoDetect_NilFormMap",
+			body:        map[string]string(nil),
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _ := newTestClient()
+			defer client.Close()
+
+			opt := bodyOption(tt.body, tt.kinds)
+
+			if tt.needsServer {
+				expectedType := tt.expectedType
+				usePrefix := tt.usePrefix
+
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					got := r.Header.Get("Content-Type")
+					if usePrefix {
+						if !strings.HasPrefix(got, expectedType) {
+							t.Errorf("Expected Content-Type prefix %q, got %q", expectedType, got)
+						}
+					} else {
+						if got != expectedType {
+							t.Errorf("Expected Content-Type %q, got %q", expectedType, got)
+						}
+					}
+					w.WriteHeader(http.StatusOK)
+				}))
+				defer server.Close()
+
+				_, err := client.Post(server.URL, opt)
+				if err != nil {
+					t.Fatalf("Request failed: %v", err)
+				}
+			} else {
+				// Error-only cases: no server needed
+				_, err := client.Post("http://example.com", opt)
+				if tt.expectError && err == nil {
+					t.Error("Expected error but got nil")
+				}
 			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		data := TestData{Message: "test", Code: 200}
-		_, err := client.Post(server.URL, WithBody(data))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("AutoDetect_String", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Content-Type") != "text/plain; charset=utf-8" {
-				t.Errorf("Expected Content-Type: text/plain; charset=utf-8, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post(server.URL, WithBody("plain text body"))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("AutoDetect_ByteArray", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Content-Type") != "application/octet-stream" {
-				t.Errorf("Expected Content-Type: application/octet-stream, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post(server.URL, WithBody([]byte("binary data")))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("AutoDetect_FormMap", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
-				t.Errorf("Expected Content-Type: application/x-www-form-urlencoded, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post(server.URL, WithBody(map[string]string{"key": "value"}))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("AutoDetect_FormData", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
-				t.Errorf("Expected Content-Type: multipart/form-data, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		formData := &FormData{
-			Fields: map[string]string{"field1": "value1"},
-		}
-		_, err := client.Post(server.URL, WithBody(formData))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("AutoDetect_Reader", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// io.Reader should NOT set Content-Type automatically
-			if r.Header.Get("Content-Type") != "" {
-				t.Errorf("Expected no Content-Type, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post(server.URL, WithBody(strings.NewReader("reader content")))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("Explicit_JSON", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Content-Type") != "application/json" {
-				t.Errorf("Expected Content-Type: application/json, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		// Even with string input, explicit JSON should set application/json
-		_, err := client.Post(server.URL, WithBody("string as json", BodyJSON))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("Explicit_XML", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Content-Type") != "application/xml" {
-				t.Errorf("Expected Content-Type: application/xml, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		data := TestData{Message: "test", Code: 200}
-		_, err := client.Post(server.URL, WithBody(data, BodyXML))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("Explicit_Form", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Content-Type") != "application/x-www-form-urlencoded" {
-				t.Errorf("Expected Content-Type: application/x-www-form-urlencoded, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post(server.URL, WithBody(map[string]string{"key": "value"}, BodyForm))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("Explicit_Binary", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Content-Type") != "application/octet-stream" {
-				t.Errorf("Expected Content-Type: application/octet-stream, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post(server.URL, WithBody([]byte("binary"), BodyBinary))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("Explicit_Multipart", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
-				t.Errorf("Expected Content-Type: multipart/form-data, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		formData := &FormData{
-			Fields: map[string]string{"field1": "value1"},
-		}
-		_, err := client.Post(server.URL, WithBody(formData, BodyMultipart))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("Error_NilBody", func(t *testing.T) {
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post("http://example.com", WithBody(nil))
-		if err == nil {
-			t.Error("Expected error for nil body")
-		}
-	})
-
-	t.Run("Error_FormWrongType", func(t *testing.T) {
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post("http://example.com", WithBody("not a map", BodyForm))
-		if err == nil {
-			t.Error("Expected error for wrong type with BodyForm")
-		}
-	})
-
-	t.Run("Error_BinaryWrongType", func(t *testing.T) {
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post("http://example.com", WithBody(123, BodyBinary))
-		if err == nil {
-			t.Error("Expected error for wrong type with BodyBinary")
-		}
-	})
-
-	t.Run("Error_MultipartWrongType", func(t *testing.T) {
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post("http://example.com", WithBody(map[string]string{"key": "value"}, BodyMultipart))
-		if err == nil {
-			t.Error("Expected error for wrong type with BodyMultipart")
-		}
-	})
-
-	t.Run("AutoDetect_NilByteArray", func(t *testing.T) {
-		client, _ := newTestClient()
-		defer client.Close()
-
-		var data []byte = nil
-		_, err := client.Post("http://example.com", WithBody(data))
-		if err == nil {
-			t.Error("Expected error for nil byte array")
-		}
-	})
-
-	t.Run("AutoDetect_NilFormData", func(t *testing.T) {
-		client, _ := newTestClient()
-		defer client.Close()
-
-		var formData *FormData = nil
-		_, err := client.Post("http://example.com", WithBody(formData))
-		if err == nil {
-			t.Error("Expected error for nil FormData")
-		}
-	})
-
-	t.Run("AutoDetect_NilFormMap", func(t *testing.T) {
-		client, _ := newTestClient()
-		defer client.Close()
-
-		var formMap map[string]string = nil
-		_, err := client.Post("http://example.com", WithBody(formMap))
-		if err == nil {
-			t.Error("Expected error for nil form map")
-		}
-	})
-
-	t.Run("AutoDetect_UntaggedStruct", func(t *testing.T) {
-		type raw struct {
-			Name string
-			Age  int
-		}
-
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.Header.Get("Content-Type") != "application/json" {
-				t.Errorf("Expected Content-Type: application/json, got %s", r.Header.Get("Content-Type"))
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Post(server.URL, WithBody(raw{Name: "test", Age: 30}))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
+		})
+	}
 }
 
 // ----------------------------------------------------------------------------

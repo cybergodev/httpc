@@ -202,19 +202,6 @@ func equalFold(s, t string) bool {
 	return true
 }
 
-// ValidateURL performs comprehensive URL validation including:
-// - Empty check
-// - Length check
-// - Parse validation
-// - Scheme validation (http/https only)
-// - Host validation
-//
-// This function centralizes URL validation logic for use by security.Validator.
-func ValidateURL(urlStr string) error {
-	_, err := ValidateAndParseURL(urlStr)
-	return err
-}
-
 // ValidateAndParseURL validates a URL and returns the parsed result.
 // This avoids callers needing to parse the URL again after validation.
 func ValidateAndParseURL(urlStr string) (*url.URL, error) {

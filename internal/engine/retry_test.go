@@ -58,142 +58,138 @@ func TestRetryEngine_ShouldRetry_MaxAttemptsExceeded(t *testing.T) {
 	}
 }
 
-func TestRetryEngine_ShouldRetry_NetworkErrors(t *testing.T) {
+func TestRetryEngine_ShouldRetry(t *testing.T) {
 	config := &Config{
 		MaxRetries: 3,
 	}
 
 	engine := newRetryEngine(config)
 
-	tests := []struct {
-		name     string
-		err      error
-		expected bool
-	}{
-		{
-			name: "OpError is retryable (temporary)",
-			err: &net.OpError{
-				Op:   "dial",
-				Net:  "tcp",
-				Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80},
-				Err:  errors.New("connection refused"),
+	t.Run("NetworkErrors", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			err      error
+			expected bool
+		}{
+			{
+				name: "OpError is retryable (temporary)",
+				err: &net.OpError{
+					Op:   "dial",
+					Net:  "tcp",
+					Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80},
+					Err:  errors.New("connection refused"),
+				},
+				expected: false, // OpError.Temporary() returns false by default, so not retryable via net.Error interface
 			},
-			expected: false, // OpError.Temporary() returns false by default, so not retryable via net.Error interface
-		},
-		{
-			name: "DNSError is retryable (temporary)",
-			err: &net.DNSError{
-				Err:         "no such host",
-				Name:        "example.com",
-				Server:      "8.8.8.8",
-				IsTimeout:   false,
-				IsTemporary: true, // Set to true to make it retryable
+			{
+				name: "DNSError is retryable (temporary)",
+				err: &net.DNSError{
+					Err:         "no such host",
+					Name:        "example.com",
+					Server:      "8.8.8.8",
+					IsTimeout:   false,
+					IsTemporary: true, // Set to true to make it retryable
+				},
+				expected: true,
 			},
-			expected: true,
-		},
-		{
-			name: "DNSError not temporary",
-			err: &net.DNSError{
-				Err:         "no such host",
-				Name:        "example.com",
-				Server:      "8.8.8.8",
-				IsTimeout:   false,
-				IsTemporary: false,
+			{
+				name: "DNSError not temporary",
+				err: &net.DNSError{
+					Err:         "no such host",
+					Name:        "example.com",
+					Server:      "8.8.8.8",
+					IsTimeout:   false,
+					IsTemporary: false,
+				},
+				expected: false,
 			},
-			expected: false,
-		},
-		{
-			name:     "Context canceled is not retryable",
-			err:      context.Canceled,
-			expected: false,
-		},
-		{
-			name:     "Context deadline exceeded is not retryable",
-			err:      context.DeadlineExceeded,
-			expected: false,
-		},
-	}
+			{
+				name:     "Context canceled is not retryable",
+				err:      context.Canceled,
+				expected: false,
+			},
+			{
+				name:     "Context deadline exceeded is not retryable",
+				err:      context.DeadlineExceeded,
+				expected: false,
+			},
+		}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := engine.ShouldRetry(nil, tt.err, 0)
-			if result != tt.expected {
-				t.Errorf("Expected %v, got %v for error: %v", tt.expected, result, tt.err)
-			}
-		})
-	}
-}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				result := engine.ShouldRetry(nil, tt.err, 0)
+				if result != tt.expected {
+					t.Errorf("Expected %v, got %v for error: %v", tt.expected, result, tt.err)
+				}
+			})
+		}
+	})
 
-func TestRetryEngine_ShouldRetry_StatusCodes(t *testing.T) {
-	config := &Config{
-		MaxRetries: 3,
-	}
+	t.Run("StatusCodes", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			statusCode int
+			expected   bool
+		}{
+			{
+				name:       "408 Request Timeout is retryable",
+				statusCode: http.StatusRequestTimeout,
+				expected:   true,
+			},
+			{
+				name:       "429 Too Many Requests is retryable",
+				statusCode: http.StatusTooManyRequests,
+				expected:   true,
+			},
+			{
+				name:       "500 Internal Server Error is retryable",
+				statusCode: http.StatusInternalServerError,
+				expected:   true,
+			},
+			{
+				name:       "502 Bad Gateway is retryable",
+				statusCode: http.StatusBadGateway,
+				expected:   true,
+			},
+			{
+				name:       "503 Service Unavailable is retryable",
+				statusCode: http.StatusServiceUnavailable,
+				expected:   true,
+			},
+			{
+				name:       "504 Gateway Timeout is retryable",
+				statusCode: http.StatusGatewayTimeout,
+				expected:   true,
+			},
+			{
+				name:       "200 OK is not retryable",
+				statusCode: http.StatusOK,
+				expected:   false,
+			},
+			{
+				name:       "400 Bad Request is not retryable",
+				statusCode: http.StatusBadRequest,
+				expected:   false,
+			},
+			{
+				name:       "404 Not Found is not retryable",
+				statusCode: http.StatusNotFound,
+				expected:   false,
+			},
+		}
 
-	engine := newRetryEngine(config)
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				resp := &Response{}
+				resp.SetStatusCode(tt.statusCode)
 
-	tests := []struct {
-		name       string
-		statusCode int
-		expected   bool
-	}{
-		{
-			name:       "408 Request Timeout is retryable",
-			statusCode: http.StatusRequestTimeout,
-			expected:   true,
-		},
-		{
-			name:       "429 Too Many Requests is retryable",
-			statusCode: http.StatusTooManyRequests,
-			expected:   true,
-		},
-		{
-			name:       "500 Internal Server Error is retryable",
-			statusCode: http.StatusInternalServerError,
-			expected:   true,
-		},
-		{
-			name:       "502 Bad Gateway is retryable",
-			statusCode: http.StatusBadGateway,
-			expected:   true,
-		},
-		{
-			name:       "503 Service Unavailable is retryable",
-			statusCode: http.StatusServiceUnavailable,
-			expected:   true,
-		},
-		{
-			name:       "504 Gateway Timeout is retryable",
-			statusCode: http.StatusGatewayTimeout,
-			expected:   true,
-		},
-		{
-			name:       "200 OK is not retryable",
-			statusCode: http.StatusOK,
-			expected:   false,
-		},
-		{
-			name:       "400 Bad Request is not retryable",
-			statusCode: http.StatusBadRequest,
-			expected:   false,
-		},
-		{
-			name:       "404 Not Found is not retryable",
-			statusCode: http.StatusNotFound,
-			expected:   false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			resp := &Response{}
-			resp.SetStatusCode(tt.statusCode)
-
-			result := engine.ShouldRetry(resp, nil, 0)
-			if result != tt.expected {
-				t.Errorf("Expected %v, got %v", tt.expected, result)
-			}
-		})
-	}
+				result := engine.ShouldRetry(resp, nil, 0)
+				if result != tt.expected {
+					t.Errorf("Expected %v, got %v", tt.expected, result)
+				}
+			})
+		}
+	})
 }
 
 func TestRetryEngine_GetDelay_ExponentialBackoff(t *testing.T) {
@@ -457,34 +453,36 @@ func TestRetryEngine_IsRetryableError(t *testing.T) {
 // Note: mockNetError is defined in errors_test.go and shared across test files
 
 func TestRetryEngine_GetJitter(t *testing.T) {
-	config := &Config{}
-	engine := newRetryEngine(config)
+	t.Run("Random jitter within bounds", func(t *testing.T) {
+		config := &Config{}
+		engine := newRetryEngine(config)
 
-	maxJitter := 100 * time.Millisecond
+		maxJitter := 100 * time.Millisecond
 
-	// Test multiple times to ensure randomness
-	for i := 0; i < 10; i++ {
-		jitter := engine.getJitter(maxJitter)
+		// Test multiple times to ensure randomness
+		for i := 0; i < 10; i++ {
+			jitter := engine.getJitter(maxJitter)
 
-		if jitter < 0 {
-			t.Errorf("Jitter should not be negative, got %v", jitter)
+			if jitter < 0 {
+				t.Errorf("Jitter should not be negative, got %v", jitter)
+			}
+
+			if jitter > maxJitter {
+				t.Errorf("Jitter should not exceed max, got %v (max: %v)", jitter, maxJitter)
+			}
 		}
+	})
 
-		if jitter > maxJitter {
-			t.Errorf("Jitter should not exceed max, got %v (max: %v)", jitter, maxJitter)
+	t.Run("Zero max returns zero", func(t *testing.T) {
+		config := &Config{}
+		engine := newRetryEngine(config)
+
+		jitter := engine.getJitter(0)
+
+		if jitter != 0 {
+			t.Errorf("Expected 0 jitter for 0 maxJitter, got %v", jitter)
 		}
-	}
-}
-
-func TestRetryEngine_GetJitter_ZeroMax(t *testing.T) {
-	config := &Config{}
-	engine := newRetryEngine(config)
-
-	jitter := engine.getJitter(0)
-
-	if jitter != 0 {
-		t.Errorf("Expected 0 jitter for 0 maxJitter, got %v", jitter)
-	}
+	})
 }
 
 // ============================================================================
@@ -498,6 +496,7 @@ func TestParseRetryAfterHeader(t *testing.T) {
 		expectDelay time.Duration
 		expectMin   time.Duration // For time-based tests (future dates)
 	}{
+		// --- Basic header cases ---
 		{
 			name:        "Nil headers",
 			headers:     nil,
@@ -513,6 +512,7 @@ func TestParseRetryAfterHeader(t *testing.T) {
 			headers:     http.Header{"Content-Type": {"application/json"}},
 			expectDelay: 0,
 		},
+		// --- Delta-seconds format ---
 		{
 			name:        "Delta-seconds format",
 			headers:     http.Header{"Retry-After": {"30"}},
@@ -553,6 +553,22 @@ func TestParseRetryAfterHeader(t *testing.T) {
 			headers:     http.Header{"Retry-After": {"30", "60"}},
 			expectDelay: 30 * time.Second,
 		},
+		// --- Edge cases ---
+		{
+			name:        "Whitespace in value",
+			headers:     http.Header{"Retry-After": {" 30 "}},
+			expectDelay: 0, // strconv.Atoi does NOT trim whitespace, so this should fail and return 0
+		},
+		{
+			name:        "Float value falls back to date parsing",
+			headers:     http.Header{"Retry-After": {"30.5"}},
+			expectDelay: 0, // Float should fail both integer and date parsing
+		},
+		{
+			name:        "Very large seconds value capped at 60s",
+			headers:     http.Header{"Retry-After": {"86400"}}, // 24 hours
+			expectDelay: 60 * time.Second,
+		},
 	}
 
 	for _, tt := range tests {
@@ -571,79 +587,49 @@ func TestParseRetryAfterHeader(t *testing.T) {
 			}
 		})
 	}
-}
 
-func TestParseRetryAfterHeader_HTTPDateFormat(t *testing.T) {
-	t.Run("Future date returns positive delay", func(t *testing.T) {
-		// Create a date 30 seconds in the future
-		futureTime := time.Now().Add(30 * time.Second).UTC()
-		httpDate := futureTime.Format(time.RFC1123)
+	// --- HTTP date format tests (time-dependent, cannot use static table) ---
+	t.Run("HTTP date format", func(t *testing.T) {
+		t.Run("Future date returns positive delay", func(t *testing.T) {
+			// Create a date 30 seconds in the future
+			futureTime := time.Now().Add(30 * time.Second).UTC()
+			httpDate := futureTime.Format(time.RFC1123)
 
-		headers := http.Header{"Retry-After": {httpDate}}
-		delay := parseRetryAfterHeader(headers)
+			headers := http.Header{"Retry-After": {httpDate}}
+			delay := parseRetryAfterHeader(headers)
 
-		// Should be approximately 30 seconds (allow some tolerance for test execution)
-		if delay < 25*time.Second || delay > 35*time.Second {
-			t.Errorf("Expected delay around 30s, got %v", delay)
-		}
-	})
+			// Should be approximately 30 seconds (allow some tolerance for test execution)
+			if delay < 25*time.Second || delay > 35*time.Second {
+				t.Errorf("Expected delay around 30s, got %v", delay)
+			}
+		})
 
-	t.Run("Past date returns zero", func(t *testing.T) {
-		// Create a date in the past
-		pastTime := time.Now().Add(-30 * time.Second).UTC()
-		httpDate := pastTime.Format(time.RFC1123)
+		t.Run("Past date returns zero", func(t *testing.T) {
+			// Create a date in the past
+			pastTime := time.Now().Add(-30 * time.Second).UTC()
+			httpDate := pastTime.Format(time.RFC1123)
 
-		headers := http.Header{"Retry-After": {httpDate}}
-		delay := parseRetryAfterHeader(headers)
+			headers := http.Header{"Retry-After": {httpDate}}
+			delay := parseRetryAfterHeader(headers)
 
-		if delay != 0 {
-			t.Errorf("Expected 0 delay for past date, got %v", delay)
-		}
-	})
+			if delay != 0 {
+				t.Errorf("Expected 0 delay for past date, got %v", delay)
+			}
+		})
 
-	t.Run("Current time returns zero or very small delay", func(t *testing.T) {
-		// Create a date at current time
-		now := time.Now().UTC()
-		httpDate := now.Format(time.RFC1123)
+		t.Run("Current time returns zero or very small delay", func(t *testing.T) {
+			// Create a date at current time
+			now := time.Now().UTC()
+			httpDate := now.Format(time.RFC1123)
 
-		headers := http.Header{"Retry-After": {httpDate}}
-		delay := parseRetryAfterHeader(headers)
+			headers := http.Header{"Retry-After": {httpDate}}
+			delay := parseRetryAfterHeader(headers)
 
-		// Should be very small (0 or close to it)
-		if delay > 5*time.Second {
-			t.Errorf("Expected very small delay for current time, got %v", delay)
-		}
-	})
-}
-
-func TestParseRetryAfterHeader_EdgeCases(t *testing.T) {
-	t.Run("Whitespace in value", func(t *testing.T) {
-		headers := http.Header{"Retry-After": {" 30 "}}
-		delay := parseRetryAfterHeader(headers)
-
-		// strconv.Atoi does NOT trim whitespace, so this should fail and return 0
-		if delay != 0 {
-			t.Errorf("Expected 0s delay for whitespace value, got %v", delay)
-		}
-	})
-
-	t.Run("Float value falls back to date parsing", func(t *testing.T) {
-		headers := http.Header{"Retry-After": {"30.5"}}
-		delay := parseRetryAfterHeader(headers)
-
-		// Float should fail both integer and date parsing
-		if delay != 0 {
-			t.Errorf("Expected 0 delay for invalid float, got %v", delay)
-		}
-	})
-
-	t.Run("Very large seconds value capped at 60s", func(t *testing.T) {
-		headers := http.Header{"Retry-After": {"86400"}} // 24 hours
-		delay := parseRetryAfterHeader(headers)
-
-		if delay != 60*time.Second {
-			t.Errorf("Expected 60s capped delay, got %v", delay)
-		}
+			// Should be very small (0 or close to it)
+			if delay > 5*time.Second {
+				t.Errorf("Expected very small delay for current time, got %v", delay)
+			}
+		})
 	})
 }
 

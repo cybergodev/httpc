@@ -6,14 +6,17 @@ import (
 )
 
 // TestParseWindowsProxyString verifies parsing of Windows proxy server strings
-// in both simple host:port and per-protocol formats.
+// in both simple host:port and per-protocol formats, including protocol priority
+// and URL verification.
 func TestParseWindowsProxyString(t *testing.T) {
 	tests := []struct {
 		name     string
 		input    string
-		wantHost string
 		wantErr  bool
+		wantHost string // expected hostname (checked when wantErr is false and non-empty)
+		wantURL  string // expected full URL string (checked when non-empty)
 	}{
+		// Basic parsing cases
 		{
 			name:     "Simple host:port",
 			input:    "proxy:8080",
@@ -42,6 +45,7 @@ func TestParseWindowsProxyString(t *testing.T) {
 			input:   "   ",
 			wantErr: true,
 		},
+		// Per-protocol parsing
 		{
 			name:     "Per-protocol returns first matching protocol",
 			input:    "http=proxy-http:8080;https=proxy-https:8443",
@@ -54,6 +58,14 @@ func TestParseWindowsProxyString(t *testing.T) {
 			wantHost: "proxy-http",
 			wantErr:  false,
 		},
+		// Protocol priority: first matching protocol (http or https) is returned
+		{
+			name:     "Per-protocol https first has priority",
+			input:    "https=https-proxy:8443;http=http-proxy:8080",
+			wantHost: "https-proxy",
+			wantErr:  false,
+		},
+		// Full URL prefixes
 		{
 			name:     "Full URL with http prefix",
 			input:    "http://proxy.example.com:8080",
@@ -78,6 +90,22 @@ func TestParseWindowsProxyString(t *testing.T) {
 			wantHost: "http-proxy",
 			wantErr:  false,
 		},
+		// URL verification: ensure returned URL is valid and usable
+		{
+			name:    "Simple proxy gets http scheme prepended",
+			input:   "proxy:8080",
+			wantURL: "http://proxy:8080",
+		},
+		{
+			name:    "http:// prefix preserved",
+			input:   "http://proxy:8080",
+			wantURL: "http://proxy:8080",
+		},
+		{
+			name:    "Per-protocol result has http scheme",
+			input:   "https=secure-proxy:8443",
+			wantURL: "http://secure-proxy:8443",
+		},
 	}
 
 	for _, tt := range tests {
@@ -100,70 +128,22 @@ func TestParseWindowsProxyString(t *testing.T) {
 			}
 
 			// Verify the host part of the resulting URL
-			host := result.Hostname()
-			if host != tt.wantHost {
-				t.Errorf("host = %q, want %q (full URL: %s)", host, tt.wantHost, result.String())
-			}
-		})
-	}
-}
-
-// TestParseWindowsProxyString_ProtocolPriority verifies per-protocol parsing
-// returns the first matching protocol (http or https) encountered.
-func TestParseWindowsProxyString_ProtocolPriority(t *testing.T) {
-	result, err := parseWindowsProxyString("https=https-proxy:8443;http=http-proxy:8080")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	if result == nil {
-		t.Fatal("expected non-nil URL")
-	}
-
-	host := result.Hostname()
-	if host != "https-proxy" {
-		t.Errorf("first matching protocol should be returned, got host = %q, want %q", host, "https-proxy")
-	}
-}
-
-// TestParseWindowsProxyString_URLVerification verifies that the returned URL
-// is valid and usable by an http.Transport.
-func TestParseWindowsProxyString_URLVerification(t *testing.T) {
-	tests := []struct {
-		name    string
-		input   string
-		wantURL string
-	}{
-		{
-			name:    "Simple proxy gets http scheme prepended",
-			input:   "proxy:8080",
-			wantURL: "http://proxy:8080",
-		},
-		{
-			name:    "http:// prefix preserved",
-			input:   "http://proxy:8080",
-			wantURL: "http://proxy:8080",
-		},
-		{
-			name:    "Per-protocol result has http scheme",
-			input:   "https=secure-proxy:8443",
-			wantURL: "http://secure-proxy:8443",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := parseWindowsProxyString(tt.input)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
+			if tt.wantHost != "" {
+				host := result.Hostname()
+				if host != tt.wantHost {
+					t.Errorf("host = %q, want %q (full URL: %s)", host, tt.wantHost, result.String())
+				}
 			}
 
-			got := result.String()
-			if got != tt.wantURL {
-				// url.URL.String() may add trailing slash for empty path
-				wantURL, _ := url.Parse(tt.wantURL)
-				if got != wantURL.String() {
-					t.Errorf("URL = %q, want %q", got, wantURL.String())
+			// Verify the full URL string
+			if tt.wantURL != "" {
+				got := result.String()
+				if got != tt.wantURL {
+					// url.URL.String() may add trailing slash for empty path
+					wantURL, _ := url.Parse(tt.wantURL)
+					if got != wantURL.String() {
+						t.Errorf("URL = %q, want %q", got, wantURL.String())
+					}
 				}
 			}
 		})

@@ -8,6 +8,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/cybergodev/httpc/internal/engine"
 )
@@ -155,6 +156,10 @@ func New(config ...*Config) (Client, error) {
 // accidental mutation of shared config state. This is called internally
 // when creating a new client to ensure each client has its own
 // independent configuration.
+//
+// Note: RetryConfig.CustomPolicy is NOT deep-copied. If the policy
+// implementation contains mutable state, do not share the same Config
+// instance across multiple clients concurrently.
 func deepCopyConfig(src *Config) *Config {
 	dst := *src
 
@@ -353,7 +358,16 @@ func (c *clientImpl) executeRequest(ctx context.Context, method, url string, opt
 		}
 	}
 
-	return c.middlewareChain(ctx, engineReq)
+	resp, err := c.middlewareChain(ctx, engineReq)
+	// Safety net: if middleware returned an error but also a response,
+	// release the response to prevent pool leaks. This handles user-written
+	// middlewares that call next() (obtaining a response) then return an error
+	// without passing it along.
+	if err != nil && resp != nil {
+		releaseResponseMutator(resp)
+		return nil, err
+	}
+	return resp, err
 }
 
 // Close releases resources held by the client including connection pools and transport.
@@ -394,6 +408,7 @@ func getDefaultClient() (Client, error) {
 
 	impl, ok := newClient.(*clientImpl)
 	if !ok {
+		_ = newClient.Close() // Prevent resource leak on unexpected type
 		return nil, fmt.Errorf("unexpected client type")
 	}
 
@@ -557,9 +572,11 @@ func ReleaseResult(r *Result) {
 	}
 
 	// Sanitize sensitive body data before returning to pool.
+	// Clear the entire backing array to prevent sensitive data (tokens, PII)
+	// from persisting in pooled objects.
 	body := r.Response.RawBody
 	if len(body) > 0 {
-		clear(body[:min(len(body), 64*1024)])
+		clear(body)
 		r.Response.RawBody = nil
 	}
 	*r.Request = RequestInfo{}
@@ -589,8 +606,13 @@ func convertResponseToResult(resp ResponseMutator) *Result {
 	// string conversion (sync.Once). The engine Response is released right
 	// after this call, so its cached body string would be wasted.
 	result.Response.RawBody = resp.RawBody()
+	// OPTIMIZATION: Use unsafe string conversion to avoid copying the body.
+	// The raw bytes are freshly allocated by readBody(), so the caller has
+	// exclusive ownership. When ReleaseResult is called, the underlying bytes
+	// are cleared (security), making the string unusable — which is correct.
+	// If the caller never calls ReleaseResult, the string remains valid.
 	if len(result.Response.RawBody) > 0 {
-		result.Response.Body = string(result.Response.RawBody)
+		result.Response.Body = unsafeBytesToString(result.Response.RawBody)
 	}
 	result.Response.ContentLength = resp.ContentLength()
 	result.Response.Cookies = resp.Cookies()
@@ -600,6 +622,13 @@ func convertResponseToResult(resp ResponseMutator) *Result {
 	result.Meta.RedirectCount = resp.RedirectCount()
 
 	return result
+}
+
+// unsafeBytesToString converts a byte slice to a string without copying.
+// The caller must ensure the byte slice is not modified after this call.
+// This is safe because readBody() always returns freshly allocated []byte.
+func unsafeBytesToString(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
 }
 
 func extractRequestCookies(headers http.Header) []*http.Cookie {
