@@ -28,6 +28,12 @@ type ChecksumAlgorithm string
 const (
 	// ChecksumSHA256 uses SHA-256 for integrity verification.
 	ChecksumSHA256 ChecksumAlgorithm = "sha256"
+
+	// maxDrainBodySize caps how many response-body bytes are read and discarded
+	// on error paths to allow connection reuse. Bounded to avoid spending
+	// unbounded time/memory draining an oversized error body; the remainder is
+	// left unread and the connection is not reused in that case.
+	maxDrainBodySize = 1 << 20 // 1 MiB
 )
 
 // DownloadConfig configures file download behavior.
@@ -59,7 +65,7 @@ type DownloadConfig struct {
 //	cfg := httpc.DefaultDownloadConfig()
 //	cfg.FilePath = "/downloads/file.zip"
 //	cfg.Overwrite = true
-//	result, err := client.DownloadWithOptions(url, cfg)
+//	result, err := httpc.Download(context.Background(), url, cfg)
 func DefaultDownloadConfig() *DownloadConfig {
 	return &DownloadConfig{
 		Overwrite:         false,
@@ -111,63 +117,48 @@ func doPackageDownload(fn func(Client) (*DownloadResult, error)) (*DownloadResul
 	return fn(client)
 }
 
-// DownloadFile downloads a file from the given URL to the specified file path using the default client.
-// Returns DownloadResult with download statistics or an error if the download fails.
-func DownloadFile(url string, filePath string, options ...RequestOption) (*DownloadResult, error) {
+// Download downloads a file from url to the path specified in cfg, using the
+// default client with the given context and request options.
+//
+// Download is the single canonical download entry point across the package,
+// the Client interface, and DomainClient: one signature collapses the former
+// {config} × {context} variant matrix. Callers that already hold a client or
+// DomainClient use the Download method of the same signature.
+//
+// cfg must be non-nil; cfg.FilePath must be set (ErrEmptyFilePath otherwise).
+// Use context.Background() when no cancellation or timeout is required. Pass
+// options for headers, authentication, query parameters, etc.
+func Download(ctx context.Context, url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("download config cannot be nil")
+	}
 	return doPackageDownload(func(c Client) (*DownloadResult, error) {
-		return c.DownloadFile(url, filePath, options...)
+		return c.Download(ctx, url, cfg, options...)
 	})
 }
 
-// DownloadWithOptions downloads a file with custom download options using the default client.
-// Returns DownloadResult with download statistics or an error if the download fails.
-func DownloadWithOptions(url string, downloadOpts *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
-	return doPackageDownload(func(c Client) (*DownloadResult, error) {
-		return c.DownloadWithOptions(url, downloadOpts, options...)
-	})
-}
-
-// DownloadFileWithContext downloads a file using the default client with context control.
-// The context parameter allows for timeout and cancellation control during the download.
-func DownloadFileWithContext(ctx context.Context, url string, filePath string, options ...RequestOption) (*DownloadResult, error) {
-	return doPackageDownload(func(c Client) (*DownloadResult, error) {
-		return c.DownloadFileWithContext(ctx, url, filePath, options...)
-	})
-}
-
-// DownloadWithOptionsWithContext downloads a file with custom download options and context control.
-// The context parameter allows for timeout and cancellation control during the download.
-func DownloadWithOptionsWithContext(ctx context.Context, url string, downloadOpts *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
-	return doPackageDownload(func(c Client) (*DownloadResult, error) {
-		return c.DownloadWithOptionsWithContext(ctx, url, downloadOpts, options...)
-	})
-}
-
-// DownloadFile downloads a file from the given URL to the specified file path.
-func (c *clientImpl) DownloadFile(url string, filePath string, options ...RequestOption) (*DownloadResult, error) {
-	return c.DownloadFileWithContext(backgroundCtx, url, filePath, options...)
-}
-
-// DownloadWithOptions downloads a file with custom download options.
-func (c *clientImpl) DownloadWithOptions(url string, downloadOpts *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
-	return c.DownloadWithOptionsWithContext(backgroundCtx, url, downloadOpts, options...)
-}
-
-// DownloadFileWithContext downloads a file with context control for cancellation and timeouts.
-func (c *clientImpl) DownloadFileWithContext(ctx context.Context, url string, filePath string, options ...RequestOption) (*DownloadResult, error) {
-	downloadOpts := DefaultDownloadConfig()
-	downloadOpts.FilePath = filePath
-	return c.downloadFile(ctx, url, downloadOpts, options...)
-}
-
-// DownloadWithOptionsWithContext downloads a file with custom download options and context control.
-func (c *clientImpl) DownloadWithOptionsWithContext(ctx context.Context, url string, downloadOpts *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
-	return c.downloadFile(ctx, url, downloadOpts, options...)
+// Download downloads a file from url to the path specified in cfg, using the
+// client's configuration with the given context and request options.
+// cfg must be non-nil; cfg.FilePath must be set (ErrEmptyFilePath otherwise).
+// Use DefaultDownloadConfig() as the starting point, then set FilePath and any
+// of ProgressCallback / Overwrite / ResumeDownload / Checksum as needed.
+func (c *clientImpl) Download(ctx context.Context, url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
+	return c.downloadFile(ctx, url, cfg, options...)
 }
 
 func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *DownloadConfig, options ...RequestOption) (result *DownloadResult, err error) {
+	// SEC-003: default panic safety net for the download path. Mirrors the guard in
+	// clientImpl.Request. Deferred cleanups registered below (engine.ReleaseResponse,
+	// bodyReader.Close) run during unwinding before this recover (LIFO), so streaming
+	// resources are released even when a panic is converted to an error.
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			err = panicToError(r)
+		}
+	}()
 	if opts == nil {
-		return nil, fmt.Errorf("download options cannot be nil")
+		return nil, fmt.Errorf("download config cannot be nil")
 	}
 	if opts.FilePath == "" {
 		return nil, ErrEmptyFilePath
@@ -215,7 +206,7 @@ func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *Downloa
 	// the server does not support range requests. Truncating the existing
 	// partial file would silently destroy data the user intended to resume.
 	if resumeOffset > 0 && !resumed {
-		_, _ = io.Copy(io.Discard, io.LimitReader(df.bodyReader, 1<<20))
+		_, _ = io.Copy(io.Discard, io.LimitReader(df.bodyReader, maxDrainBodySize))
 		return nil, fmt.Errorf("server does not support range requests (status %d); cannot resume download", df.statusCode)
 	}
 
@@ -318,7 +309,7 @@ func handleDownloadStatus(statusCode int, bodyReader io.Reader, resumeOffset int
 	if resumeOffset > 0 && statusCode == http.StatusRequestedRangeNotSatisfiable {
 		// Drain body for connection reuse
 		if bodyReader != nil {
-			_, _ = io.Copy(io.Discard, io.LimitReader(bodyReader, 1<<20))
+			_, _ = io.Copy(io.Discard, io.LimitReader(bodyReader, maxDrainBodySize))
 		}
 		return fmt.Errorf("server cannot satisfy range request (416)")
 	}
@@ -334,7 +325,7 @@ func handleDownloadStatus(statusCode int, bodyReader io.Reader, resumeOffset int
 					bodyPreview = bodyPreview[:200] + "..."
 				}
 			}
-			_, _ = io.Copy(io.Discard, io.LimitReader(bodyReader, 1<<20))
+			_, _ = io.Copy(io.Discard, io.LimitReader(bodyReader, maxDrainBodySize))
 		}
 		if bodyPreview != "" {
 			return fmt.Errorf("unexpected status code: %d: %s", statusCode, bodyPreview)
@@ -347,6 +338,12 @@ func handleDownloadStatus(statusCode int, bodyReader io.Reader, resumeOffset int
 
 // writeDownloadBody streams the response body to a file and returns download statistics.
 func writeDownloadBody(bodyReader io.Reader, filePath string, opts *DownloadConfig, resumed bool, resumeOffset int64, statusCode int, contentLength int64, downloadStart time.Time, responseCookies []*http.Cookie) (*DownloadResult, error) {
+	// Validate checksum algorithm BEFORE touching the destination file.
+	// A configuration error must not truncate (O_TRUNC) an existing file.
+	if opts.Checksum != "" && opts.ChecksumAlgorithm != ChecksumSHA256 && opts.ChecksumAlgorithm != "" {
+		return nil, fmt.Errorf("unsupported checksum algorithm: %s", opts.ChecksumAlgorithm)
+	}
+
 	var file *os.File
 	var err error
 	if resumed {
@@ -362,16 +359,9 @@ func writeDownloadBody(bodyReader io.Reader, filePath string, opts *DownloadConf
 	var writer io.Writer = file
 	var hasher hash.Hash
 	if opts.Checksum != "" {
-		switch opts.ChecksumAlgorithm {
-		case ChecksumSHA256, "":
-			hasher = sha256.New()
-		default:
-			_ = file.Close()
-			if !resumed {
-				_ = os.Remove(filePath)
-			}
-			return nil, fmt.Errorf("unsupported checksum algorithm: %s", opts.ChecksumAlgorithm)
-		}
+		// Algorithm already validated above; both SHA-256 and the empty
+		// default map to SHA-256.
+		hasher = sha256.New()
 		writer = io.MultiWriter(file, hasher)
 	}
 	if opts.ProgressCallback != nil {
@@ -398,12 +388,20 @@ func writeDownloadBody(bodyReader io.Reader, filePath string, opts *DownloadConf
 		return nil, fmt.Errorf("failed to write file: %w", err)
 	}
 
-	// Sync and close file before potential checksum-based removal
+	// Sync and close file before potential checksum-based removal.
+	// On failure, remove the partial file (unless resuming, where the
+	// pre-existing bytes should be preserved for the next resume attempt).
 	if syncErr := file.Sync(); syncErr != nil {
 		_ = file.Close() // best-effort cleanup on sync failure
+		if !resumed {
+			_ = os.Remove(filePath) // don't leave a truncated/corrupt file
+		}
 		return nil, fmt.Errorf("failed to sync file: %w", syncErr)
 	}
 	if closeErr := file.Close(); closeErr != nil {
+		if !resumed {
+			_ = os.Remove(filePath)
+		}
 		return nil, fmt.Errorf("failed to close file: %w", closeErr)
 	}
 

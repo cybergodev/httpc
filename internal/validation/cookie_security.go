@@ -55,10 +55,11 @@ func DefaultCookieSecurityConfig() *CookieSecurityConfig {
 // Use this for high-security applications (financial, medical, government).
 func StrictCookieSecurityConfig() *CookieSecurityConfig {
 	return &CookieSecurityConfig{
-		RequireSecure:     true,
-		RequireHttpOnly:   true,
-		RequireSameSite:   "Strict",
-		AllowSameSiteNone: false,
+		RequireSecure:                true,
+		RequireHttpOnly:              true,
+		RequireSameSite:              "Strict",
+		AllowSameSiteNone:            false,
+		RequireSecureForSameSiteNone: true, // consistent with the "strict" intent
 	}
 }
 

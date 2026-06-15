@@ -28,6 +28,10 @@ type DoHResolver struct {
 	cacheTTL  atomic.Int64 // Thread-safe cache TTL (stored as nanoseconds)
 	cacheSize atomic.Int64 // O(1) cache size tracking
 	closed    atomic.Bool  // Prevents double-close and operations after close
+
+	// inflight coalesces concurrent network lookups for the same host into a
+	// single provider round-trip, preventing a cache-stampede (thundering herd).
+	inflight inflightMap
 }
 
 // Compile-time interface check
@@ -50,6 +54,21 @@ type DoHProvider struct {
 type cacheEntry struct {
 	IPs     []net.IPAddr
 	Expires time.Time
+}
+
+// call represents a single in-flight DoH lookup shared by concurrent waiters.
+type call struct {
+	wg  sync.WaitGroup
+	ips []net.IPAddr
+	err error
+}
+
+// inflightMap deduplicates concurrent lookups for the same host
+// (singleflight-style), so a stampede of cache misses collapses into one
+// network round-trip. Implemented with the standard library — no x/sync dep.
+type inflightMap struct {
+	mu sync.Mutex
+	m  map[string]*call
 }
 
 // Security constants for DoH
@@ -94,6 +113,16 @@ func NewDoHResolver(providers []*DoHProvider, cacheTTL time.Duration) *DoHResolv
 		cacheTTL = 5 * time.Minute
 	}
 
+	// Defensive copy: callers may reuse or share the provided DoHProvider
+	// structs. The template pre-split below writes resolver-internal fields
+	// (urlPrefix/urlMiddle/urlSuffix) onto each provider, so operate on owned
+	// copies to avoid mutating the caller's input or aliasing across resolvers.
+	owned := make([]*DoHProvider, len(providers))
+	for i := range providers {
+		cp := *providers[i]
+		owned[i] = &cp
+	}
+
 	r := &DoHResolver{
 		client: &http.Client{
 			Timeout: 5 * time.Second,
@@ -109,7 +138,7 @@ func NewDoHResolver(providers []*DoHProvider, cacheTTL time.Duration) *DoHResolv
 				ForceAttemptHTTP2:  true,
 			},
 		},
-		providers: providers,
+		providers: owned,
 	}
 	r.cacheTTL.Store(int64(cacheTTL))
 
@@ -157,51 +186,99 @@ func (r *DoHResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAd
 		}
 	}
 
-	// Try each provider until one succeeds
+	// Resolve via providers, coalescing concurrent lookups for the same host
+	// into a single network round-trip (prevents cache-stampede). The returned
+	// slice may be shared across concurrent waiters and must be treated read-only.
+	ips, err := r.lookupDedup(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return ips, nil
+	}
+
+	// SECURITY: Use CAS to atomically reserve cache slot before storing.
+	// Bounded retry prevents theoretical livelock under extreme contention
+	// where concurrent goroutines continuously fill and evict the cache.
+	const maxCacheRetryAttempts = 3
+	for attempt := 0; attempt < maxCacheRetryAttempts; attempt++ {
+		current := r.cacheSize.Load()
+		if current >= maxDoHCacheSize {
+			// Cache full — evict expired entries first, then the oldest fresh
+			// entry, so a new admission never silently drops the result.
+			r.evictExpiredEntries()
+			if r.cacheSize.Load() >= maxDoHCacheSize {
+				r.evictOldestEntry()
+			}
+			continue
+		}
+		if r.cacheSize.CompareAndSwap(current, current+1) {
+			cacheTTL := time.Duration(r.cacheTTL.Load())
+			// IPs from lookupWithProvider are fresh allocations.
+			// Shallow copy for cache isolation: the slice header is independent
+			// while the underlying net.IP data is shared (read-only per contract).
+			cachedIPs := make([]net.IPAddr, len(ips))
+			copy(cachedIPs, ips)
+			newEntry := &cacheEntry{
+				IPs:     cachedIPs,
+				Expires: time.Now().Add(cacheTTL),
+			}
+			// Use LoadOrStore to detect concurrent stores and prevent counter drift.
+			// If another goroutine already stored an entry for this host,
+			// revert our counter increment since no new slot was consumed.
+			if _, exists := r.cache.LoadOrStore(host, newEntry); exists {
+				r.cacheSize.Add(-1)
+			}
+			break
+		}
+	}
+	return ips, nil
+}
+
+// lookupDedup coalesces concurrent lookups for the same host into a single
+// network round-trip. When several goroutines miss the cache for a host at
+// once, only the first performs the provider queries; the others wait and
+// share the result. This is a minimal singleflight using the standard library.
+func (r *DoHResolver) lookupDedup(ctx context.Context, host string) ([]net.IPAddr, error) {
+	r.inflight.mu.Lock()
+	if r.inflight.m == nil {
+		r.inflight.m = make(map[string]*call)
+	}
+	if c, ok := r.inflight.m[host]; ok {
+		// Another goroutine is already resolving this host — wait for its result.
+		r.inflight.mu.Unlock()
+		c.wg.Wait()
+		return c.ips, c.err
+	}
+	c := new(call)
+	c.wg.Add(1)
+	r.inflight.m[host] = c
+	r.inflight.mu.Unlock()
+
+	ips, err := r.lookupViaProviders(ctx, host)
+
+	// Publish the result before Done() so waiters observe it after Wait().
+	c.ips, c.err = ips, err
+	c.wg.Done()
+
+	r.inflight.mu.Lock()
+	delete(r.inflight.m, host)
+	r.inflight.mu.Unlock()
+
+	return ips, err
+}
+
+// lookupViaProviders queries each configured DoH provider in priority order
+// until one returns addresses, falling back to the system resolver on failure.
+func (r *DoHResolver) lookupViaProviders(ctx context.Context, host string) ([]net.IPAddr, error) {
 	var lastErr error
 	for _, provider := range r.providers {
 		ips, err := r.lookupWithProvider(ctx, provider, host)
 		if err == nil && len(ips) > 0 {
-			// SECURITY: Use CAS to atomically reserve cache slot before storing.
-			// Bounded retry prevents theoretical livelock under extreme contention
-			// where concurrent goroutines continuously fill and evict the cache.
-			const maxCacheRetryAttempts = 3
-			for attempt := 0; attempt < maxCacheRetryAttempts; attempt++ {
-				current := r.cacheSize.Load()
-				if current >= maxDoHCacheSize {
-					// Cache full - evict expired entries to make room
-					r.evictExpiredEntries()
-					if r.cacheSize.Load() >= maxDoHCacheSize {
-						break // Still full after eviction, skip caching
-					}
-					continue
-				}
-				if r.cacheSize.CompareAndSwap(current, current+1) {
-					cacheTTL := time.Duration(r.cacheTTL.Load())
-					// IPs from lookupWithProvider are fresh allocations.
-					// Shallow copy for cache isolation: the slice header is independent
-					// while the underlying net.IP data is shared (read-only per contract).
-					cachedIPs := make([]net.IPAddr, len(ips))
-					copy(cachedIPs, ips)
-					newEntry := &cacheEntry{
-						IPs:     cachedIPs,
-						Expires: time.Now().Add(cacheTTL),
-					}
-					// Use LoadOrStore to detect concurrent stores and prevent counter drift.
-					// If another goroutine already stored an entry for this host,
-					// revert our counter increment since no new slot was consumed.
-					if _, exists := r.cache.LoadOrStore(host, newEntry); exists {
-						r.cacheSize.Add(-1)
-					}
-					break
-				}
-			}
 			return ips, nil
 		}
 		lastErr = err
 	}
-
-	// Fallback to system resolver if all providers fail
 	return r.fallbackLookup(ctx, host, lastErr)
 }
 
@@ -457,8 +534,7 @@ func (r *DoHResolver) parseWireFormatResponse(body []byte, host string) ([]net.I
 // maxDomainRecursion limits the depth of DNS compression pointer recursion
 // to prevent stack overflow from malicious responses with circular pointers.
 // RFC 1035 allows compression, but malformed responses could exploit this.
-// SECURITY: Increased from 10 to 16 to handle edge cases with legitimate but
-// deeply nested compression while still preventing stack overflow.
+// 16 handles legitimate deeply nested compression while preventing stack overflow.
 const maxDomainRecursion = 16
 
 // parseDomain parses a DNS domain name (RFC 1035) with recursion depth limit.
@@ -571,6 +647,34 @@ func (r *DoHResolver) evictExpiredEntries() {
 		}
 		return true
 	})
+}
+
+// evictOldestEntry removes the cache entry with the nearest expiry time.
+// Used when the cache is full of fresh (unexpired) entries and a new entry
+// must be admitted; without it, freshly resolved hosts are silently dropped
+// once the cache fills with long-TTL entries. O(n), but only runs on admission
+// when the working set exceeds maxDoHCacheSize.
+func (r *DoHResolver) evictOldestEntry() {
+	var oldestKey any
+	var oldestExpiry time.Time
+	found := false
+	r.cache.Range(func(key, value any) bool {
+		entry, ok := value.(*cacheEntry)
+		if !ok || entry == nil {
+			return true
+		}
+		if !found || entry.Expires.Before(oldestExpiry) {
+			found = true
+			oldestKey = key
+			oldestExpiry = entry.Expires
+		}
+		return true
+	})
+	if found {
+		if _, deleted := r.cache.LoadAndDelete(oldestKey); deleted {
+			r.cacheSize.Add(-1)
+		}
+	}
 }
 
 // SetCacheTTL sets the cache TTL duration.

@@ -308,6 +308,8 @@ func TestRequestProcessor_BuildErrors(t *testing.T) {
 		name        string
 		request     *Request
 		expectError bool
+		wantMethod  string // if set, assert the built request's method (post-normalization)
+		wantCtxSet  bool   // if true, assert the built request has a non-nil context
 	}{
 		{
 			name: "Invalid URL",
@@ -319,27 +321,32 @@ func TestRequestProcessor_BuildErrors(t *testing.T) {
 			expectError: true,
 		},
 		{
-			name: "Empty method",
+			// Build normalizes an empty method to "GET" (request.go:633-635) —
+			// this is intentional defaulting, not a validation gap.
+			name: "Empty method defaults to GET",
 			request: testRequestBuilder().
 				Method("").
 				URL("https://api.example.com/users").
 				Context(context.Background()).
 				Build(),
-			expectError: false, // Actually empty method might be allowed
+			expectError: false,
+			wantMethod:  "GET",
 		},
 		{
-			name: "Nil context",
+			// Build defaults a nil context to context.Background (request.go:637-639).
+			name: "Nil context defaults to background",
 			request: testRequestBuilder().
 				Method("GET").
 				URL("https://api.example.com/users").
 				Build(),
-			expectError: false, // Actually nil context might be allowed
+			expectError: false,
+			wantCtxSet:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := processor.Build(tt.request)
+			httpReq, err := processor.Build(tt.request)
 
 			if tt.expectError && err == nil {
 				t.Error("Expected error, got nil")
@@ -347,6 +354,16 @@ func TestRequestProcessor_BuildErrors(t *testing.T) {
 
 			if !tt.expectError && err != nil {
 				t.Errorf("Unexpected error: %v", err)
+			}
+
+			// Verify the documented defaulting behavior when Build succeeds.
+			if err == nil && httpReq != nil {
+				if tt.wantMethod != "" && httpReq.Method != tt.wantMethod {
+					t.Errorf("Method = %q, want %q", httpReq.Method, tt.wantMethod)
+				}
+				if tt.wantCtxSet && httpReq.Context() == nil {
+					t.Error("Expected non-nil context after defaulting")
+				}
 			}
 		})
 	}

@@ -258,7 +258,7 @@ HTTPC uses the following synchronization mechanisms internally:
 |-----------|-------------|-------|
 | `client.Get/Post/etc.` | ✅ Yes | Safe for concurrent calls |
 | `client.Close()` | ✅ Yes | Safe to call once |
-| `client.DownloadFile()` | ✅ Yes | Safe for concurrent downloads |
+| `client.Download()` | ✅ Yes | Safe for concurrent downloads |
 | `result.Unmarshal()` | ❌ No | Each goroutine needs own Result |
 | `result.SaveToFile()` | ❌ No | Each goroutine needs own Result |
 | `domainClient.SetHeader()` | ✅ Yes | Safe for concurrent calls |

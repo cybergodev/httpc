@@ -41,7 +41,19 @@ func getSecurityWarnOutput() io.Writer {
 // isTestEnvironment detects if the code is running in a test environment.
 // This is used to warn against using TestingConfig in production.
 func isTestEnvironment() bool {
-	executable := filepath.Base(os.Args[0])
+	return isTestEnvironmentFrom(filepath.Base(os.Args[0]), os.Getenv("GO_TEST"), os.Getenv("GOTEST"))
+}
+
+// isTestEnvironmentFrom is the pure (process-global-free) core of
+// isTestEnvironment. Splitting the logic out lets tests exercise every branch
+// deterministically by passing controlled inputs, instead of mutating
+// os.Args / environment variables — which are package-global and not safe to
+// write while other goroutines read them. Concurrent reads of os.Args / env in
+// production are safe (they are set once at startup and never mutated during
+// normal operation), but tests that flip them race with parallel callers of
+// New() -> isTestEnvironment() under -race. Testing the pure function removes
+// that race at zero production cost.
+func isTestEnvironmentFrom(executable, goTest, gotest string) bool {
 	// Check for common test executable patterns
 	if strings.HasSuffix(executable, ".test") ||
 		strings.HasSuffix(executable, ".test.exe") ||
@@ -49,7 +61,7 @@ func isTestEnvironment() bool {
 		return true
 	}
 	// Check for Go test environment
-	if os.Getenv("GO_TEST") != "" || os.Getenv("GOTEST") == "1" {
+	if goTest != "" || gotest == "1" {
 		return true
 	}
 	return false

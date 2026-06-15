@@ -15,7 +15,7 @@ import (
 type SessionConfig struct {
 	// CookieSecurity configures cookie security validation.
 	// If nil, no cookie security validation is performed.
-	CookieSecurity *validation.CookieSecurityConfig
+	CookieSecurity *CookieSecurityConfig
 }
 
 // DefaultSessionConfig returns a SessionConfig with default settings.
@@ -36,7 +36,7 @@ type SessionManager struct {
 	mu             sync.RWMutex
 	cookies        map[string]*http.Cookie
 	headers        map[string]string
-	cookieSecurity *validation.CookieSecurityConfig
+	cookieSecurity *CookieSecurityConfig
 }
 
 // NewSessionManager creates a new SessionManager with the given configuration.
@@ -67,7 +67,7 @@ func NewSessionManager(config ...*SessionConfig) (*SessionManager, error) {
 
 // SetCookieSecurity sets the cookie security configuration.
 // This affects all subsequent SetCookie calls.
-func (s *SessionManager) SetCookieSecurity(config *validation.CookieSecurityConfig) {
+func (s *SessionManager) SetCookieSecurity(config *CookieSecurityConfig) {
 	if s == nil {
 		return
 	}
@@ -419,7 +419,12 @@ func (s *SessionManager) captureFromOptions(options []RequestOption) {
 				continue
 			}
 		}
-		s.cookies[cookie.Name] = cookie
+		// Copy the cookie before storing. tempReq is pooled and Cookies()
+		// returns its internal slice by reference, so &cookies[i] aliases
+		// pooled memory that is released (and reused) once this function
+		// returns. storeCookies() follows the same copy pattern.
+		cp := *cookie
+		s.cookies[cp.Name] = &cp
 	}
 
 	for key, value := range headers {

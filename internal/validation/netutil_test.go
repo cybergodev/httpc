@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// BenchmarkIsLocalhost benchmarks the IsLocalhost function
+// BenchmarkIsLocalhost benchmarks the isLocalhost function
 func BenchmarkIsLocalhost(b *testing.B) {
 	benchmarks := []struct {
 		name     string
@@ -25,7 +25,7 @@ func BenchmarkIsLocalhost(b *testing.B) {
 	for _, bm := range benchmarks {
 		b.Run(bm.name, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				_ = IsLocalhost(bm.hostname)
+				_ = isLocalhost(bm.hostname)
 			}
 		})
 	}
@@ -91,9 +91,9 @@ func TestIsPrivateOrReservedIP(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("Failed to parse IP: %s", tt.ip)
 			}
-			result := IsPrivateOrReservedIP(ip)
+			result := isPrivateOrReservedIP(ip)
 			if result != tt.expected {
-				t.Errorf("IsPrivateOrReservedIP(%s) = %v, want %v", tt.ip, result, tt.expected)
+				t.Errorf("isPrivateOrReservedIP(%s) = %v, want %v", tt.ip, result, tt.expected)
 			}
 		})
 	}
@@ -169,9 +169,9 @@ func TestIsLocalhost(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := IsLocalhost(tt.hostname)
+			result := isLocalhost(tt.hostname)
 			if result != tt.expected {
-				t.Errorf("IsLocalhost(%s) = %v, want %v", tt.hostname, result, tt.expected)
+				t.Errorf("isLocalhost(%s) = %v, want %v", tt.hostname, result, tt.expected)
 			}
 		})
 	}
@@ -208,7 +208,7 @@ func TestSSRFBypassPrevention(t *testing.T) {
 				t.Fatalf("Failed to parse IP: %s", tt.ip)
 			}
 
-			blocked := IsPrivateOrReservedIP(ip)
+			blocked := isPrivateOrReservedIP(ip)
 			if blocked != tt.blocked {
 				t.Errorf("SSRF bypass check for %s: blocked=%v, want=%v", tt.ip, blocked, tt.blocked)
 			}
@@ -272,9 +272,9 @@ func TestIsIPExempted(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("Failed to parse IP: %s", tt.ip)
 			}
-			result := IsIPExempted(ip, nets)
+			result := isIPExempted(ip, nets)
 			if result != tt.expected {
-				t.Errorf("IsIPExempted(%s) = %v, want %v", tt.ip, result, tt.expected)
+				t.Errorf("isIPExempted(%s) = %v, want %v", tt.ip, result, tt.expected)
 			}
 		})
 	}
@@ -395,9 +395,9 @@ func TestIsPrivateOrReservedIP_BoundaryConditions(t *testing.T) {
 			if ip == nil {
 				t.Fatalf("Failed to parse IP: %s", tt.ip)
 			}
-			result := IsPrivateOrReservedIP(ip)
+			result := isPrivateOrReservedIP(ip)
 			if result != tt.expected {
-				t.Errorf("IsPrivateOrReservedIP(%s) = %v, want %v", tt.ip, result, tt.expected)
+				t.Errorf("isPrivateOrReservedIP(%s) = %v, want %v", tt.ip, result, tt.expected)
 			}
 		})
 	}

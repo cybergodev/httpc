@@ -247,14 +247,14 @@ result, err := httpc.Request(ctx, "DELETE", url,
 
 ```go
 // Simple download
-result, err := client.DownloadFile("https://example.com/file.zip", "downloads/file.zip")
+result, err := client.Download(context.Background(), "https://example.com/file.zip", &httpc.DownloadConfig{FilePath: "downloads/file.zip"})
 if err != nil {
     log.Fatal(err)
 }
 fmt.Printf("Downloaded %s\n", httpc.FormatBytes(result.BytesWritten))
 
 // Download with options
-result, err := client.DownloadFile(url, filePath,
+result, err := client.Download(context.Background(), url, &httpc.DownloadConfig{FilePath: filePath},
     httpc.WithBearerToken(token),
     httpc.WithTimeout(5*time.Minute),
 )
@@ -516,7 +516,7 @@ Now that you understand the basics, explore these guides:
 ### Using Defaults
 
 ```go
-// Uses secure defaults (TLS 1.2+, 30s timeout, 3 retries)
+// Uses secure defaults (TLS 1.2+, 180s timeout, 3 retries)
 client, err := httpc.New()
 ```
 

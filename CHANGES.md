@@ -4,6 +4,55 @@ All notable changes to the cybergodev/httpc library will be documented in this f
 
 ---
 
+## v1.5.2 - Per-Request SSRF Override, Panic Safety Net & Deprecated-API Removal (2026-06-15)
+
+### Breaking
+- Removed deprecated package-level download functions (`DownloadFile`, `DownloadWithOptions`, `DownloadFileWithContext`, `DownloadWithOptionsWithContext`) — use the canonical `Download(ctx, url, cfg, options...)`
+- Removed exported sentinel `ErrInvalidURL` (was never returned anywhere in the codebase) — delete any `errors.Is(err, httpc.ErrInvalidURL)` checks
+- Panics on the public request/download path are now returned as errors instead of crashing the caller (always-on recover guard at each execution boundary; no signature change)
+
+### Added
+- `WithAllowPrivateIPs(allow bool)` per-request option — lets a secure-by-default client reach localhost/private IPs on one trusted call without relaxing the whole client
+- `Download(ctx, url, cfg, options...)` — single recommended package-level download entry point
+- Public certificate-pinning API: `CertificatePinner` type and `NewSPKIHashPinner`/`NewPublicKeyPinner`/`NewCertificatePinnerChain` constructors (no internal-package import needed)
+- `CertificatePinner` field on `SecurityConfig` wiring pinning end-to-end via `config_convert`
+
+### Changed
+- Per-request SSRF override propagates to the pre-flight validator, the connection dialer, and the redirect-target validator
+- `CookieSecurity`/`SessionConfig` field types changed to the exported alias `*CookieSecurityConfig` (callers no longer import `internal/validation`)
+- `ProxyURL` validation now requires scheme ∈ {http,https,socks5,socks5h} and a non-empty host
+- Default client self-heals: `getDefaultClient` recreates a closed default client instead of returning it
+- DoH resolver gains per-host singleflight (coalesces concurrent cache misses) and nearest-Expiry eviction when the cache is full
+- SSRF validation DNS lookup now derives its timeout from the caller's context (was `context.Background()`)
+- `StrictCookieSecurityConfig()` now sets `RequireSecureForSameSiteNone: true`
+- `Client.Request()` returns `ErrClientClosed` directly instead of wrapping it with `fmt.Errorf("%w", ...)`
+- `New()`/`NewDomain()` share a single `prepareConfig` helper so the two constructors cannot drift
+
+### Security
+- Removed attacker-controlled `GO_TEST`/`GOTEST` env branch from `isTestEnvironment()` that could disable certificate pinning
+- SSRF validation now blocks legacy integer/hex/octal IPv4 notation (e.g. `2130706433`, `0x7f000001`) that bypasses `net.ParseIP` on cgo builds
+- Cert-pin cache key widened from an 8-byte prefix to the full 32-byte SHA-256 fingerprint (removes prefix-collision risk)
+- Cookie `Value`/`Domain`/`Path` no longer leak across requests via pooled memory (RoundTrip jar-merge + `SessionManager.captureFromOptions` paths)
+- Validated-URL cache is bypassed (read and write) when a per-request SSRF override is present, preventing cache poisoning
+
+### Fixed
+- `RoundTrip` cookie-jar scrub now clears the populated merged slice (previously iterated an empty pooled header, leaking cookie fields)
+- `SessionManager.captureFromOptions` now copies each cookie before storing (`&cookies[i]` aliased pooled memory released on return)
+- `PoolManager.Close()` resets `activeConns`/`totalConns` (left phantom counts when connections arrived during close)
+- `evictStaleHosts()` hostCount compensation was inverted — bumped on the losing `LoadOrStore` path, causing a steady under-count
+- `sleepWithContext` drains the pooled timer channel to stop a stale timer firing on reuse
+- Config-apply and validation errors no longer call `metrics.recordRequest()` (no longer skew connection-health metrics)
+- Download validates `ChecksumAlgorithm` before `os.OpenFile` and removes the partial file on Sync/Close failure (non-resume path)
+- `examples/17_file_operations.go`: restored 11 corrupted `✓` glyphs, fixed a checksum-demo logic no-op, migrated to canonical `Download`
+
+### Performance
+- `Result` + its three nested info structs co-located in one heap block via `resultBundle` (−3 allocs/op on every request result)
+- Map pools store map values directly instead of `*map` pointers; response headers transfer directly (drops a defensive `CloneHeader`) — −6 allocs/op steady state
+- `queryValueLength` formats numeric/bool values into a stack buffer instead of heap-allocating (−1–2 allocs/op for typed query params)
+- `SimpleGET`: 87 → 78 allocs/op combined; consistent reductions across all end-to-end benchmarks
+
+---
+
 ## v1.5.1 - Config Pointer Types, Performance & Documentation (2026-05-31)
 
 ### Breaking

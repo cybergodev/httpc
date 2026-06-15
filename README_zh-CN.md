@@ -44,6 +44,7 @@
 | **默认安全** | TLS 1.2+、SSRF 防护、CRLF 注入防护、路径遍历阻断 |
 | **高性能** | 连接池、HTTP/2、goroutine 安全、`sync.Pool` 优化 |
 | **内置弹性** | 智能重试，支持指数退避和抖动 |
+| **自动解压缩** | 透明的 gzip/deflate 处理，带 Zip 炸弹防护 |
 | **开发者友好** | 简洁的 API、直观的选项模式、完善的文档 |
 | **极简依赖** | 1 个直接依赖 (golang.org/x/sys)，纯 Go 实现 |
 | **Cookie 管理** | 完整的 Cookie Jar 支持，带安全验证 |
@@ -291,6 +292,9 @@ httpc.WithMaxRetries(3)
 // 重定向控制
 httpc.WithFollowRedirects(false)
 httpc.WithMaxRedirects(5)
+
+// 单次请求的 SSRF 覆盖 (针对一个受信任的内部 URL 的逃生舱)
+httpc.WithAllowPrivateIPs(true)
 ```
 
 ### 回调函数
@@ -318,7 +322,7 @@ httpc.WithOnResponse(func(resp httpc.ResponseMutator) error {
 | **查询参数** | `WithQuery(key, value)`, `WithQueryMap(map)` |
 | **请求体** | `WithJSON(data)`, `WithXML(data)`, `WithForm(map)`, `WithFormData(*FormData)`, `WithFile(field, filename, content)`, `WithBody(data, ...BodyKind)`, `WithBinary([]byte, ...contentType)`, `WithStreamBody(bool)` |
 | **Cookie** | `WithCookie(cookie)`, `WithCookies([]Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
-| **控制** | `WithTimeout(dur)`, `WithMaxRetries(n)`, `WithContext(ctx)` |
+| **控制** | `WithTimeout(dur)`, `WithMaxRetries(n)`, `WithContext(ctx)`, `WithAllowPrivateIPs(bool)` |
 | **重定向** | `WithFollowRedirects(bool)`, `WithMaxRedirects(n)` |
 | **回调** | `WithOnRequest(fn)`, `WithOnResponse(fn)` |
 
@@ -379,6 +383,24 @@ fmt.Println(result.Meta.RedirectChain) // 重定向 URL 链
 fmt.Println(result.String())
 ```
 
+### 自动解压缩
+
+HTTPC 会透明地解压 `gzip` 和 `deflate` 响应。默认会自动发送
+`Accept-Encoding: gzip, deflate`（可通过 `WithHeader("Accept-Encoding", ...)`
+覆盖或扩展）。解压缩炸弹 (Zip 炸弹) 防护将解压后的大小限制在
+`Security.MaxDecompressedBodySize`（默认 100 MB）。
+
+```go
+result, _ := httpc.Get("https://httpbin.org/gzip",
+    httpc.WithHeaderMap(map[string]string{"Accept-Encoding": "gzip, deflate"}),
+)
+fmt.Println(result.Body()) // 已自动解压
+```
+
+> **注意：** Brotli (`br`) 和 LZW (`compress`) **不受支持**，若服务器返回这些
+> 编码会报错。由于 httpc 不会主动声明它们，仅在你手动设置 `Accept-Encoding`
+> 时才会发生。
+
 ---
 
 ## Context 与取消
@@ -408,9 +430,9 @@ if errors.Is(err, context.DeadlineExceeded) {
 - **断点续传支持** - 自动恢复中断的下载
 
 ```go
-result, _ := httpc.DownloadFile(
+result, _ := httpc.Download(context.Background(),
     "https://example.com/file.zip",
-    "downloads/file.zip",
+    &httpc.DownloadConfig{FilePath: "downloads/file.zip"},
 )
 fmt.Printf("已下载: %s，速度: %s/s\n",
     httpc.FormatBytes(result.BytesWritten),
@@ -426,7 +448,7 @@ opts.ProgressCallback = func(downloaded, total int64, speed float64) {
     pct := float64(downloaded) / float64(total) * 100
     fmt.Printf("\r%.1f%% - %s/s", pct, httpc.FormatSpeed(speed))
 }
-result, _ := httpc.DownloadWithOptions(url, opts)
+result, _ := httpc.Download(context.Background(), url, opts)
 ```
 
 ### 断点续传下载
@@ -435,7 +457,7 @@ result, _ := httpc.DownloadWithOptions(url, opts)
 opts := httpc.DefaultDownloadConfig()
 opts.FilePath = "downloads/large.zip"
 opts.ResumeDownload = true
-result, _ := httpc.DownloadWithOptions(url, opts)
+result, _ := httpc.Download(context.Background(), url, opts)
 if result.Resumed {
     fmt.Println("下载已从上次位置恢复")
 }
@@ -447,13 +469,13 @@ if result.Resumed {
 ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 defer cancel()
 
-result, _ := httpc.DownloadFileWithContext(ctx,
+result, _ := httpc.Download(ctx,
     "https://example.com/large.zip",
-    "downloads/large.zip",
+    &httpc.DownloadConfig{FilePath: "downloads/large.zip"},
 )
 
 // 使用下载配置 + Context 完全控制
-result, _ := httpc.DownloadWithOptionsWithContext(ctx, url, opts)
+result, _ := httpc.Download(ctx, url, opts)
 ```
 
 ### DownloadConfig 字段
@@ -471,10 +493,7 @@ result, _ := httpc.DownloadWithOptionsWithContext(ctx, url, opts)
 
 | 函数 | 描述 |
 |------|------|
-| `DownloadFile(url, filePath, ...options)` | 简单下载 |
-| `DownloadWithOptions(url, config, ...options)` | 带进度/断点续传配置下载 |
-| `DownloadFileWithContext(ctx, url, filePath, ...options)` | 带取消控制的下载 |
-| `DownloadWithOptionsWithContext(ctx, url, config, ...options)` | 带配置 + Context 完全控制 |
+| `Download(ctx, url, cfg, ...options)` | **规范入口** — 包级别下载的单一函数 |
 
 ### DownloadResult 字段
 
@@ -558,10 +577,8 @@ client.Session() // 底层 SessionManager
 ### 文件下载 (相对路径)
 
 ```go
-result, _ := client.DownloadFile("/files/data.csv", "data.csv")
-result, _ := client.DownloadWithOptions("/files/large.zip", downloadOpts)
-result, _ := client.DownloadFileWithContext(ctx, "/files/data.csv", "data.csv")
-result, _ := client.DownloadWithOptionsWithContext(ctx, "/files/large.zip", downloadOpts)
+result, _ := client.Download(ctx, "/files/data.csv", &httpc.DownloadConfig{FilePath: "data.csv"})
+result, _ := client.Download(ctx, "/files/large.zip", downloadOpts)
 ```
 
 ### 所有 HTTP 方法
@@ -729,8 +746,9 @@ fmt.Println(config.String())
 | `Security.MinTLSVersion` | `uint16` | `TLS 1.2` | 最低 TLS 版本 |
 | `Security.MaxTLSVersion` | `uint16` | `TLS 1.3` | 最高 TLS 版本 |
 | `Security.InsecureSkipVerify` | `bool` | `false` | 跳过 TLS 验证 (仅限测试！) |
+| `Security.CertificatePinner` | `CertificatePinner` | `nil` | 证书固定 — 即使 CA 被攻破也拒绝 MITM |
 | `Security.MaxResponseBodySize` | `int64` | `10MB` | 最大响应体大小 |
-| `Security.MaxRequestBodySize` | `int64` | `0` | 最大请求体大小 (0 = 使用 MaxResponseBodySize) |
+| `Security.MaxRequestBodySize` | `int64` | `0` | 最大请求体大小 (0 = 不限制；不会回退到 MaxResponseBodySize) |
 | `Security.AllowPrivateIPs` | `bool` | `false` | 允许私有 IP (默认启用 SSRF 防护) |
 | `Security.ValidateURL` | `bool` | `true` | 启用 URL 验证 |
 | `Security.ValidateHeaders` | `bool` | `true` | 启用请求头验证 |
@@ -868,6 +886,7 @@ config.Connection.EnableSystemProxy = true  // 从环境变量和系统设置读
 | 特性 | 描述 |
 |------|------|
 | **TLS 1.2+** | 默认使用现代加密标准 |
+| **证书固定** | 即使 CA 被攻破也能防御中间人攻击 (MITM) |
 | **SSRF 防护** | 双层 DNS 验证阻断私有 IP |
 | **CRLF 注入防护** | 请求头和 URL 验证 |
 | **路径遍历防护** | 安全的文件操作 |
@@ -899,6 +918,49 @@ cfg := httpc.DefaultConfig()
 cfg.Security.SSRFExemptCIDRs = []string{"10.0.0.0/8", "100.64.0.0/10"}
 client, _ := httpc.New(cfg)
 ```
+
+如果只需对单个受信任的内部地址发起调用，而不想放宽整个客户端的安全策略，
+可使用单次请求的 `WithAllowPrivateIPs` 选项（仅对该次请求覆盖客户端的 SSRF 策略）：
+
+```go
+// 默认客户端会阻断私有 IP；此处仅对这一次请求放行
+result, err := httpc.Get("http://localhost:8080/health",
+    httpc.WithAllowPrivateIPs(true),
+)
+```
+
+### 证书固定
+
+证书固定 (Certificate Pinning) 即使在受信任的证书颁发机构 (CA) 被攻破时也能防御中间人攻击：除非服务器提供已固定的公钥，否则 TLS 握手将被拒绝。通过将 `CertificatePinner` 赋值给 `Security.CertificatePinner` 来启用。
+
+```go
+// 按 SubjectPublicKeyInfo (SPKI) 的 base64 编码 SHA-256 哈希固定。
+// 提供多个哈希以支持密钥轮换（任一匹配即通过）。
+pinner, err := httpc.NewSPKIHashPinner(
+    "YLh1dUR9y6Kja30RrAn7JKnbQG/uEtLMkBgFF2fuihg=", // 当前密钥
+    "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=", // 备用密钥（轮换）
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+cfg := httpc.DefaultConfig()
+cfg.Security.CertificatePinner = pinner
+client, err := httpc.New(cfg)
+```
+
+从证书生成 SPKI 哈希：
+
+```bash
+openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary | openssl enc -base64
+```
+
+| 函数 | 描述 |
+|------|------|
+| `NewSPKIHashPinner(hashes ...string)` | 按 base64 SHA-256 SPKI 哈希固定（推荐；HPKP 格式） |
+| `NewPublicKeyPinner(publicKeys ...[]byte)` | 按 DER 编码 PKIX 公钥固定 |
+| `NewCertificatePinnerChain(pinners ...CertificatePinner)` | 组合多个固定器（任一匹配即通过） |
 
 ### 安全警告输出
 
@@ -971,7 +1033,6 @@ const (
 var (
     ErrClientClosed         // 客户端已关闭
     ErrNilConfig            // 提供了 nil 配置
-    ErrInvalidURL           // URL 验证失败
     ErrInvalidHeader        // 请求头验证失败
     ErrInvalidTimeout       // 超时为负数或超出限制
     ErrInvalidRetry         // 重试配置无效
@@ -1066,10 +1127,7 @@ type Client interface {
     Delete(url string, options ...RequestOption) (*Result, error)
     Head(url string, options ...RequestOption) (*Result, error)
     Options(url string, options ...RequestOption) (*Result, error)
-    DownloadFile(url, filePath string, options ...RequestOption) (*DownloadResult, error)
-    DownloadWithOptions(url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
-    DownloadFileWithContext(ctx context.Context, url, filePath string, options ...RequestOption) (*DownloadResult, error)
-    DownloadWithOptionsWithContext(ctx context.Context, url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
+    Download(ctx context.Context, url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
     Close() error
 }
 ```
@@ -1139,12 +1197,6 @@ func (m *MockClient) Get(url string, options ...httpc.RequestOption) (*httpc.Res
 | **核心功能** | [05_request_options](examples/05_request_options.go), [06_error_handling](examples/06_error_handling.go), [07_timeout_retry](examples/07_timeout_retry.go), [08_client_configuration](examples/08_client_configuration.go), [09_redirects](examples/09_redirects.go), [10_cookies_advanced](examples/10_cookies_advanced.go) |
 | **有状态客户端** | [11_session](examples/11_session.go), [12_domain_client](examples/12_domain_client.go), [13_proxy_configuration](examples/13_proxy_configuration.go), [14_doh](examples/14_doh.go) |
 | **高级** | [15_middleware](examples/15_middleware.go), [16_concurrent_requests](examples/16_concurrent_requests.go), [17_file_operations](examples/17_file_operations.go), [18_rest_api_client](examples/18_rest_api_client.go), [19_advanced_patterns](examples/19_advanced_patterns.go) |
-
-运行示例：
-
-```bash
-go run -tags examples examples/01_basic_usage.go
-```
 
 ---
 

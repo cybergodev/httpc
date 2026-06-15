@@ -589,7 +589,7 @@ func TestPoolManager_ValidateAddressBeforeDial(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := pm.resolveAndValidateAddress(tt.address)
+			_, err := pm.resolveAndValidateAddress(context.Background(), tt.address)
 			if tt.expectError && err == nil {
 				t.Errorf("Expected error for address %s, got nil", tt.address)
 			}
@@ -816,9 +816,9 @@ func TestPoolManager_ConnectionMetrics(t *testing.T) {
 	t.Logf("Metrics: TotalConns=%d, ActiveConns=%d, RejectedConns=%d",
 		metrics.TotalConnections, metrics.ActiveConnections, metrics.RejectedConnections)
 
-	// Total connections should be at least 1
+	// A successful request must register at least one connection in the metrics.
 	if metrics.TotalConnections < 1 {
-		t.Logf("Warning: TotalConnections = %d, expected at least 1", metrics.TotalConnections)
+		t.Errorf("TotalConnections = %d, want >= 1 after a successful request", metrics.TotalConnections)
 	}
 }
 
@@ -857,7 +857,7 @@ func TestPoolManager_ValidateAddress_DomainResolution(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := pm.resolveAndValidateAddress(tt.address)
+			_, err := pm.resolveAndValidateAddress(context.Background(), tt.address)
 			if tt.expectError && err == nil {
 				t.Errorf("Expected error for address %s, got nil", tt.address)
 			}
@@ -899,10 +899,12 @@ func TestTrackedConn_DoubleClose(t *testing.T) {
 		t.Errorf("First body close failed: %v", err)
 	}
 
-	// Second close should be safe (trackedConn handles double close)
+	// Second close must be safe and idempotent: the body wrapper is designed so
+	// that closing an already-closed body is a no-op returning nil.
 	err = resp.Body.Close()
-	// This may or may not return an error depending on implementation
-	_ = err
+	if err != nil {
+		t.Errorf("Second body close should be idempotent (nil error), got: %v", err)
+	}
 }
 
 // ============================================================================

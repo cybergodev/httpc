@@ -42,11 +42,11 @@ type Client interface {
 	Head(url string, options ...RequestOption) (*Result, error)
 	Options(url string, options ...RequestOption) (*Result, error)
 
-	// File download methods
-	DownloadFile(url string, filePath string, options ...RequestOption) (*DownloadResult, error)
-	DownloadWithOptions(url string, downloadOpts *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
-	DownloadFileWithContext(ctx context.Context, url string, filePath string, options ...RequestOption) (*DownloadResult, error)
-	DownloadWithOptionsWithContext(ctx context.Context, url string, downloadOpts *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
+	// Download downloads a file from url to the path specified in cfg.
+	// cfg must be non-nil and cfg.FilePath must be set (ErrEmptyFilePath otherwise).
+	// Use DefaultDownloadConfig() as the starting point, then set FilePath and any
+	// of ProgressCallback / Overwrite / ResumeDownload / Checksum as needed.
+	Download(ctx context.Context, url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
 
 	// Close releases resources held by the client
 	Close() error
@@ -117,21 +117,33 @@ type clientImpl struct {
 //	// Use preset configuration
 //	client, err := httpc.New(httpc.SecureConfig())
 func New(config ...*Config) (Client, error) {
-	var cfg *Config
-	if len(config) > 0 && config[0] != nil {
-		if err := ValidateConfig(config[0]); err != nil {
-			return nil, fmt.Errorf("invalid configuration: %w", err)
-		}
-		cfg = deepCopyConfig(config[0])
-		if err := cfg.parseSSRFExemptCIDRs(); err != nil {
-			return nil, fmt.Errorf("invalid configuration: %w", err)
-		}
-		cfg = mergeNilSubConfigs(cfg)
-	} else {
-		cfg = DefaultConfig()
+	var in *Config
+	if len(config) > 0 {
+		in = config[0]
 	}
-
+	cfg, err := prepareConfig(in)
+	if err != nil {
+		return nil, err
+	}
 	return newFromPreparedConfig(cfg)
+}
+
+// prepareConfig validates, deep-copies, parses SSRF exempt CIDRs, and fills nil
+// sub-configs from the defaults. Returns DefaultConfig() when in is nil.
+// Shared by New and NewDomain so the two constructors cannot drift apart; the
+// error wrapping matches the previously inlined logic exactly.
+func prepareConfig(in *Config) (*Config, error) {
+	if in == nil {
+		return DefaultConfig(), nil
+	}
+	if err := ValidateConfig(in); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+	cfg := deepCopyConfig(in)
+	if err := cfg.parseSSRFExemptCIDRs(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
+	}
+	return mergeNilSubConfigs(cfg), nil
 }
 
 // newFromPreparedConfig creates a client from an already-validated and deep-copied config.
@@ -192,6 +204,9 @@ func deepCopyConfig(src *Config) *Config {
 	if src.Security != nil {
 		cp := *src.Security
 		dst.Security = &cp
+		// Note: CertificatePinner is an interface copied by reference (shared),
+		// not deep-copied. Pinner implementations are concurrency-safe, so
+		// sharing across clients is intentional. See SecurityConfig.CertificatePinner.
 	}
 	if src.Retry != nil {
 		cp := *src.Retry
@@ -288,6 +303,7 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 		// a type assertion on each invocation — only once at chain entry.
 		var onRequest func(*engine.Request) error
 		var onResponse func(*engine.Response) error
+		var allowPrivateIPs *bool
 		if engReq, ok := req.(*engine.Request); ok {
 			if cb := engReq.OnRequest(); cb != nil {
 				onRequest = cb
@@ -295,6 +311,7 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 			if cb := engReq.OnResponse(); cb != nil {
 				onResponse = cb
 			}
+			allowPrivateIPs = engReq.AllowPrivateIPs()
 		}
 
 		// Single option closure forwards all mutable fields from the middleware-modified request.
@@ -311,6 +328,9 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 				}
 				if mr := req.MaxRedirects(); mr != nil {
 					r.SetMaxRedirects(mr)
+				}
+				if allowPrivateIPs != nil {
+					r.SetAllowPrivateIPs(allowPrivateIPs)
 				}
 				r.SetStreamBody(req.StreamBody())
 				// Forward pre-extracted callbacks
@@ -374,7 +394,18 @@ func (c *clientImpl) doRequest(method, url string, options []RequestOption) (*Re
 
 // Request executes an HTTP request with the given context, method, URL, and options.
 // The context parameter allows for timeout and cancellation control.
-func (c *clientImpl) Request(ctx context.Context, method, url string, options ...RequestOption) (*Result, error) {
+func (c *clientImpl) Request(ctx context.Context, method, url string, options ...RequestOption) (result *Result, err error) {
+	// SEC-003: default panic safety net. An unexpected runtime panic anywhere in the
+	// execution path (engine, transport, TLS, response conversion) is converted to an
+	// error instead of crashing the caller. Pool hygiene is unaffected: executeRequest's
+	// own deferred releases and the releaseResponseMutator defer below run during stack
+	// unwinding before this recover (LIFO), so no pooled Response is leaked on panic.
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			err = panicToError(r)
+		}
+	}()
 	resp, err := c.executeRequest(ctx, method, url, options)
 	if err != nil {
 		return nil, err
@@ -471,8 +502,10 @@ var (
 )
 
 func getDefaultClient() (Client, error) {
-	// Fast path: check if already initialized (lock-free)
-	if client := defaultClient.Load(); client != nil {
+	// Fast path: check if already initialized (lock-free).
+	// A closed default client is treated as absent so the singleton
+	// self-heals after CloseDefaultClient() or a direct client.Close().
+	if client := defaultClient.Load(); client != nil && !client.engine.IsClosed() {
 		return client, nil
 	}
 
@@ -481,7 +514,7 @@ func getDefaultClient() (Client, error) {
 	defer defaultClientMu.Unlock()
 
 	// Double-check after acquiring lock
-	if client := defaultClient.Load(); client != nil {
+	if client := defaultClient.Load(); client != nil && !client.engine.IsClosed() {
 		return client, nil
 	}
 
@@ -515,58 +548,51 @@ func CloseDefaultClient() error {
 	return client.Close()
 }
 
-// doPackage is a helper for package-level HTTP verb functions.
-func doPackage(fn func(Client, string, ...RequestOption) (*Result, error), url string, options ...RequestOption) (*Result, error) {
-	client, err := getDefaultClient()
-	if err != nil {
-		return nil, err
-	}
-	return fn(client, url, options...)
-}
-
-// Get makes a GET request to the specified URL using the default client. Results are pooled; GC handles cleanup automatically.
-func Get(url string, options ...RequestOption) (*Result, error) {
-	return doPackage(Client.Get, url, options...)
-}
-
-// Post makes a POST request to the specified URL using the default client. Results are pooled; GC handles cleanup automatically.
-func Post(url string, options ...RequestOption) (*Result, error) {
-	return doPackage(Client.Post, url, options...)
-}
-
-// Put makes a PUT request to the specified URL using the default client. Results are pooled; GC handles cleanup automatically.
-func Put(url string, options ...RequestOption) (*Result, error) {
-	return doPackage(Client.Put, url, options...)
-}
-
-// Patch makes a PATCH request to the specified URL using the default client. Results are pooled; GC handles cleanup automatically.
-func Patch(url string, options ...RequestOption) (*Result, error) {
-	return doPackage(Client.Patch, url, options...)
-}
-
-// Delete makes a DELETE request to the specified URL using the default client. Results are pooled; GC handles cleanup automatically.
-func Delete(url string, options ...RequestOption) (*Result, error) {
-	return doPackage(Client.Delete, url, options...)
-}
-
-// Head makes a HEAD request to the specified URL using the default client. Results are pooled; GC handles cleanup automatically.
-func Head(url string, options ...RequestOption) (*Result, error) {
-	return doPackage(Client.Head, url, options...)
-}
-
-// Options makes an OPTIONS request to the specified URL using the default client. Results are pooled; GC handles cleanup automatically.
-func Options(url string, options ...RequestOption) (*Result, error) {
-	return doPackage(Client.Options, url, options...)
-}
-
-// doPackageRequest is a helper for the package-level Request function.
-// Unlike doPackage, it accepts a context parameter for timeout and cancellation control.
-func doPackageRequest(ctx context.Context, method, url string, options ...RequestOption) (*Result, error) {
+// withDefault resolves the default client and dispatches a request through it.
+// It is the single dispatch point for every package-level HTTP function, so the
+// package-level verbs and Request share one code path instead of duplicating the
+// default-client resolution in two separate helpers.
+func withDefault(ctx context.Context, method, url string, options []RequestOption) (*Result, error) {
 	client, err := getDefaultClient()
 	if err != nil {
 		return nil, err
 	}
 	return client.Request(ctx, method, url, options...)
+}
+
+// Get makes a GET request to the specified URL using the default client.
+func Get(url string, options ...RequestOption) (*Result, error) {
+	return withDefault(backgroundCtx, "GET", url, options)
+}
+
+// Post makes a POST request to the specified URL using the default client.
+func Post(url string, options ...RequestOption) (*Result, error) {
+	return withDefault(backgroundCtx, "POST", url, options)
+}
+
+// Put makes a PUT request to the specified URL using the default client.
+func Put(url string, options ...RequestOption) (*Result, error) {
+	return withDefault(backgroundCtx, "PUT", url, options)
+}
+
+// Patch makes a PATCH request to the specified URL using the default client.
+func Patch(url string, options ...RequestOption) (*Result, error) {
+	return withDefault(backgroundCtx, "PATCH", url, options)
+}
+
+// Delete makes a DELETE request to the specified URL using the default client.
+func Delete(url string, options ...RequestOption) (*Result, error) {
+	return withDefault(backgroundCtx, "DELETE", url, options)
+}
+
+// Head makes a HEAD request to the specified URL using the default client.
+func Head(url string, options ...RequestOption) (*Result, error) {
+	return withDefault(backgroundCtx, "HEAD", url, options)
+}
+
+// Options makes an OPTIONS request to the specified URL using the default client.
+func Options(url string, options ...RequestOption) (*Result, error) {
+	return withDefault(backgroundCtx, "OPTIONS", url, options)
 }
 
 // Request executes an HTTP request with the given method using the default client.
@@ -579,7 +605,7 @@ func doPackageRequest(ctx context.Context, method, url string, options ...Reques
 //
 //	result, err := httpc.Request(ctx, "GET", "https://api.example.com/data")
 func Request(ctx context.Context, method, url string, options ...RequestOption) (*Result, error) {
-	return doPackageRequest(ctx, method, url, options...)
+	return withDefault(ctx, method, url, options)
 }
 
 // SetDefaultClient sets a custom client as the default for package-level functions.
@@ -613,6 +639,21 @@ func SetDefaultClient(client Client) error {
 	return closeErr
 }
 
+// resultBundle co-locates a Result and its three nested info structs in a single
+// heap allocation. convertResponseToResult returns &b.result, whose Request,
+// Response, and Meta fields point into the same bundle. This collapses four
+// separate allocations (Result + RequestInfo + ResponseInfo + RequestMeta) into
+// one while remaining transparent to callers — the public API exposes only the
+// *Result pointer, and the bundle is reclaimed by GC once the result is.
+// Pooling is unsuitable here because callers retain the returned Result
+// indefinitely.
+type resultBundle struct {
+	result Result
+	req    RequestInfo
+	resp   ResponseInfo
+	meta   RequestMeta
+}
+
 func convertResponseToResult(resp ResponseMutator) *Result {
 	if resp == nil {
 		return nil
@@ -628,30 +669,33 @@ func convertResponseToResult(resp ResponseMutator) *Result {
 	}
 	requestCookies := extractRequestCookies(requestHeaders)
 
-	// Allocate fresh Result — objects are returned to callers who
-	// hold references indefinitely, so pooling provides no benefit.
-	result := &Result{
-		Request: &RequestInfo{
+	// Single allocation for Result and its three nested structs (see resultBundle).
+	b := &resultBundle{
+		req: RequestInfo{
 			URL:     resp.RequestURL(),
 			Method:  resp.RequestMethod(),
 			Headers: requestHeaders,
 			Cookies: requestCookies,
 		},
-		Response: &ResponseInfo{
+		resp: ResponseInfo{
 			StatusCode: resp.StatusCode(),
 			Status:     resp.Status(),
 			Proto:      resp.Proto(),
-			// Transfer header ownership from engine Response.
-			// Fall back to clone for middleware-wrapped ResponseMutator.
 		},
-		Meta: &RequestMeta{
+		meta: RequestMeta{
 			Duration:      resp.Duration(),
 			Attempts:      resp.Attempts(),
 			RedirectChain: resp.RedirectChain(),
 			RedirectCount: resp.RedirectCount(),
 		},
 	}
+	result := &b.result
+	result.Request = &b.req
+	result.Response = &b.resp
+	result.Meta = &b.meta
 
+	// Transfer header ownership from engine Response.
+	// Fall back to clone for middleware-wrapped ResponseMutator.
 	if engineResp, ok := resp.(*engine.Response); ok {
 		result.Response.Headers = engineResp.TransferHeaders()
 	} else {

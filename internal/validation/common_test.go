@@ -376,18 +376,18 @@ func TestValidateCookieName(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateCookieName(tt.cookieName)
+			err := validateCookieName(tt.cookieName)
 			if tt.wantErr {
 				if err == nil {
-					t.Errorf("ValidateCookieName() expected error, got nil")
+					t.Errorf("validateCookieName() expected error, got nil")
 					return
 				}
 				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("ValidateCookieName() error = %v, want to contain %v", err, tt.errContains)
+					t.Errorf("validateCookieName() error = %v, want to contain %v", err, tt.errContains)
 				}
 			} else {
 				if err != nil {
-					t.Errorf("ValidateCookieName() unexpected error = %v", err)
+					t.Errorf("validateCookieName() unexpected error = %v", err)
 				}
 			}
 		})
@@ -412,28 +412,24 @@ func TestValidateCookieValue(t *testing.T) {
 			wantErr:     true,
 			errContains: "invalid characters",
 		},
-		{
-			name:        "too long cookie value",
-			cookieValue: strings.Repeat("a", 4097),
-			wantErr:     true,
-			errContains: "too long",
-		},
+		// "too long cookie value" is covered more sharply (exact-max + one-over,
+		// against the MaxCookieValueLen constant) by TestValidateCookieValue_Boundaries.
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateCookieValue(tt.cookieValue)
+			err := validateCookieValue(tt.cookieValue)
 			if tt.wantErr {
 				if err == nil {
-					t.Errorf("ValidateCookieValue() expected error, got nil")
+					t.Errorf("validateCookieValue() expected error, got nil")
 					return
 				}
 				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("ValidateCookieValue() error = %v, want to contain %v", err, tt.errContains)
+					t.Errorf("validateCookieValue() error = %v, want to contain %v", err, tt.errContains)
 				}
 			} else {
 				if err != nil {
-					t.Errorf("ValidateCookieValue() unexpected error = %v", err)
+					t.Errorf("validateCookieValue() unexpected error = %v", err)
 				}
 			}
 		})
@@ -503,26 +499,8 @@ func TestValidateCookie(t *testing.T) {
 			wantErr:     true,
 			errContains: "path too long",
 		},
-		{
-			name: "domain with control character",
-			cookie: &http.Cookie{
-				Name:   "session",
-				Value:  "abc123",
-				Domain: "example\x01.com",
-			},
-			wantErr:     true,
-			errContains: "invalid characters",
-		},
-		{
-			name: "path with control character",
-			cookie: &http.Cookie{
-				Name:  "session",
-				Value: "abc123",
-				Path:  "/api\x01/path",
-			},
-			wantErr:     true,
-			errContains: "invalid characters",
-		},
+		// Control-character-in-Domain/Path cases are covered by the dedicated
+		// TestValidateCookie_ControlCharsInDomain and _ControlCharsInPath tests.
 	}
 
 	for _, tt := range tests {
@@ -545,36 +523,8 @@ func TestValidateCookie(t *testing.T) {
 	}
 }
 
-func TestIsValidHeaderChar(t *testing.T) {
-	tests := []struct {
-		char  rune
-		valid bool
-	}{
-		{'a', true},
-		{'z', true},
-		{'A', true},
-		{'Z', true},
-		{'0', true},
-		{'9', true},
-		{'-', true},
-		{' ', false},
-		{':', false},
-		{'_', false},
-		{'.', false},
-		{'\n', false},
-		{'\r', false},
-		{'\t', false},
-	}
-
-	for _, tt := range tests {
-		t.Run(string(tt.char), func(t *testing.T) {
-			result := isValidHeaderChar(tt.char)
-			if result != tt.valid {
-				t.Errorf("isValidHeaderChar(%q) = %v, want %v", tt.char, result, tt.valid)
-			}
-		})
-	}
-}
+// TestIsValidHeaderChar is retired: its cases are a strict subset of
+// TestIsValidHeaderChar_Boundaries, which also covers NUL/DEL/non-ASCII edges.
 
 func TestIsValidHeaderString(t *testing.T) {
 	tests := []struct {
@@ -724,21 +674,21 @@ func TestIsValidHeaderChar_Boundaries(t *testing.T) {
 // including empty string, exact max length, and one over max length.
 func TestValidateCookieValue_Boundaries(t *testing.T) {
 	t.Run("empty string is valid", func(t *testing.T) {
-		err := ValidateCookieValue("")
+		err := validateCookieValue("")
 		if err != nil {
 			t.Errorf("unexpected error for empty cookie value: %v", err)
 		}
 	})
 
 	t.Run("value at exact max length", func(t *testing.T) {
-		err := ValidateCookieValue(strings.Repeat("a", MaxCookieValueLen))
+		err := validateCookieValue(strings.Repeat("a", MaxCookieValueLen))
 		if err != nil {
 			t.Errorf("unexpected error for value at MaxCookieValueLen: %v", err)
 		}
 	})
 
 	t.Run("value one over max length", func(t *testing.T) {
-		err := ValidateCookieValue(strings.Repeat("a", MaxCookieValueLen+1))
+		err := validateCookieValue(strings.Repeat("a", MaxCookieValueLen+1))
 		if err == nil {
 			t.Error("expected error for value exceeding MaxCookieValueLen")
 		}
@@ -838,15 +788,5 @@ func TestValidateCookie_ControlCharsInPath(t *testing.T) {
 	}
 }
 
-// TestValidateHeaderKeyValue_PseudoHeader verifies that HTTP/2 pseudo-headers
-// (keys starting with ":") are rejected. The colon character fails the header
-// character validation before reaching the explicit pseudo-header check.
-func TestValidateHeaderKeyValue_PseudoHeader(t *testing.T) {
-	err := ValidateHeaderKeyValue(":method", "GET")
-	if err == nil {
-		t.Fatal("ValidateHeaderKeyValue() expected error for pseudo-header ':method', got nil")
-	}
-	if !strings.Contains(err.Error(), "invalid character") {
-		t.Errorf("error should mention invalid character, got: %v", err)
-	}
-}
+// TestValidateHeaderKeyValue_PseudoHeader is retired: the ":path" and ":method"
+// pseudo-header cases are already rows in TestValidateHeaderKeyValue_EdgeCases.

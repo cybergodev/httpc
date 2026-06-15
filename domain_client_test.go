@@ -1,6 +1,7 @@
 package httpc_test
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -238,20 +239,28 @@ func TestDomainClient_HeaderOverride(t *testing.T) {
 	}
 }
 
-func TestDomainClient_SetHeaders(t *testing.T) {
+// newTestDomain returns a DomainClient bound to a fixed example base URL, with
+// Close registered for automatic cleanup. It collapses the repeated
+// NewDomain + defer Close boilerplate shared by the session-accessor tests.
+func newTestDomain(t *testing.T) httpc.DomainClienter {
+	t.Helper()
 	client, err := httpc.NewDomain("https://api.example.com")
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
-	defer client.Close()
+	t.Cleanup(func() { _ = client.Close() })
+	return client
+}
+
+func TestDomainClient_SetHeaders(t *testing.T) {
+	client := newTestDomain(t)
 
 	headers := map[string]string{
 		"X-Custom-1": "value1",
 		"X-Custom-2": "value2",
 	}
 
-	err = client.SetHeaders(headers)
-	if err != nil {
+	if err := client.SetHeaders(headers); err != nil {
 		t.Fatalf("SetHeaders error = %v", err)
 	}
 
@@ -268,14 +277,9 @@ func TestDomainClient_SetHeaders(t *testing.T) {
 }
 
 func TestDomainClient_DeleteHeader(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com")
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
+	client := newTestDomain(t)
 
-	err = client.SetHeader("X-Test", "value")
-	if err != nil {
+	if err := client.SetHeader("X-Test", "value"); err != nil {
 		t.Fatalf("SetHeader error = %v", err)
 	}
 
@@ -288,18 +292,13 @@ func TestDomainClient_DeleteHeader(t *testing.T) {
 }
 
 func TestDomainClient_ClearHeaders(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com")
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
+	client := newTestDomain(t)
 
 	headers := map[string]string{
 		"X-Custom-1": "value1",
 		"X-Custom-2": "value2",
 	}
-	err = client.SetHeaders(headers)
-	if err != nil {
+	if err := client.SetHeaders(headers); err != nil {
 		t.Fatalf("SetHeaders error = %v", err)
 	}
 
@@ -312,19 +311,14 @@ func TestDomainClient_ClearHeaders(t *testing.T) {
 }
 
 func TestDomainClient_SetCookies(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com")
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
+	client := newTestDomain(t)
 
 	cookies := []*http.Cookie{
 		{Name: "cookie1", Value: "value1"},
 		{Name: "cookie2", Value: "value2"},
 	}
 
-	err = client.SetCookies(cookies)
-	if err != nil {
+	if err := client.SetCookies(cookies); err != nil {
 		t.Fatalf("SetCookies error = %v", err)
 	}
 
@@ -335,14 +329,9 @@ func TestDomainClient_SetCookies(t *testing.T) {
 }
 
 func TestDomainClient_GetCookie(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com")
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
+	client := newTestDomain(t)
 
-	err = client.SetCookie(&http.Cookie{Name: "test", Value: "value"})
-	if err != nil {
+	if err := client.SetCookie(&http.Cookie{Name: "test", Value: "value"}); err != nil {
 		t.Fatalf("SetCookie error = %v", err)
 	}
 
@@ -354,45 +343,33 @@ func TestDomainClient_GetCookie(t *testing.T) {
 		t.Errorf("GetCookie = %v/%v, want test/value", cookie.Name, cookie.Value)
 	}
 
-	notFound := client.GetCookie("nonexistent")
-	if notFound != nil {
+	if notFound := client.GetCookie("nonexistent"); notFound != nil {
 		t.Errorf("GetCookie for nonexistent cookie should return nil")
 	}
 }
 
 func TestDomainClient_DeleteCookie(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com")
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
+	client := newTestDomain(t)
 
-	err = client.SetCookie(&http.Cookie{Name: "test", Value: "value"})
-	if err != nil {
+	if err := client.SetCookie(&http.Cookie{Name: "test", Value: "value"}); err != nil {
 		t.Fatalf("SetCookie error = %v", err)
 	}
 
 	client.DeleteCookie("test")
 
-	cookie := client.GetCookie("test")
-	if cookie != nil {
+	if cookie := client.GetCookie("test"); cookie != nil {
 		t.Errorf("Cookie should be deleted")
 	}
 }
 
 func TestDomainClient_ClearCookies(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com")
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
+	client := newTestDomain(t)
 
 	cookies := []*http.Cookie{
 		{Name: "cookie1", Value: "value1"},
 		{Name: "cookie2", Value: "value2"},
 	}
-	err = client.SetCookies(cookies)
-	if err != nil {
+	if err := client.SetCookies(cookies); err != nil {
 		t.Fatalf("SetCookies error = %v", err)
 	}
 
@@ -1053,7 +1030,7 @@ func TestDomainClient_RealWorldScenario(t *testing.T) {
 // These tests focus on DomainClient-specific auto-header/cookie behavior.
 // ============================================================================
 
-func TestDomainClient_DownloadFile_WithAutoHeaders(t *testing.T) {
+func TestDomainClient_Download_WithAutoHeaders(t *testing.T) {
 	content := []byte("test content with headers")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
@@ -1090,9 +1067,9 @@ func TestDomainClient_DownloadFile_WithAutoHeaders(t *testing.T) {
 	tmpFile := filepath.Join(os.TempDir(), "test_download_headers.txt")
 	defer os.Remove(tmpFile)
 
-	_, err = client.DownloadFile("/file.txt", tmpFile)
+	_, err = client.Download(context.Background(), "/file.txt", &httpc.DownloadConfig{FilePath: tmpFile})
 	if err != nil {
-		t.Fatalf("DownloadFile error = %v", err)
+		t.Fatalf("Download error = %v", err)
 	}
 
 	data, _ := os.ReadFile(tmpFile)
@@ -1101,7 +1078,7 @@ func TestDomainClient_DownloadFile_WithAutoHeaders(t *testing.T) {
 	}
 }
 
-func TestDomainClient_DownloadFile_WithAutoCookies(t *testing.T) {
+func TestDomainClient_Download_WithAutoCookies(t *testing.T) {
 	content := []byte("test content with cookies")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cookie, err := r.Cookie("session")
@@ -1135,9 +1112,9 @@ func TestDomainClient_DownloadFile_WithAutoCookies(t *testing.T) {
 	tmpFile := filepath.Join(os.TempDir(), "test_download_cookies.txt")
 	defer os.Remove(tmpFile)
 
-	_, err = client.DownloadFile("/file.txt", tmpFile)
+	_, err = client.Download(context.Background(), "/file.txt", &httpc.DownloadConfig{FilePath: tmpFile})
 	if err != nil {
-		t.Fatalf("DownloadFile error = %v", err)
+		t.Fatalf("Download error = %v", err)
 	}
 
 	data, _ := os.ReadFile(tmpFile)
@@ -1146,7 +1123,7 @@ func TestDomainClient_DownloadFile_WithAutoCookies(t *testing.T) {
 	}
 }
 
-func TestDomainClient_DownloadFile_FullURL(t *testing.T) {
+func TestDomainClient_Download_FullURL(t *testing.T) {
 	content := []byte("test full url download")
 	called := false
 
@@ -1172,9 +1149,9 @@ func TestDomainClient_DownloadFile_FullURL(t *testing.T) {
 	tmpFile := filepath.Join(os.TempDir(), "test_download_fullurl.txt")
 	defer os.Remove(tmpFile)
 
-	result, err := client.DownloadFile(server2.URL+"/file.txt", tmpFile)
+	result, err := client.Download(context.Background(), server2.URL+"/file.txt", &httpc.DownloadConfig{FilePath: tmpFile})
 	if err != nil {
-		t.Fatalf("DownloadFile error = %v", err)
+		t.Fatalf("Download error = %v", err)
 	}
 
 	if !called {
@@ -1191,7 +1168,7 @@ func TestDomainClient_DownloadFile_FullURL(t *testing.T) {
 	}
 }
 
-func TestDomainClient_DownloadFile_WithPathOptions(t *testing.T) {
+func TestDomainClient_Download_WithPathOptions(t *testing.T) {
 	tests := []struct {
 		name           string
 		path           string
@@ -1218,9 +1195,9 @@ func TestDomainClient_DownloadFile_WithPathOptions(t *testing.T) {
 			tmpFile := filepath.Join(os.TempDir(), "test_path_"+tt.name+".txt")
 			defer os.Remove(tmpFile)
 
-			_, err := client.DownloadFile(tt.path, tmpFile)
+			_, err := client.Download(context.Background(), tt.path, &httpc.DownloadConfig{FilePath: tmpFile})
 			if err != nil {
-				t.Fatalf("DownloadFile error = %v", err)
+				t.Fatalf("Download error = %v", err)
 			}
 
 			if tt.expectedCalled && !called {

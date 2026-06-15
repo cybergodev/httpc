@@ -321,6 +321,47 @@ resp, err := client.Get(url,
 )
 ```
 
+### Two Ways to Pass Context
+
+HTTPC offers two equivalent ways to attach a context to a request. Pick one and use
+it consistently:
+
+```go
+// (1) Explicit context argument — preferred for long-running or cancellable calls
+ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+resp, err := client.Request(ctx, "GET", url)
+
+// (2) Context option — convenient when chaining convenience verbs (Get/Post/...)
+resp, err := client.Get(url, httpc.WithContext(ctx))
+```
+
+Both reach the same execution path (`executeRequest`); there is no behavioral
+difference. `Request` additionally accepts an arbitrary method string (e.g.
+`"PROPFIND"`), so prefer it for non-standard verbs.
+
+### Per-Request Override Priority
+
+A handful of request options override values set on the client `Config`. When both
+are present, the per-request option wins for that single request only — the client's
+configuration is unchanged:
+
+| Per-request option | Overrides Config field |
+|--------------------|------------------------|
+| `WithTimeout(d)` | `Config.Timeouts.Request` |
+| `WithMaxRetries(n)` | `Config.Retry.MaxRetries` |
+| `WithFollowRedirects(b)` | `Config.Middleware.FollowRedirects` |
+| `WithMaxRedirects(n)` | `Config.Middleware.MaxRedirects` |
+| `WithContext(ctx)` | the client's default background context |
+
+All other options (headers, body, query, auth, cookies, callbacks) are request-only
+and have no corresponding `Config` field.
+
+> **Exception:** `Config.Timeouts.ResponseHeader`, when set to a positive value, is a
+> transport-level cap that applies to **all** requests sharing the client and
+> **cannot** be relaxed per request via `WithTimeout`. Leave it at `0` (the default)
+> if you need full per-request timeout control.
+
 ## Retry Options
 
 ### Max Retries

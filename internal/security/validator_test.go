@@ -548,7 +548,7 @@ func TestValidateHost_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validator.validateHost(tt.host)
+			err := validator.validateHost(tt.host, nil)
 			if (err != nil) != tt.shouldErr {
 				t.Errorf("validateHost(%s) error = %v, shouldErr = %v", tt.host, err, tt.shouldErr)
 			}
@@ -657,7 +657,7 @@ func TestValidateURL_WithAllowPrivateIPs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validator.validateURL(tt.url)
+			err := validator.validateURL(tt.url, nil)
 			if (err != nil) != tt.shouldErr {
 				t.Errorf("validateURL(%s) error = %v, shouldErr = %v", tt.url, err, tt.shouldErr)
 			}
@@ -692,8 +692,9 @@ func TestValidateRequestBodySize_UrlValues(t *testing.T) {
 	}
 }
 
-// TestValidateRequestBodySize_ZeroLimitFallback verifies that when
-// MaxRequestBodySize is zero, the validator falls back to MaxResponseBodySize.
+// TestValidateRequestBodySize_ZeroLimitNoValidation verifies that when
+// MaxRequestBodySize is zero, no request-body size validation is performed
+// (there is intentionally NO fallback to MaxResponseBodySize).
 func TestValidateRequestBodySize_ZeroLimitNoValidation(t *testing.T) {
 	validator := NewValidatorWithConfig(&Config{
 		ValidateURL:         true,
@@ -735,7 +736,7 @@ func TestValidateHost_AllowPrivateIPsFastReturn(t *testing.T) {
 
 	for _, host := range hosts {
 		t.Run(host, func(t *testing.T) {
-			err := validator.validateHost(host)
+			err := validator.validateHost(host, nil)
 			if err != nil {
 				t.Errorf("validateHost(%q) expected nil with AllowPrivateIPs=true, got: %v", host, err)
 			}
@@ -777,5 +778,68 @@ func TestValidatorCacheConcurrency(t *testing.T) {
 
 	if len(keys) > 1 {
 		t.Errorf("expected at most 1 urlKey entry, got %d: %v", len(keys), keys)
+	}
+}
+
+// boolPtr returns a pointer to b, used to build per-request AllowPrivateIPs overrides.
+func boolPtr(b bool) *bool { return &b }
+
+// TestValidateHost_PerRequestOverride verifies that a per-request AllowPrivateIPs
+// override takes precedence over the validator's configured policy in both directions.
+func TestValidateHost_PerRequestOverride(t *testing.T) {
+	// Validator with SSRF protection enabled (AllowPrivateIPs=false).
+	validator := NewValidatorWithConfig(&Config{
+		ValidateURL:     true,
+		AllowPrivateIPs: false,
+	})
+
+	// nil override → client policy (false) → localhost blocked.
+	if err := validator.validateHost("localhost", nil); err == nil {
+		t.Error("validateHost(localhost, nil) expected error with client policy=false")
+	}
+	// true override → localhost allowed.
+	if err := validator.validateHost("localhost", boolPtr(true)); err != nil {
+		t.Errorf("validateHost(localhost, true) expected nil, got: %v", err)
+	}
+	// false override (explicit) → localhost blocked, matching client policy.
+	if err := validator.validateHost("localhost", boolPtr(false)); err == nil {
+		t.Error("validateHost(localhost, false) expected error")
+	}
+
+	// Validator with SSRF protection disabled (AllowPrivateIPs=true): a false
+	// override must RE-ENABLE protection for that request.
+	permissive := NewValidatorWithConfig(&Config{
+		ValidateURL:     true,
+		AllowPrivateIPs: true,
+	})
+	if err := permissive.validateHost("localhost", nil); err != nil {
+		t.Errorf("validateHost(localhost, nil) expected nil with client policy=true, got: %v", err)
+	}
+	if err := permissive.validateHost("localhost", boolPtr(false)); err == nil {
+		t.Error("validateHost(localhost, false) expected error even when client policy=true")
+	}
+}
+
+// TestValidateURL_OverrideDoesNotPoisonCache verifies the URL-validation cache is
+// not poisoned by a per-request override. A URL allowed only via override must not
+// be cached as generally-allowed, so a later request without the override is still
+// blocked. This is the regression guard for the cache keyed by URL string alone.
+func TestValidateURL_OverrideDoesNotPoisonCache(t *testing.T) {
+	validator := NewValidatorWithConfig(&Config{
+		ValidateURL:     true,
+		AllowPrivateIPs: false,
+	})
+
+	localhost := "http://localhost:8080/"
+
+	// 1. Validate with override=true → allowed (must NOT be cached).
+	if err := validator.validateURL(localhost, boolPtr(true)); err != nil {
+		t.Fatalf("validateURL with override=true expected nil, got: %v", err)
+	}
+
+	// 2. Validate the SAME url with no override → must still be blocked.
+	//    If the override result had been cached, this would incorrectly return nil.
+	if err := validator.validateURL(localhost, nil); err == nil {
+		t.Error("SECURITY ISSUE: validateURL without override must still block localhost after an override-allowed validation (cache poisoned)")
 	}
 }

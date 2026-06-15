@@ -207,9 +207,14 @@ func (p *responseProcessor) Process(httpResp *http.Response) (*Response, error) 
 	resp := getResponse()
 	resp.SetStatusCode(httpResp.StatusCode)
 	resp.SetStatus(httpResp.Status)
-	// Clone headers so the engine owns the copy. This enables TransferHeaders()
-	// in the public layer to take ownership without a second clone.
-	resp.SetHeaders(CloneHeader(httpResp.Header))
+	// Transfer ownership of httpResp.Header directly instead of cloning.
+	// Each *http.Response from RoundTrip is a fresh, unshared object whose Header
+	// map remains valid after Body.Close() (net/http retains the connection, not
+	// the Response/Header). Nothing mutates this map between here and the deferred
+	// body close in executeRequest, and the Set-Cookie read below only reads it.
+	// This mirrors the streaming path (executeRequest) and lets TransferHeaders()
+	// hand the map to the public Result with zero header copies on the happy path.
+	resp.SetHeaders(httpResp.Header)
 	resp.SetRawBody(body)
 	// Body string is lazily converted on first access via Body() to avoid
 	// doubling memory when caller only uses RawBody

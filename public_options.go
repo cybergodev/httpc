@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -134,8 +135,52 @@ func WithQueryMap(params map[string]any) RequestOption {
 }
 
 // queryValueLength returns the string length of a formatted query value.
+// queryValueLength returns the formatted length of a query parameter value
+// WITHOUT materializing the formatted string. For numeric and bool types it
+// formats into a stack-allocated buffer (strconv.Append*) and measures the
+// result, avoiding the heap allocation that FormatQueryParam (strconv.Itoa/
+// FormatFloat) would incur. The value is formatted again later during encoding,
+// so computing the length this way removes a redundant per-WithQuery allocation.
+// The returned length is identical to len(FormatQueryParam(v)) for all inputs.
 func queryValueLength(v any) int {
-	return len(engine.FormatQueryParam(v))
+	switch val := v.(type) {
+	case nil:
+		return 0
+	case string:
+		return len(val)
+	case bool:
+		if val {
+			return 4 // "true"
+		}
+		return 5 // "false"
+	case int:
+		var buf [20]byte
+		return len(strconv.AppendInt(buf[:0], int64(val), 10))
+	case int64:
+		var buf [20]byte
+		return len(strconv.AppendInt(buf[:0], val, 10))
+	case int32:
+		var buf [20]byte
+		return len(strconv.AppendInt(buf[:0], int64(val), 10))
+	case uint:
+		var buf [20]byte
+		return len(strconv.AppendUint(buf[:0], uint64(val), 10))
+	case uint64:
+		var buf [20]byte
+		return len(strconv.AppendUint(buf[:0], val, 10))
+	case uint32:
+		var buf [20]byte
+		return len(strconv.AppendUint(buf[:0], uint64(val), 10))
+	case float64:
+		var buf [32]byte
+		return len(strconv.AppendFloat(buf[:0], val, 'f', -1, 64))
+	case float32:
+		var buf [32]byte
+		return len(strconv.AppendFloat(buf[:0], float64(val), 'f', -1, 32))
+	default:
+		// fmt.Stringer and other types: fall back to FormatQueryParam.
+		return len(engine.FormatQueryParam(v))
+	}
 }
 
 // WithJSON sets the request body as JSON and sets Content-Type to application/json.
@@ -185,13 +230,13 @@ func WithXML(data any) RequestOption {
 // Example:
 //
 //	// Auto-detect (JSON for struct/map)
-//	result, err := client.Post(ctx, url, httpc.WithBody(data, httpc.BodyAuto))
+//	result, err := client.Post(url,httpc.WithBody(data, httpc.BodyAuto))
 //
 //	// Explicit XML
-//	result, err := client.Post(ctx, url, httpc.WithBody(data, httpc.BodyXML))
+//	result, err := client.Post(url,httpc.WithBody(data, httpc.BodyXML))
 //
 //	// Auto-detect omitted (same as BodyAuto)
-//	result, err := client.Post(ctx, url, httpc.WithBody(data))
+//	result, err := client.Post(url,httpc.WithBody(data))
 //
 // Returns an error if data is nil, or if the body type is incompatible with the
 // specified BodyKind (e.g., BodyMultipart requires *FormData, BodyForm requires
@@ -536,6 +581,36 @@ func WithFollowRedirects(follow bool) RequestOption {
 	}
 }
 
+// WithAllowPrivateIPs overrides the client's SSRF policy for this single request.
+// When allow is true, the request may target localhost and private/reserved IP
+// ranges (127.0.0.0/8, 10.0.0.0/8, 192.168.0.0/16, 169.254.0.0/16, etc.) and may
+// follow redirects to such addresses. When allow is false, SSRF protection is
+// enforced for this request even if the client was configured with
+// Security.AllowPrivateIPs=true.
+//
+// This is a per-request escape hatch from SSRF protection. It is intended for
+// cases where a client that uses secure defaults (AllowPrivateIPs=false) must
+// occasionally reach an internal service, loopback address, or local development
+// server — without relaxing the security posture of the whole client.
+//
+// SECURITY: Only enable this on requests whose URL is trusted and not derived
+// from untrusted user input. SSRF protection exists to prevent an attacker from
+// making your process reach private/internal endpoints; disabling it per request
+// reopens that risk for this call. For whole-client access to internal services,
+// prefer setting Security.AllowPrivateIPs=true on the Config.
+//
+// Example (default client blocks private IPs; this call opts in per request):
+//
+//	result, err := httpc.Get("http://localhost:8080/health",
+//	    httpc.WithAllowPrivateIPs(true),
+//	)
+func WithAllowPrivateIPs(allow bool) RequestOption {
+	return func(r *engine.Request) error {
+		r.SetAllowPrivateIPs(&allow)
+		return nil
+	}
+}
+
 // WithStreamBody enables streaming mode where the response body is not buffered
 // into memory. The caller reads the body directly via the engine Response's
 // RawBodyReader. Used internally for file downloads to avoid buffering large files.
@@ -757,6 +832,7 @@ func parseCookieString(cookieString string) ([]http.Cookie, error) {
 //	        return nil
 //	    }),
 //	)
+//
 // Returns an error if callback is nil.
 func WithOnRequest(callback func(req RequestMutator) error) RequestOption {
 	return func(r *engine.Request) error {
@@ -832,7 +908,7 @@ func WithOnResponse(callback func(resp ResponseMutator) error) RequestOption {
 //
 // Example:
 //
-//	security := &validation.CookieSecurityConfig{
+//	security := &httpc.CookieSecurityConfig{
 //	    RequireSecure:     true,
 //	    RequireHttpOnly:   true,
 //	    RequireSameSite:   "Strict",
@@ -844,7 +920,7 @@ func WithOnResponse(callback func(resp ResponseMutator) error) RequestOption {
 //
 // Returns an error if securityConfig is nil, or if any cookie on the request
 // fails the security validation check.
-func WithSecureCookie(securityConfig *validation.CookieSecurityConfig) RequestOption {
+func WithSecureCookie(securityConfig *CookieSecurityConfig) RequestOption {
 	return func(r *engine.Request) error {
 		if securityConfig == nil {
 			return fmt.Errorf("security config cannot be nil")

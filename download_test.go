@@ -39,7 +39,7 @@ func TestDownload_Basic(t *testing.T) {
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "test.txt")
 
-	result, err := client.DownloadFile(server.URL, filePath)
+	result, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestDownload_EmptyFile(t *testing.T) {
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "empty.txt")
 
-	result, err := client.DownloadFile(server.URL, filePath)
+	result, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
 	if err != nil {
 		t.Fatalf("Download of empty file failed: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestDownload_LargeFile(t *testing.T) {
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "large-file.bin")
 
-	result, err := client.DownloadFile(server.URL, filePath)
+	result, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
 	if err != nil {
 		t.Fatalf("Large file download failed: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestDownload_WithProgress(t *testing.T) {
 		},
 	}
 
-	result, err := client.DownloadWithOptions(server.URL, opts)
+	result, err := client.Download(context.Background(), server.URL, opts)
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestDownload_WithTimeout(t *testing.T) {
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "timeout-test.txt")
 
-	_, err := client.DownloadFile(server.URL, filePath)
+	_, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
 	if err == nil {
 		t.Error("Expected timeout error")
 	}
@@ -220,7 +220,7 @@ func TestDownload_ResumeNotSupported(t *testing.T) {
 		ResumeDownload: true,
 	}
 
-	result, err := client.DownloadWithOptions(server.URL, opts)
+	result, err := client.Download(context.Background(), server.URL, opts)
 	if err == nil {
 		t.Fatal("Expected error when server does not support range requests")
 	}
@@ -267,7 +267,7 @@ func TestDownload_PartialContent(t *testing.T) {
 		ResumeDownload: true,
 	}
 
-	result, err := client.DownloadWithOptions(server.URL, opts)
+	result, err := client.Download(context.Background(), server.URL, opts)
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestDownload_InvalidPath(t *testing.T) {
 	defer client.Close()
 
 	// Invalid path with directory traversal attempt
-	_, err := client.DownloadFile(server.URL, "../../../etc/passwd")
+	_, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: "../../../etc/passwd"})
 	if err == nil {
 		t.Error("Expected error for invalid path")
 	}
@@ -320,14 +320,14 @@ func TestDownload_FileAlreadyExists(t *testing.T) {
 		FilePath:  filePath,
 		Overwrite: false,
 	}
-	_, err := client.DownloadWithOptions(server.URL, opts)
+	_, err := client.Download(context.Background(), server.URL, opts)
 	if err == nil {
 		t.Error("Expected error when file exists and overwrite is false")
 	}
 
 	// Try with overwrite
 	opts.Overwrite = true
-	result, err := client.DownloadWithOptions(server.URL, opts)
+	result, err := client.Download(context.Background(), server.URL, opts)
 	if err != nil {
 		t.Fatalf("Download with overwrite failed: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestDownload_HTTPError(t *testing.T) {
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "error-test.txt")
 
-	_, err := client.DownloadFile(server.URL, filePath)
+	_, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
 	if err == nil {
 		t.Error("Expected error for 404 response")
 	}
@@ -373,7 +373,7 @@ func TestDownload_CreateDirectories(t *testing.T) {
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "subdir1", "subdir2", "file.txt")
 
-	result, err := client.DownloadFile(server.URL, filePath)
+	result, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
 	if err != nil {
 		t.Fatalf("Download failed: %v", err)
 	}
@@ -428,7 +428,7 @@ func TestResult_SaveToFile(t *testing.T) {
 // ----------------------------------------------------------------------------
 
 func TestDownload_PackageLevel(t *testing.T) {
-	t.Run("DownloadFile", func(t *testing.T) {
+	t.Run("WithFilePath", func(t *testing.T) {
 		content := []byte("package level download test")
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -445,9 +445,9 @@ func TestDownload_PackageLevel(t *testing.T) {
 		tempDir := t.TempDir()
 		filePath := filepath.Join(tempDir, "pkg-level-test.txt")
 
-		result, err := DownloadFile(server.URL, filePath)
+		result, err := Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
 		if err != nil {
-			t.Fatalf("DownloadFile failed: %v", err)
+			t.Fatalf("Download failed: %v", err)
 		}
 
 		if result.BytesWritten != int64(len(content)) {
@@ -455,7 +455,7 @@ func TestDownload_PackageLevel(t *testing.T) {
 		}
 	})
 
-	t.Run("DownloadWithOptions", func(t *testing.T) {
+	t.Run("WithProgressCallback", func(t *testing.T) {
 		content := []byte("download with options test")
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -480,9 +480,9 @@ func TestDownload_PackageLevel(t *testing.T) {
 			},
 		}
 
-		result, err := DownloadWithOptions(server.URL, opts)
+		result, err := Download(context.Background(), server.URL, opts)
 		if err != nil {
-			t.Fatalf("DownloadWithOptions failed: %v", err)
+			t.Fatalf("Download failed: %v", err)
 		}
 
 		if result.BytesWritten != int64(len(content)) {
@@ -505,7 +505,7 @@ func TestDownload_EdgeCases(t *testing.T) {
 		client, _ := New(config)
 		defer client.Close()
 
-		_, err := client.DownloadFile("http://example.com/file.txt", "")
+		_, err := client.Download(context.Background(), "http://example.com/file.txt", &DownloadConfig{FilePath: ""})
 		if err == nil {
 			t.Error("Expected error for empty file path")
 		}
@@ -517,7 +517,7 @@ func TestDownload_EdgeCases(t *testing.T) {
 		client, _ := New(config)
 		defer client.Close()
 
-		_, err := client.DownloadWithOptions("http://example.com/file.txt", nil)
+		_, err := client.Download(context.Background(), "http://example.com/file.txt", nil)
 		if err == nil {
 			t.Error("Expected error for nil options")
 		}
@@ -750,7 +750,7 @@ func TestIsSystemPath(t *testing.T) {
 // Package-Level Download Functions
 // ----------------------------------------------------------------------------
 
-func TestPackageLevel_DownloadFileWithContext(t *testing.T) {
+func TestPackageLevel_Download_VerifiesContent(t *testing.T) {
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
@@ -765,9 +765,9 @@ func TestPackageLevel_DownloadFileWithContext(t *testing.T) {
 	defer server.Close()
 
 	filePath := filepath.Join(t.TempDir(), "ctx_test.txt")
-	result, err := DownloadFileWithContext(context.Background(), server.URL, filePath)
+	result, err := Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
 	if err != nil {
-		t.Fatalf("DownloadFileWithContext failed: %v", err)
+		t.Fatalf("Download failed: %v", err)
 	}
 	if result == nil {
 		t.Fatal("result should not be nil")
@@ -779,7 +779,7 @@ func TestPackageLevel_DownloadFileWithContext(t *testing.T) {
 	}
 }
 
-func TestPackageLevel_DownloadWithOptionsWithContext(t *testing.T) {
+func TestPackageLevel_Download_WithDefaultConfig(t *testing.T) {
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
@@ -797,9 +797,9 @@ func TestPackageLevel_DownloadWithOptionsWithContext(t *testing.T) {
 	opts := DefaultDownloadConfig()
 	opts.FilePath = filePath
 
-	result, err := DownloadWithOptionsWithContext(context.Background(), server.URL, opts)
+	result, err := Download(context.Background(), server.URL, opts)
 	if err != nil {
-		t.Fatalf("DownloadWithOptionsWithContext failed: %v", err)
+		t.Fatalf("Download failed: %v", err)
 	}
 	if result == nil {
 		t.Fatal("result should not be nil")

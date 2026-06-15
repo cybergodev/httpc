@@ -105,15 +105,23 @@ func TestSessionManager_CookieSecurityValidation(t *testing.T) {
 	}
 }
 
-func TestSessionManager_SetCookie(t *testing.T) {
+// newTestSession returns an initialized SessionManager, collapsing the repeated
+// NewSessionManager + error-check boilerplate shared by the accessor tests.
+// (Not used by TestNewSessionManager itself, which validates the constructor.)
+func newTestSession(t *testing.T) *SessionManager {
+	t.Helper()
 	session, err := NewSessionManager()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
+	return session
+}
+
+func TestSessionManager_SetCookie(t *testing.T) {
+	session := newTestSession(t)
 
 	// Test nil cookie
-	err = session.SetCookie(nil)
-	if err == nil {
+	if err := session.SetCookie(nil); err == nil {
 		t.Error("Expected error for nil cookie")
 	}
 
@@ -122,8 +130,7 @@ func TestSessionManager_SetCookie(t *testing.T) {
 		Name:  "test",
 		Value: "value",
 	}
-	err = session.SetCookie(cookie)
-	if err != nil {
+	if err := session.SetCookie(cookie); err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
@@ -138,18 +145,14 @@ func TestSessionManager_SetCookie(t *testing.T) {
 }
 
 func TestSessionManager_SetCookies(t *testing.T) {
-	session, err := NewSessionManager()
-	if err != nil {
-		t.Fatalf("NewSessionManager error: %v", err)
-	}
+	session := newTestSession(t)
 
 	cookies := []*http.Cookie{
 		{Name: "cookie1", Value: "value1"},
 		{Name: "cookie2", Value: "value2"},
 	}
 
-	err = session.SetCookies(cookies)
-	if err != nil {
+	if err := session.SetCookies(cookies); err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
@@ -160,10 +163,7 @@ func TestSessionManager_SetCookies(t *testing.T) {
 }
 
 func TestSessionManager_DeleteCookie(t *testing.T) {
-	session, err := NewSessionManager()
-	if err != nil {
-		t.Fatalf("NewSessionManager error: %v", err)
-	}
+	session := newTestSession(t)
 
 	// Add cookie
 	cookie := &http.Cookie{Name: "test", Value: "value"}
@@ -180,10 +180,7 @@ func TestSessionManager_DeleteCookie(t *testing.T) {
 }
 
 func TestSessionManager_ClearCookies(t *testing.T) {
-	session, err := NewSessionManager()
-	if err != nil {
-		t.Fatalf("NewSessionManager error: %v", err)
-	}
+	session := newTestSession(t)
 
 	// Add multiple cookies
 	_ = session.SetCookie(&http.Cookie{Name: "c1", Value: "v1"})
@@ -200,37 +197,28 @@ func TestSessionManager_ClearCookies(t *testing.T) {
 }
 
 func TestSessionManager_SetHeader(t *testing.T) {
-	session, err := NewSessionManager()
-	if err != nil {
-		t.Fatalf("NewSessionManager error: %v", err)
-	}
+	session := newTestSession(t)
 
-	// Test valid header
-	err = session.SetHeader("X-Custom", "value")
-	if err != nil {
+	// Valid header
+	if err := session.SetHeader("X-Custom", "value"); err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
-	// Test invalid header (with CRLF)
-	err = session.SetHeader("X-Bad", "value\r\nX-Injected: malicious")
-	if err == nil {
+	// Invalid header (with CRLF)
+	if err := session.SetHeader("X-Bad", "value\r\nX-Injected: malicious"); err == nil {
 		t.Error("Expected error for header with CRLF")
 	}
 }
 
 func TestSessionManager_SetHeaders(t *testing.T) {
-	session, err := NewSessionManager()
-	if err != nil {
-		t.Fatalf("NewSessionManager error: %v", err)
-	}
+	session := newTestSession(t)
 
 	headers := map[string]string{
 		"X-Header-1": "value1",
 		"X-Header-2": "value2",
 	}
 
-	err = session.SetHeaders(headers)
-	if err != nil {
+	if err := session.SetHeaders(headers); err != nil {
 		t.Errorf("Unexpected error: %v", err)
 	}
 
@@ -241,10 +229,7 @@ func TestSessionManager_SetHeaders(t *testing.T) {
 }
 
 func TestSessionManager_DeleteHeader(t *testing.T) {
-	session, err := NewSessionManager()
-	if err != nil {
-		t.Fatalf("NewSessionManager error: %v", err)
-	}
+	session := newTestSession(t)
 
 	_ = session.SetHeader("X-Test", "value")
 	session.DeleteHeader("X-Test")
@@ -256,10 +241,7 @@ func TestSessionManager_DeleteHeader(t *testing.T) {
 }
 
 func TestSessionManager_ClearHeaders(t *testing.T) {
-	session, err := NewSessionManager()
-	if err != nil {
-		t.Fatalf("NewSessionManager error: %v", err)
-	}
+	session := newTestSession(t)
 
 	_ = session.SetHeader("X-Header-1", "value1")
 	_ = session.SetHeader("X-Header-2", "value2")

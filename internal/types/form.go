@@ -21,7 +21,7 @@ package types
 //	        },
 //	    },
 //	}
-//	client.Post(ctx, "/upload", httpc.WithMultipartFormData(form))
+//	client.Post("/upload", httpc.WithFormData(form))
 type FormData struct {
 	// Fields contains the text form fields.
 	Fields map[string]string

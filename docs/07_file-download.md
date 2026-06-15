@@ -16,26 +16,26 @@ This guide covers all aspects of downloading files using HTTPC, from simple down
 
 ## Quick Start
 
-### Simple Download (Package-Level Function)
+### Simple Download
 
-The easiest way to download a file - no need to create a client:
+The canonical entry point is the package-level `Download` function — no need to
+create a client. Pass a `*DownloadConfig` whose `FilePath` is set (start from
+`DefaultDownloadConfig()` when you need more fields):
 
 ```go
 package main
 
 import (
-    "fmt"
+    "context"
     "log"
-    "strings"
-    "time"
+
     "github.com/cybergodev/httpc"
 )
 
 func main() {
-    // Download a file using package-level function
-    result, err := httpc.DownloadFile(
+    result, err := httpc.Download(context.Background(),
         "https://example.com/file.zip",
-        "downloads/file.zip",
+        &httpc.DownloadConfig{FilePath: "downloads/file.zip"},
     )
     if err != nil {
         log.Fatal(err)
@@ -62,9 +62,9 @@ if err != nil {
 defer client.Close()
 
 // Download file
-result, err := client.DownloadFile(
+result, err := client.Download(context.Background(),
     "https://example.com/document.pdf",
-    "downloads/document.pdf",
+    &httpc.DownloadConfig{FilePath: "downloads/document.pdf"},
 )
 if err != nil {
     log.Fatal(err)
@@ -80,9 +80,9 @@ fmt.Printf("Speed: %s\n", httpc.FormatSpeed(result.AverageSpeed))
 Combine download with standard request options:
 
 ```go
-result, err := client.DownloadFile(
+result, err := client.Download(context.Background(),
     "https://api.example.com/files/report.pdf",
-    "downloads/report.pdf",
+    &httpc.DownloadConfig{FilePath: "downloads/report.pdf"},
     httpc.WithBearerToken("your-token"),
     httpc.WithTimeout(5*time.Minute),
     httpc.WithMaxRetries(3),
@@ -120,7 +120,7 @@ opts.ProgressCallback = func(downloaded, total int64, speed float64) {
     }
 }
 
-result, err := client.DownloadWithOptions(url, opts)
+result, err := client.Download(context.Background(), url, opts)
 fmt.Println() // New line after progress
 ```
 
@@ -175,7 +175,7 @@ opts.ProgressCallback = func(downloaded, total int64, speed float64) {
     }
 }
 
-result, err := client.DownloadWithOptions(
+result, err := client.Download(context.Background(),
     url,
     opts,
     httpc.WithTimeout(30*time.Minute),  // Longer timeout
@@ -190,9 +190,9 @@ result, err := client.DownloadWithOptions(
 Download protected files with authentication:
 
 ```go
-result, err := client.DownloadFile(
+result, err := client.Download(context.Background(),
     "https://api.example.com/files/private.zip",
-    "downloads/private.zip",
+    &httpc.DownloadConfig{FilePath: "downloads/private.zip"},
     httpc.WithBearerToken("your-api-token"),
 )
 ```
@@ -200,9 +200,9 @@ result, err := client.DownloadFile(
 ### Basic Auth
 
 ```go
-result, err := client.DownloadFile(
+result, err := client.Download(context.Background(),
     "https://secure.example.com/file.zip",
-    "downloads/file.zip",
+    &httpc.DownloadConfig{FilePath: "downloads/file.zip"},
     httpc.WithBasicAuth("username", "password"),
 )
 ```
@@ -210,9 +210,9 @@ result, err := client.DownloadFile(
 ### Custom Headers
 
 ```go
-result, err := client.DownloadFile(
+result, err := client.Download(context.Background(),
     url,
-    filePath,
+    &httpc.DownloadConfig{FilePath: filePath},
     httpc.WithHeader("X-API-Key", "your-api-key"),
     httpc.WithHeader("X-Client-ID", "client-123"),
 )
@@ -241,7 +241,7 @@ opts := &httpc.DownloadConfig{
     },
 }
 
-result, err := client.DownloadWithOptions(url, opts)
+result, err := client.Download(context.Background(), url, opts)
 ```
 
 **Available Options:**
@@ -288,17 +288,20 @@ if err != nil {
 
 ### Context-Aware Downloads
 
-For downloads that need cancellation or timeout control at the call site:
+`Download` always takes a `context.Context` as its first argument, for cancellation
+or timeout control at the call site:
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 defer cancel()
 
-// Package-level function with context
-result, err := httpc.DownloadFileWithContext(ctx, url, filePath)
+// Package-level canonical entry point
+result, err := httpc.Download(ctx, url,
+    &httpc.DownloadConfig{FilePath: filePath},
+)
 
-// Client method with context and custom options
-result, err := client.DownloadWithOptionsWithContext(ctx, url, opts)
+// Client instance (same signature; supports all request options)
+result, err := client.Download(ctx, url, opts)
 ```
 
 ## Implementation Notes
@@ -317,7 +320,7 @@ The HTTPC download implementation:
 The streaming download implementation is memory-efficient even for large files. For additional control:
 - Use resume functionality (`ResumeDownload: true`) to handle interrupted downloads
 - Set appropriate timeouts for large files (`httpc.WithTimeout(30*time.Minute)`)
-- Use context-aware download functions for cancellation control
+- Pass a `context.Context` to `Download` for cancellation control
 
 ## Best Practices
 
@@ -355,7 +358,7 @@ opts.ResumeDownload = true  // Always enable for large files
 ### 4. Handle Errors Gracefully
 
 ```go
-result, err := client.DownloadFile(url, filePath)
+result, err := client.Download(context.Background(), url, &httpc.DownloadConfig{FilePath: filePath})
 if err != nil {
     // Check if it's a partial download
     if fileInfo, statErr := os.Stat(filePath); statErr == nil {

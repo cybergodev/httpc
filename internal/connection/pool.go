@@ -297,6 +297,14 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 			}, nil
 		}
 
+		// Per-request AllowPrivateIPs override (set by the WithAllowPrivateIPs
+		// request option) takes precedence over the client-level policy. When no
+		// override is present on the request context, fall back to the client config.
+		allowPrivateIPs := pm.config.AllowPrivateIPs
+		if override, ok := AllowPrivateIPsOverrideFromContext(ctx); ok {
+			allowPrivateIPs = override
+		}
+
 		// If DoH is enabled, resolve the address using DoH and dial the IP directly
 		if pm.dohResolver != nil {
 			host, port, err := net.SplitHostPort(address)
@@ -320,7 +328,7 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 			for i, addr := range ips {
 				resolvedIPs[i] = addr.IP
 			}
-			if !pm.config.AllowPrivateIPs {
+			if !allowPrivateIPs {
 				allowedIPs := validation.FilterAllowedIPs(resolvedIPs, pm.config.ExemptNets)
 				if len(allowedIPs) == 0 {
 					atomic.AddInt64(&pm.rejectedConns, 1)
@@ -364,8 +372,8 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 		// SECURITY: Resolve DNS, validate all IPs, then dial the validated IP directly
 		// to prevent DNS rebinding TOCTOU attacks where an attacker-controlled DNS
 		// server returns a different IP between validation and actual connection.
-		if !pm.config.AllowPrivateIPs {
-			validatedAddr, err := pm.resolveAndValidateAddress(address)
+		if !allowPrivateIPs {
+			validatedAddr, err := pm.resolveAndValidateAddress(ctx, address)
 			if err != nil {
 				atomic.AddInt64(&pm.rejectedConns, 1)
 				if pm.config.MaxTotalConns > 0 {
@@ -406,7 +414,7 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 // SECURITY: By resolving DNS once and dialing the validated IP directly (instead of
 // the original hostname), we eliminate the window where an attacker-controlled DNS
 // server could return a different (private) IP on the second resolution.
-func (pm *PoolManager) resolveAndValidateAddress(address string) (string, error) {
+func (pm *PoolManager) resolveAndValidateAddress(ctx context.Context, address string) (string, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		host = address
@@ -422,12 +430,17 @@ func (pm *PoolManager) resolveAndValidateAddress(address string) (string, error)
 	}
 
 	// For domain names, resolve and filter to allowed IPs.
+	// Derive the resolution timeout from the caller's context so request
+	// cancellation aborts the lookup promptly (the DoH path already honors ctx).
 	// Cap at 10s to avoid unbounded waits; derive from DialTimeout when smaller.
 	dnsTimeout := 10 * time.Second
 	if pm.config.DialTimeout > 0 && pm.config.DialTimeout < dnsTimeout {
 		dnsTimeout = pm.config.DialTimeout
 	}
-	dnsCtx, dnsCancel := context.WithTimeout(context.Background(), dnsTimeout)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	dnsCtx, dnsCancel := context.WithTimeout(ctx, dnsTimeout)
 	defer dnsCancel()
 	ipAddrs, err := net.DefaultResolver.LookupIPAddr(dnsCtx, host)
 	if err != nil {
@@ -635,8 +648,15 @@ func (pm *PoolManager) evictStaleHosts() {
 				if oldStats, loaded := pm.hostConns.LoadAndDelete(key); loaded {
 					pm.hostCount.Add(-1)
 					if s, ok := oldStats.(*hostStats); ok && atomic.LoadInt64(&s.ActiveConns) > 0 {
-						pm.hostConns.Store(key, oldStats)
-						pm.hostCount.Add(1) // Re-insert: undo the decrement
+						// Re-insert with LoadOrStore so we never clobber a fresher
+						// entry a concurrent connection stored after our delete, and
+						// never double-count hostCount: only bump if our oldStats won.
+						// LoadOrStore's second return is `loaded` (true = a different
+						// entry already existed, ours was NOT stored), so we bump only
+						// when ours was actually stored: !alreadyPresent.
+						if _, alreadyPresent := pm.hostConns.LoadOrStore(key, oldStats); !alreadyPresent {
+							pm.hostCount.Add(1) // oldStats was re-inserted: undo the decrement above
+						}
 					}
 				}
 			}
@@ -694,6 +714,13 @@ func (pm *PoolManager) Close() error {
 		return true
 	})
 	pm.hostCount.Store(0)
+	// Reset aggregate connection counters. trackedConn.Close() skips its
+	// activeConns/totalConns decrement once closed==1, so connections established
+	// concurrently with Close would otherwise leave phantom counts in
+	// GetMetrics(). No subsequent decrement can run (the dialer rejects new
+	// dials once closed), so resetting here cannot drive the counters negative.
+	atomic.StoreInt64(&pm.activeConns, 0)
+	atomic.StoreInt64(&pm.totalConns, 0)
 
 	return closeErr
 }

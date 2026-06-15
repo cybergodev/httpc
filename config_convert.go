@@ -107,6 +107,7 @@ func convertToEngineConfig(cfg *Config) (*engine.Config, error) {
 		ValidateHeaders:         cfg.Security.ValidateHeaders,
 		AllowPrivateIPs:         cfg.Security.AllowPrivateIPs,
 		StrictContentLength:     cfg.Security.StrictContentLength,
+		CertificatePinner:       cfg.Security.CertificatePinner,
 
 		// Retry settings
 		MaxRetries:        cfg.Retry.MaxRetries,
@@ -127,7 +128,7 @@ func convertToEngineConfig(cfg *Config) (*engine.Config, error) {
 		engineConfig.RedirectWhitelist = security.NewDomainWhitelist(cfg.Security.RedirectWhitelist...)
 	}
 
-	// Use cached parsed CIDRs from ValidateConfig (no re-parsing)
+	// Use cached parsed CIDRs from parseSSRFExemptCIDRs (no re-parsing)
 	engineConfig.ExemptNets = cfg.parsedCIDRs
 
 	return engineConfig, nil

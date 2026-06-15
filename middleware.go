@@ -149,6 +149,22 @@ func LoggingMiddleware(log func(format string, args ...any)) MiddlewareFunc {
 	}
 }
 
+// panicToError converts a recovered panic value into a descriptive error that
+// includes a stack trace. It is the single conversion routine shared by the
+// default recover safety net (clientImpl.Request / downloadFile) and
+// RecoveryMiddleware, so the public API never propagates a panic to the caller.
+//
+// The recovered value is inspected only to format the message; it is never
+// re-panicked. Fatal runtime conditions (concurrent map access, stack overflow)
+// bypass recover entirely and are unaffected by this helper.
+func panicToError(r any) error {
+	stack := debug.Stack()
+	if e, ok := r.(error); ok {
+		return fmt.Errorf("panic recovered: %w\n%s", e, stack)
+	}
+	return fmt.Errorf("panic recovered: %v\n%s", r, stack)
+}
+
 // RecoveryMiddleware creates a middleware that recovers from panics in the request handler.
 // If a panic occurs, it is converted to an error and returned.
 func RecoveryMiddleware() MiddlewareFunc {
@@ -156,12 +172,7 @@ func RecoveryMiddleware() MiddlewareFunc {
 		return func(ctx context.Context, req RequestMutator) (resp ResponseMutator, err error) {
 			defer func() {
 				if r := recover(); r != nil {
-					stack := debug.Stack()
-					if e, ok := r.(error); ok {
-						err = fmt.Errorf("panic recovered: %w\n%s", e, stack)
-					} else {
-						err = fmt.Errorf("panic recovered: %v\n%s", r, stack)
-					}
+					err = panicToError(r)
 				}
 			}()
 			return next(ctx, req)

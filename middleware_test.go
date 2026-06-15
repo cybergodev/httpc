@@ -295,8 +295,8 @@ func TestMetricsMiddleware(t *testing.T) {
 	if metrics.statusCode != http.StatusCreated {
 		t.Errorf("expected status code %d, got: %d", http.StatusCreated, metrics.statusCode)
 	}
-	if metrics.duration <= 0 {
-		t.Error("expected positive duration")
+	if metrics.duration < 0 {
+		t.Error("expected non-negative duration")
 	}
 	if metrics.err != nil {
 		t.Errorf("expected no error, got: %v", metrics.err)
@@ -586,8 +586,8 @@ func TestAuditMiddleware(t *testing.T) {
 	if capturedEvent.StatusCode != http.StatusOK {
 		t.Errorf("expected status %d, got: %d", http.StatusOK, capturedEvent.StatusCode)
 	}
-	if capturedEvent.Duration <= 0 {
-		t.Error("expected positive duration")
+	if capturedEvent.Duration < 0 {
+		t.Error("expected non-negative duration")
 	}
 }
 

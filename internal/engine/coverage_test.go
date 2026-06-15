@@ -1146,12 +1146,19 @@ func TestClient_RetryExhausted(t *testing.T) {
 	defer client.Close()
 
 	resp, err := client.Request(backgroundCtx, "GET", server.URL)
-	// After all retries, the last response should be returned (500)
-	if err != nil {
-		t.Logf("Error (acceptable for exhausted retries): %v", err)
+	// After all retries are exhausted, the last response (500) is returned and
+	// the full attempt count was made. We deliberately do not assert on err: the
+	// documented contract is "return the last response"; whether that is also
+	// wrapped in an error is implementation-defined and not part of the contract.
+	_ = err
+	if resp == nil {
+		t.Fatal("expected non-nil response after exhausting retries")
 	}
-	if resp != nil && resp.StatusCode() != 500 {
-		t.Errorf("Expected status 500, got %d", resp.StatusCode())
+	if resp.StatusCode() != 500 {
+		t.Errorf("Expected status 500 after exhausted retries, got %d", resp.StatusCode())
+	}
+	if wantAttempts := 3; resp.Attempts() != wantAttempts { // 1 initial + 2 retries
+		t.Errorf("Expected %d attempts after exhausting MaxRetries=2, got %d", wantAttempts, resp.Attempts())
 	}
 }
 
@@ -1262,9 +1269,9 @@ func TestClient_NoRedirectFollowing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
-	// Should get the redirect response (302) instead of following
-	if resp.StatusCode() != 302 {
-		t.Logf("Status: %d (may vary)", resp.StatusCode())
+	// With FollowRedirects disabled, the 302 redirect response is returned as-is.
+	if resp.StatusCode() != http.StatusFound {
+		t.Errorf("Expected status %d (redirect not followed), got %d", http.StatusFound, resp.StatusCode())
 	}
 }
 
@@ -1601,12 +1608,17 @@ func TestClient_ExecuteRetry_MaxReached(t *testing.T) {
 	defer client.Close()
 
 	resp, err := client.Request(backgroundCtx, "GET", server.URL)
-	// Should return the last response after retries exhausted
-	if resp != nil {
-		t.Logf("Response status: %d, attempts: %d", resp.StatusCode(), resp.Attempts())
+	// After retries are exhausted, the server must have been hit exactly
+	// 1 + MaxRetries times and the last (503) response is returned.
+	_ = err
+	if wantHits := 3; attempts != wantHits { // 1 initial + 2 retries
+		t.Errorf("Expected server to be hit %d times, got %d", wantHits, attempts)
 	}
-	if err != nil {
-		t.Logf("Error (expected for exhausted retries): %v", err)
+	if resp == nil {
+		t.Fatal("expected non-nil response after exhausted retries")
+	}
+	if resp.StatusCode() != http.StatusServiceUnavailable {
+		t.Errorf("Expected status %d after exhausted retries, got %d", http.StatusServiceUnavailable, resp.StatusCode())
 	}
 }
 
@@ -2008,10 +2020,11 @@ func TestClient_CircularRedirect(t *testing.T) {
 	}
 	defer client.Close()
 
-	// Circular redirect should be detected
+	// A circular redirect must be detected and surface as an error rather than
+	// looping until the redirect cap silently truncates.
 	_, err = client.Request(backgroundCtx, "GET", server.URL+"/a")
-	if err != nil {
-		t.Logf("Circular redirect detected (expected): %v", err)
+	if err == nil {
+		t.Fatal("Expected error for circular redirect, got nil")
 	}
 }
 
@@ -2045,12 +2058,11 @@ func TestClient_SSRSRedirectBlocked(t *testing.T) {
 	}
 	defer client.Close()
 
-	// Should fail because redirect target is a private IP
+	// The redirect target (127.0.0.1) is a private IP and SSRF protection is
+	// active, so the request must fail rather than follow the redirect.
 	_, err = client.Request(backgroundCtx, "GET", server.URL+"/redirect-to-localhost")
 	if err == nil {
-		t.Log("Expected error for redirect to private IP (or redirect just didn't happen)")
-	} else {
-		t.Logf("SSRF redirect blocked (expected): %v", err)
+		t.Fatal("Expected error for redirect to private IP, got nil")
 	}
 }
 

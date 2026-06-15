@@ -24,6 +24,27 @@ type CertificatePinner interface {
 	VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error
 }
 
+// NewSPKIHashPinner creates a CertificatePinner from one or more base64-encoded
+// SHA-256 hashes of DER-encoded SubjectPublicKeyInfo (SPKI). This is the standard
+// HPKP pin format. Exported for use by the public httpc package.
+func NewSPKIHashPinner(hashes ...string) (CertificatePinner, error) {
+	return newSPKIHashPinner(hashes...)
+}
+
+// NewPublicKeyPinner creates a CertificatePinner from one or more DER-encoded
+// PKIX public keys (as returned by x509.MarshalPKIXPublicKey). Exported for use
+// by the public httpc package.
+func NewPublicKeyPinner(publicKeys ...[]byte) (CertificatePinner, error) {
+	return newPublicKeyPinner(publicKeys...)
+}
+
+// NewCertificatePinnerChain combines multiple pinners; the certificate is
+// accepted if ANY pinner accepts it. This enables key rotation by pinning both
+// the current and next keys. Exported for use by the public httpc package.
+func NewCertificatePinnerChain(pinners ...CertificatePinner) CertificatePinner {
+	return newCertificatePinnerChain(pinners...)
+}
+
 // publicKeyPinner pins one or more public keys by their SHA-256 hash.
 // The peer certificate's public key must match one of the pinned keys.
 // Internally delegates to spkiHashPinner for verification.
@@ -148,9 +169,13 @@ func (p *spkiHashPinner) VerifyPeerCertificate(rawCerts [][]byte, _ [][]*x509.Ce
 
 	// Check each certificate in the chain
 	for _, rawCert := range rawCerts {
-		// Compute a fingerprint of the raw DER for cache lookup
+		// Compute a fingerprint of the raw DER for cache lookup.
+		// Use the full 32-byte SHA-256 digest: a truncated key (e.g. 8 bytes / 64
+		// bits) risks collisions under a large or attacker-influenced cert set, in
+		// which case a cache hit could return a *different* cert's SPKI hash and,
+		// if that hash happens to be pinned, accept the wrong certificate.
 		fp := sha256.Sum256(rawCert)
-		fpKey := string(fp[:8])
+		fpKey := string(fp[:])
 
 		// Check cache first to avoid expensive x509.ParseCertificate
 		p.mu.RLock()
@@ -275,14 +300,16 @@ func (n *noOpPinner) VerifyPeerCertificate(_ [][]byte, _ [][]*x509.Certificate) 
 
 // isTestEnvironment detects if the code is running in a test environment.
 // Consistent with the detection logic in the httpc package.
+//
+// SECURITY: Detection is based ONLY on the compiled test-binary name. We
+// deliberately do NOT honor GO_TEST / GOTEST environment variables: any
+// operator (or attacker controlling the process environment) could otherwise
+// flip them and silently disable certificate pinning via noOpPinner.
 func isTestEnvironment() bool {
 	executable := filepath.Base(os.Args[0])
 	if strings.HasSuffix(executable, ".test") ||
 		strings.HasSuffix(executable, ".test.exe") ||
 		strings.Contains(executable, ".test.") {
-		return true
-	}
-	if os.Getenv("GO_TEST") != "" || os.Getenv("GOTEST") == "1" {
 		return true
 	}
 	return false

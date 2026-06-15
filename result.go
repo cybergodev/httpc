@@ -50,7 +50,15 @@ var cachedSensitiveHeaderNames = func() []string {
 
 // Result wraps an HTTP response with request metadata and convenience methods.
 // Obtain a Result from Client.Request() or package-level functions like Get(), Post(), etc.
-// Results are automatically pooled; GC handles cleanup.
+// Each Result is freshly allocated per request; GC reclaims it automatically, so
+// callers need not release it. (The internal engine.Response is pooled separately
+// for performance, but that is transparent to the caller.)
+//
+// Access style: prefer the nil-safe accessor methods (StatusCode, Body, RawBody,
+// IsSuccess, GetCookie, etc.). The Request, Response, and Meta struct fields are
+// exported primarily so callers can construct Result values directly in tests and
+// mocks; reading them on a client-returned Result requires a nil-check on the
+// nested pointer (e.g. Response may be nil when the request errored).
 type Result struct {
 	Request  *RequestInfo
 	Response *ResponseInfo
