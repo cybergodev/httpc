@@ -12,7 +12,7 @@ func BenchmarkValidateURL_Valid(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = v.validateURL(url)
+		_ = v.validateURL(url, nil)
 	}
 }
 
@@ -23,8 +23,8 @@ func BenchmarkValidateURL_Invalid(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		_ = v.validateURL("")
-		_ = v.validateURL("not-a-url")
+		_ = v.validateURL("", nil)
+		_ = v.validateURL("not-a-url", nil)
 	}
 }
 

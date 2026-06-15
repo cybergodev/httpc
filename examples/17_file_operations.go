@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"os"
@@ -74,7 +76,7 @@ func demonstrateFileUpload(client httpc.Client) {
 	if err != nil {
 		log.Printf("Single file error: %v\n", err)
 	} else {
-		fmt.Printf("âœ?Single file: Status %d (%d bytes)\n", resp.StatusCode(), len(fileContent))
+		fmt.Printf("âœ“ Single file: Status %d (%d bytes)\n", resp.StatusCode(), len(fileContent))
 	}
 
 	// 2. Multiple files upload
@@ -97,7 +99,7 @@ func demonstrateFileUpload(client httpc.Client) {
 	if err != nil {
 		log.Printf("Multiple files error: %v\n", err)
 	} else {
-		fmt.Printf("âœ?Multiple files: Status %d (%d files)\n", resp.StatusCode(), len(formData.Files))
+		fmt.Printf("âœ“ Multiple files: Status %d (%d files)\n", resp.StatusCode(), len(formData.Files))
 	}
 
 	// 3. File with form fields (metadata)
@@ -122,7 +124,7 @@ func demonstrateFileUpload(client httpc.Client) {
 	if err != nil {
 		log.Printf("File with fields error: %v\n", err)
 	} else {
-		fmt.Printf("âœ?File with metadata: Status %d\n", resp.StatusCode())
+		fmt.Printf("âœ“ File with metadata: Status %d\n", resp.StatusCode())
 	}
 
 	// 4. Large file with timeout
@@ -138,7 +140,7 @@ func demonstrateFileUpload(client httpc.Client) {
 	if err != nil {
 		log.Printf("Large file error: %v\n", err)
 	} else {
-		fmt.Printf("âœ?Large file: Status %d (%d bytes, took %v)\n\n",
+		fmt.Printf("âœ“ Large file: Status %d (%d bytes, took %v)\n\n",
 			resp.StatusCode(), len(largeFile), resp.Meta.Duration)
 	}
 }
@@ -148,14 +150,14 @@ func demonstrateFileDownload(client httpc.Client) {
 	fmt.Println("--- File Download ---")
 
 	// 1. Simple download
-	result, err := client.DownloadFile(
+	result, err := client.Download(context.Background(),
 		"https://raw.githubusercontent.com/golang/go/master/README.md",
-		"downloads/golang-readme.md",
+		&httpc.DownloadConfig{FilePath: "downloads/golang-readme.md"},
 	)
 	if err != nil {
 		log.Printf("Simple download error: %v\n", err)
 	} else {
-		fmt.Printf("âœ?Simple download: %s (%s, %v)\n",
+		fmt.Printf("âœ“ Simple download: %s (%s, %v)\n",
 			result.FilePath,
 			formatBytes(result.BytesWritten),
 			result.Duration)
@@ -177,7 +179,7 @@ func demonstrateFileDownload(client httpc.Client) {
 		},
 	}
 
-	result, err = client.DownloadWithOptions(
+	result, err = client.Download(context.Background(),
 		"https://raw.githubusercontent.com/golang/go/master/LICENSE",
 		opts,
 		httpc.WithTimeout(60*time.Second),
@@ -185,7 +187,7 @@ func demonstrateFileDownload(client httpc.Client) {
 	if err != nil {
 		log.Printf("\nProgress download error: %v\n", err)
 	} else {
-		fmt.Printf("\nâœ?Progress download: %s (%s, avg %s)\n",
+		fmt.Printf("\nâœ“ Progress download: %s (%s, avg %s)\n",
 			result.FilePath,
 			formatBytes(result.BytesWritten),
 			formatSpeed(result.AverageSpeed))
@@ -196,7 +198,7 @@ func demonstrateFileDownload(client httpc.Client) {
 		FilePath:  "downloads/authenticated-file.txt",
 		Overwrite: true,
 	}
-	result, err = client.DownloadWithOptions(
+	result, err = client.Download(context.Background(),
 		"https://httpbin.org/get",
 		authOpts,
 		httpc.WithBearerToken("your-api-token"),
@@ -205,7 +207,7 @@ func demonstrateFileDownload(client httpc.Client) {
 	if err != nil {
 		log.Printf("Auth download error: %v\n", err)
 	} else {
-		fmt.Printf("âœ?Authenticated download: %s (%s)\n",
+		fmt.Printf("âœ“ Authenticated download: %s (%s)\n",
 			result.FilePath,
 			formatBytes(result.BytesWritten))
 	}
@@ -219,7 +221,7 @@ func demonstrateFileDownload(client httpc.Client) {
 		if err := resp.SaveToFile(filePath); err != nil {
 			log.Printf("Save error: %v\n", err)
 		} else {
-			fmt.Printf("âœ?SaveToFile: %s (%s)\n",
+			fmt.Printf("âœ“ SaveToFile: %s (%s)\n",
 				filePath,
 				formatBytes(int64(len(resp.RawBody()))))
 		}
@@ -232,7 +234,7 @@ func demonstrateFileDownload(client httpc.Client) {
 		ResumeDownload: true,
 		Overwrite:      false,
 	}
-	result, err = client.DownloadWithOptions(
+	result, err = client.Download(context.Background(),
 		"https://raw.githubusercontent.com/golang/go/master/README.md",
 		resumeOpts,
 		httpc.WithTimeout(5*time.Minute),
@@ -241,9 +243,9 @@ func demonstrateFileDownload(client httpc.Client) {
 		log.Printf("Resume download error: %v\n", err)
 	} else {
 		if result.Resumed {
-			fmt.Printf("âœ?Resumed download: %s (resumed from partial)\n", result.FilePath)
+			fmt.Printf("âœ“ Resumed download: %s (resumed from partial)\n", result.FilePath)
 		} else {
-			fmt.Printf("âœ?Complete download: %s (no resume needed)\n", result.FilePath)
+			fmt.Printf("âœ“ Complete download: %s (no resume needed)\n", result.FilePath)
 		}
 	}
 }
@@ -261,7 +263,7 @@ func demonstrateContextDownload(client httpc.Client) {
 		Overwrite: true,
 	}
 
-	result, err := client.DownloadWithOptionsWithContext(ctx,
+	result, err := client.Download(ctx,
 		"https://httpbin.org/get",
 		opts,
 		httpc.WithBearerToken("test-token"),
@@ -275,10 +277,10 @@ func demonstrateContextDownload(client httpc.Client) {
 		return
 	}
 
-	fmt.Printf("âœ?Downloaded: %s (%s)\n",
+	fmt.Printf("âœ“ Downloaded: %s (%s)\n",
 		result.FilePath,
 		formatBytes(result.BytesWritten))
-	fmt.Println("\nUse WithContext variants for:")
+	fmt.Println("\nPass a context to Download for:")
 	fmt.Println("  - Download timeouts independent of client config")
 	fmt.Println("  - User-initiated cancellation")
 	fmt.Println("  - Graceful shutdown in services")
@@ -288,42 +290,56 @@ func demonstrateContextDownload(client httpc.Client) {
 func demonstrateChecksumDownload() {
 	fmt.Println("--- Download with Checksum Verification ---")
 
-	// Package-level download function (uses default client)
-	result, err := httpc.DownloadFile(
-		"https://raw.githubusercontent.com/golang/go/master/LICENSE",
-		"downloads/go-license.txt",
+	ctx := context.Background()
+	url := "https://raw.githubusercontent.com/golang/go/master/LICENSE"
+
+	// Step 1: Download the file once (no verification).
+	first, err := httpc.Download(ctx, url,
+		&httpc.DownloadConfig{FilePath: "downloads/go-license.txt"},
 		httpc.WithTimeout(30*time.Second),
 	)
 	if err != nil {
 		log.Printf("Download error: %v\n", err)
 		return
 	}
-	fmt.Printf("Package-level DownloadFile: %s (%s)\n",
-		result.FilePath, formatBytes(result.BytesWritten))
+	fmt.Printf("Downloaded: %s (%s)\n", first.FilePath, formatBytes(first.BytesWritten))
 
-	// Download with checksum verification
-	// The checksum is verified after download; mismatch removes the file
-	checksumOpts := &httpc.DownloadConfig{
-		FilePath:          "downloads/go-license-verified.txt",
-		Overwrite:         true,
-		Checksum:          result.ActualChecksum, // Use the checksum from first download
-		ChecksumAlgorithm: httpc.ChecksumSHA256,
-	}
-
-	result, err = httpc.DownloadWithOptions(
-		"https://raw.githubusercontent.com/golang/go/master/LICENSE",
-		checksumOpts,
-		httpc.WithTimeout(30*time.Second),
-	)
+	// Step 2: Compute the expected SHA-256 from the downloaded bytes.
+	// In production you would obtain this checksum from a trusted source
+	// (release manifest, vendor page) rather than computing it yourself.
+	expected, err := sha256OfFile(first.FilePath)
 	if err != nil {
-		log.Printf("Checksum download error: %v\n", err)
+		log.Printf("Checksum error: %v\n", err)
 		return
 	}
 
-	fmt.Printf("Verified download: %s (checksum match: %s)\n",
-		result.FilePath, result.ActualChecksum)
+	// Step 3: Re-download with checksum verification enabled. When Checksum is
+	// set, the body is hashed while streaming to disk and compared after
+	// completion; a mismatch removes the downloaded file and returns an error.
+	verified, err := httpc.Download(ctx, url, &httpc.DownloadConfig{
+		FilePath:          "downloads/go-license-verified.txt",
+		Overwrite:         true,
+		Checksum:          expected,
+		ChecksumAlgorithm: httpc.ChecksumSHA256,
+	}, httpc.WithTimeout(30*time.Second))
+	if err != nil {
+		log.Printf("Checksum verification failed: %v\n", err)
+		return
+	}
+
+	fmt.Printf("âœ“ Verified: %s (checksum %s)\n", verified.FilePath, verified.ActualChecksum)
 	fmt.Println("\nChecksum verification:")
-	fmt.Println("  - Set Checksum to expected SHA-256 hex string")
-	fmt.Println("  - File is removed if checksum mismatches")
-	fmt.Println("  - ActualChecksum field contains computed hash")
+	fmt.Println("  - Checksum = expected SHA-256 hex (from a trusted source)")
+	fmt.Println("  - A mismatch removes the downloaded file and returns an error")
+	fmt.Println("  - ActualChecksum holds the hash computed during a verified download")
+}
+
+// sha256OfFile reads a file and returns its lowercase hex SHA-256 (local helper).
+func sha256OfFile(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
 }

@@ -50,6 +50,10 @@ type Request struct {
 	Headers     map[string]string
 	QueryParams map[string]any
 	Body        any
+	// AllowPrivateIPs carries a per-request override of the client's SSRF policy.
+	// A non-nil value overrides the Validator's configured AllowPrivateIPs for this
+	// request only. nil means "use the client-level policy".
+	AllowPrivateIPs *bool
 }
 
 // NewValidator creates a new Validator with default security settings.
@@ -86,7 +90,7 @@ func NewValidatorWithConfig(config *Config) *Validator {
 // ValidateRequest validates an HTTP request against the configured security rules.
 func (v *Validator) ValidateRequest(req *Request) error {
 	if v.config.ValidateURL {
-		if err := v.validateURL(req.URL); err != nil {
+		if err := v.validateURL(req.URL, req.AllowPrivateIPs); err != nil {
 			return err
 		}
 	}
@@ -108,19 +112,31 @@ func (v *Validator) ValidateRequest(req *Request) error {
 	return nil
 }
 
-func (v *Validator) validateURL(urlStr string) error {
+func (v *Validator) validateURL(urlStr string, override *bool) error {
 	// Fast path: skip re-parsing URLs that have already been validated.
 	// Most workloads reuse the same base URL across many requests.
-	if _, ok := v.validatedURLs.Load(urlStr); ok {
-		return nil
+	//
+	// The cache is keyed by URL string only, so it is only valid when the
+	// validation result is stable — i.e. when there is no per-request override.
+	// A per-request AllowPrivateIPs override changes the host-validation result
+	// for the same URL, so it must bypass the cache (both read and write).
+	if override == nil {
+		if _, ok := v.validatedURLs.Load(urlStr); ok {
+			return nil
+		}
 	}
 
 	parsedURL, err := validation.ValidateAndParseURL(urlStr)
 	if err != nil {
 		return err
 	}
-	if err := v.validateHost(parsedURL.Host); err != nil {
+	if err := v.validateHost(parsedURL.Host, override); err != nil {
 		return err
+	}
+
+	// Only cache the result when it is stable for this client (no per-request override).
+	if override != nil {
+		return nil
 	}
 
 	// Evict oldest entries when cache exceeds limit.
@@ -149,8 +165,13 @@ func (v *Validator) validateURL(urlStr string) error {
 
 // validateHost performs comprehensive host validation to prevent SSRF attacks.
 // Delegates to the shared validation.ValidateSSRFHost for consistent behavior.
-func (v *Validator) validateHost(host string) error {
-	if v.config.AllowPrivateIPs {
+// A non-nil override takes precedence over the Validator's configured AllowPrivateIPs.
+func (v *Validator) validateHost(host string, override *bool) error {
+	allowPrivate := v.config.AllowPrivateIPs
+	if override != nil {
+		allowPrivate = *override
+	}
+	if allowPrivate {
 		return nil
 	}
 

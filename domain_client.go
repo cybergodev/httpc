@@ -58,19 +58,15 @@ func NewDomain(baseURL string, config ...*Config) (DomainClienter, error) {
 	}
 
 	// Create config with cookies enabled.
-	// Use deepCopyConfig to fully isolate caller's config before mutation.
-	var cfg *Config
-	if len(config) > 0 && config[0] != nil {
-		if err := ValidateConfig(config[0]); err != nil {
-			return nil, fmt.Errorf("invalid configuration: %w", err)
-		}
-		cfg = deepCopyConfig(config[0])
-		if err := cfg.parseSSRFExemptCIDRs(); err != nil {
-			return nil, fmt.Errorf("invalid configuration: %w", err)
-		}
-		cfg = mergeNilSubConfigs(cfg)
-	} else {
-		cfg = DefaultConfig()
+	// prepareConfig validates, deep-copies (fully isolating the caller's config),
+	// parses SSRF exempt CIDRs, and fills nil sub-configs — shared with New.
+	var in *Config
+	if len(config) > 0 {
+		in = config[0]
+	}
+	cfg, err := prepareConfig(in)
+	if err != nil {
+		return nil, err
 	}
 	if cfg.Connection == nil {
 		cfg.Connection = &ConnectionConfig{}
@@ -170,42 +166,23 @@ func (dc *DomainClient) Request(ctx context.Context, method, path string, option
 	return result, nil
 }
 
-// DownloadFile downloads a file from the specified path to the given file path.
-// Response cookies are captured into the session, consistent with Request behavior.
-func (dc *DomainClient) DownloadFile(path string, filePath string, options ...RequestOption) (*DownloadResult, error) {
-	return dc.DownloadFileWithContext(backgroundCtx, path, filePath, options...)
-}
-
-// DownloadWithOptions downloads a file with custom download options.
-// Response cookies are captured into the session, consistent with Request behavior.
-func (dc *DomainClient) DownloadWithOptions(path string, downloadOpts *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
-	return dc.DownloadWithOptionsWithContext(backgroundCtx, path, downloadOpts, options...)
-}
-
-// DownloadFileWithContext downloads a file with context control for cancellation and timeouts.
-// Response cookies are captured into the session, consistent with Request behavior.
-func (dc *DomainClient) DownloadFileWithContext(ctx context.Context, path string, filePath string, options ...RequestOption) (*DownloadResult, error) {
-	downloadOpts := DefaultDownloadConfig()
-	downloadOpts.FilePath = filePath
-	return dc.downloadWithContext(ctx, path,
-		func(ctx context.Context, url string, _ *DownloadConfig, opts ...RequestOption) (*DownloadResult, error) {
-			return dc.client.DownloadWithOptionsWithContext(ctx, url, downloadOpts, opts...)
-		},
-		downloadOpts, options,
-	)
-}
-
-// DownloadWithOptionsWithContext downloads a file with custom download options and context control.
-// Response cookies are captured into the session, consistent with Request behavior.
-func (dc *DomainClient) DownloadWithOptionsWithContext(ctx context.Context, path string, downloadOpts *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
-	if downloadOpts == nil {
-		return nil, fmt.Errorf("download options cannot be nil")
+// Download downloads a file from the specified path to cfg.FilePath.
+// Response cookies are captured into the session. Like Request, request options are
+// applied twice internally (once for session capture, once for the actual request) —
+// avoid options with side effects (e.g., counters, nonce generation).
+//
+// cfg must be non-nil; cfg.FilePath must be set (ErrEmptyFilePath otherwise).
+// Use DefaultDownloadConfig() as the starting point, then set FilePath and any
+// of ProgressCallback / Overwrite / ResumeDownload / Checksum as needed.
+func (dc *DomainClient) Download(ctx context.Context, path string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
+	if cfg == nil {
+		return nil, fmt.Errorf("download config cannot be nil")
 	}
 	return dc.downloadWithContext(ctx, path,
 		func(ctx context.Context, url string, opts *DownloadConfig, additional ...RequestOption) (*DownloadResult, error) {
-			return dc.client.DownloadWithOptionsWithContext(ctx, url, opts, additional...)
+			return dc.client.Download(ctx, url, opts, additional...)
 		},
-		downloadOpts, options,
+		cfg, options,
 	)
 }
 

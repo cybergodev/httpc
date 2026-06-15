@@ -665,7 +665,7 @@ func TestResolveAndValidateAddress(t *testing.T) {
 
 				var lastErr error
 				for _, domain := range domains {
-					result, resolveErr := pm.resolveAndValidateAddress(domain)
+					result, resolveErr := pm.resolveAndValidateAddress(context.Background(), domain)
 					if resolveErr == nil {
 						host, port, splitErr := net.SplitHostPort(result)
 						if splitErr != nil {
@@ -686,7 +686,7 @@ func TestResolveAndValidateAddress(t *testing.T) {
 				return
 			}
 
-			result, err := pm.resolveAndValidateAddress(tt.address)
+			result, err := pm.resolveAndValidateAddress(context.Background(), tt.address)
 
 			if tt.wantErr {
 				if err == nil {

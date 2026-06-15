@@ -198,9 +198,16 @@ func (t *transport) checkRedirect(req *http.Request, via []*http.Request) error 
 		}
 	}
 
-	// SECURITY: Validate redirect target for SSRF protection
-	// This prevents redirects to private/reserved IP addresses when SSRF protection is enabled
-	if !t.allowPrivateIPs {
+	// SECURITY: Validate redirect target for SSRF protection.
+	// This prevents redirects to private/reserved IP addresses when SSRF protection is enabled.
+	// A per-request AllowPrivateIPs override (from the WithAllowPrivateIPs option), carried on
+	// the request context, takes precedence over the client-level policy so an explicitly
+	// permitted local/internal request can still follow local redirects.
+	allowPrivateIPs := t.allowPrivateIPs
+	if override, ok := connection.AllowPrivateIPsOverrideFromContext(req.Context()); ok {
+		allowPrivateIPs = override
+	}
+	if !allowPrivateIPs {
 		if err := t.validateRedirectTarget(req.URL); err != nil {
 			return fmt.Errorf("redirect blocked: %w", err)
 		}
@@ -362,30 +369,40 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			for _, c := range cookieMap {
 				mergedCookies = append(mergedCookies, c)
 			}
+			// Capture the slice that was actually populated. append only updates
+			// the local mergedCookies header (and may reallocate into a new backing
+			// array), leaving the pooled *mergedPtr header at length 0 — so the
+			// deferred scrub below must iterate populated, not *mergedPtr, or it
+			// clears nothing (this was a no-op bug: it scrubbed a zero-length slice).
+			populated := mergedCookies
 
 			t.httpClient.Jar.SetCookies(req.URL, mergedCookies)
 			req.Header.Del("Cookie")
 
-			// SECURITY: Clear sensitive cookie data before returning to pool
-			// Use defer to ensure cleanup even if subsequent operations panic
+			// SECURITY: Clear sensitive cookie data before returning to pool.
+			// Use defer to ensure cleanup even if subsequent operations panic.
 			defer func() {
 				// Clear the map to prevent data leakage between requests
 				for k := range cookieMap {
 					delete(cookieMap, k)
 				}
-				// SECURITY: Clear each Cookie's sensitive fields to prevent cross-request data leakage
-				// The http.Cookie objects are retained in memory until overwritten, so we must
-				// explicitly clear their Value, Domain, and Path fields.
-				for i := range *mergedPtr {
-					if (*mergedPtr)[i] != nil {
-						(*mergedPtr)[i].Value = ""
-						(*mergedPtr)[i].Domain = ""
-						(*mergedPtr)[i].Path = ""
-						(*mergedPtr)[i].RawExpires = ""
-						(*mergedPtr)[i].Raw = ""
+				// SECURITY: Clear each populated Cookie's sensitive fields to prevent
+				// cross-request data leakage through pooled memory. The pooled backing
+				// array retains cookie pointers until overwritten, so we must zero
+				// Value/Domain/Path explicitly.
+				for i := range populated {
+					if populated[i] != nil {
+						populated[i].Value = ""
+						populated[i].Domain = ""
+						populated[i].Path = ""
+						populated[i].RawExpires = ""
+						populated[i].Raw = ""
 					}
 				}
-				// Clear the slice but keep capacity for reuse
+				// Clear the slice but keep capacity for reuse. *mergedPtr holds the
+				// original pooled backing array (independent of any reallocation that
+				// populated may have triggered); a reallocated array was already
+				// scrubbed above and is left for GC rather than bloating the pool.
 				*mergedPtr = (*mergedPtr)[:0]
 
 				// Return slices to pool (now cleared of sensitive data)

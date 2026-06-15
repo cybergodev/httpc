@@ -126,7 +126,8 @@ type SecurityConfig struct {
 	MaxResponseBodySize int64
 
 	// MaxRequestBodySize limits request body size in bytes.
-	// Default: 0 (uses MaxResponseBodySize). Set independently if needed.
+	// Default: 0 (no request body limit). Unlike MaxResponseBodySize there is
+	// NO automatic fallback — set it explicitly to enforce an upload cap.
 	MaxRequestBodySize int64
 
 	// MaxDecompressedBodySize limits decompressed response body size in bytes.
@@ -160,7 +161,18 @@ type SecurityConfig struct {
 
 	// CookieSecurity enables cookie security attribute validation.
 	// Default: nil (no validation).
-	CookieSecurity *validation.CookieSecurityConfig
+	CookieSecurity *CookieSecurityConfig
+
+	// CertificatePinner, when set, enables certificate pinning: the TLS
+	// handshake is rejected unless the server presents a pinned key/certificate,
+	// defending against MITM even if a trusted CA is compromised.
+	// Construct one with NewSPKIHashPinner, NewPublicKeyPinner, or
+	// NewCertificatePinnerChain. Default: nil (pinning disabled).
+	//
+	// The pinner is shared by reference across clients created from the same
+	// Config (it is not deep-copied); pinner implementations are safe for
+	// concurrent use by multiple clients.
+	CertificatePinner CertificatePinner
 
 	// RedirectWhitelist specifies allowed domains for redirects.
 	// Default: nil (all redirects allowed).
@@ -189,7 +201,15 @@ type RetryConfig struct {
 	CustomPolicy RetryPolicy
 }
 
-// MiddlewareConfig configures middleware, default headers, and redirect behavior.
+// MiddlewareConfig configures the per-request defaults and the middleware chain
+// applied to every outgoing request. It groups two related concerns: the
+// middleware chain (Middlewares) and the request defaults — User-Agent, default
+// headers, and the redirect policy.
+//
+// Only Middlewares is strictly "middleware"; UserAgent, Headers, FollowRedirects,
+// and MaxRedirects are request defaults colocated here for historical reasons and
+// may move to a dedicated options struct in a future major version. Use
+// DefaultConfig() to obtain sensible values for all fields.
 type MiddlewareConfig struct {
 	// Middlewares contains middleware functions for request/response interception.
 	// Default: nil.
@@ -440,8 +460,19 @@ func ValidateConfig(cfg *Config) error {
 			}
 		}
 		if cfg.Connection.ProxyURL != "" {
-			if _, err := url.Parse(cfg.Connection.ProxyURL); err != nil {
+			pu, err := url.Parse(cfg.Connection.ProxyURL)
+			if err != nil {
 				return fmt.Errorf("%w: Connection.ProxyURL invalid: %w", ErrInvalidConnection, err)
+			}
+			// Reject malformed proxy URLs early instead of failing deep in the
+			// transport layer with an opaque error.
+			switch pu.Scheme {
+			case "http", "https", "socks5", "socks5h":
+			default:
+				return fmt.Errorf("%w: Connection.ProxyURL unsupported scheme %q (want http, https, socks5, or socks5h)", ErrInvalidConnection, pu.Scheme)
+			}
+			if pu.Host == "" {
+				return fmt.Errorf("%w: Connection.ProxyURL missing host", ErrInvalidConnection)
 			}
 		}
 		if cfg.Connection.DoHCacheTTL < 0 {
@@ -499,7 +530,7 @@ func ValidateConfig(cfg *Config) error {
 	// Validate middleware settings
 	if cfg.Middleware != nil {
 		if cfg.Middleware.MaxRedirects < 0 || cfg.Middleware.MaxRedirects > maxRedirectLimit {
-			return fmt.Errorf("%w: Middleware.MaxRedirects must be 0-50, got %d", ErrInvalidMiddleware, cfg.Middleware.MaxRedirects)
+			return fmt.Errorf("%w: Middleware.MaxRedirects must be 0-%d, got %d", ErrInvalidMiddleware, maxRedirectLimit, cfg.Middleware.MaxRedirects)
 		}
 		if len(cfg.Middleware.UserAgent) > maxUserAgentLen || !validation.IsValidHeaderString(cfg.Middleware.UserAgent) {
 			return fmt.Errorf("%w: Middleware.UserAgent invalid: max %d chars, no control characters", ErrInvalidMiddleware, maxUserAgentLen)
@@ -584,6 +615,12 @@ func (c *Config) String() string {
 		b.WriteString(strconv.FormatBool(c.Security.InsecureSkipVerify))
 		b.WriteString(", AllowPrivateIPs: ")
 		b.WriteString(strconv.FormatBool(c.Security.AllowPrivateIPs))
+		b.WriteString(", CertPinning: ")
+		if c.Security.CertificatePinner != nil {
+			b.WriteString("<configured>")
+		} else {
+			b.WriteString("<disabled>")
+		}
 	} else {
 		b.WriteString("<nil>")
 	}

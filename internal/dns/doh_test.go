@@ -162,61 +162,7 @@ func BenchmarkDoHResolver_CachedLookup(b *testing.B) {
 	}
 }
 
-// ============================================================================
-// Additional Cache Tests (complementing doh_unit_test.go)
-// ============================================================================
-
-func TestDoHResolver_CacheSize_MultipleLookups(t *testing.T) {
-	resolver := NewDoHResolver(nil, 5*time.Minute)
-	defer resolver.Close()
-	ctx := context.Background()
-
-	hosts := []string{"www.google.com", "www.example.com", "www.cloudflare.com"}
-
-	// Look up multiple hosts
-	for _, host := range hosts {
-		_, err := resolver.LookupIPAddr(ctx, host)
-		if err != nil {
-			t.Logf("Lookup for %s failed (may be expected in test env): %v", host, err)
-		}
-	}
-
-	// Cache should have entries
-	size := resolver.CacheSize()
-	t.Logf("Cache size after %d lookups: %d", len(hosts), size)
-
-	// Clear and verify
-	resolver.ClearCache()
-	if resolver.CacheSize() != 0 {
-		t.Errorf("Cache size after clear = %d, want 0", resolver.CacheSize())
-	}
-}
-
-func TestDoHResolver_ConcurrentCacheAccess(t *testing.T) {
-	resolver := NewDoHResolver(nil, 5*time.Minute)
-	defer resolver.Close()
-
-	// Concurrent TTL reads and writes
-	done := make(chan bool)
-
-	// Writer goroutine
-	go func() {
-		for i := range 10 {
-			resolver.SetCacheTTL(time.Duration(i+1) * time.Minute)
-		}
-		done <- true
-	}()
-
-	// Reader goroutine
-	go func() {
-		for range 10 {
-			_ = resolver.GetCacheTTL()
-			_ = resolver.CacheSize()
-		}
-		done <- true
-	}()
-
-	// Wait for both goroutines
-	<-done
-	<-done
-}
+// The "CacheSize_MultipleLookups" and "ConcurrentCacheAccess" tests that lived
+// here were retired: they required live network and duplicated cache-size /
+// concurrent-access coverage already provided by doh_unit_test.go, which runs
+// without the integration build tag.

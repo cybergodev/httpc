@@ -437,7 +437,6 @@ HTTPC defines sentinel errors for specific failure conditions:
 |----------|-------------|
 | `httpc.ErrClientClosed` | Client has been closed |
 | `httpc.ErrNilConfig` | Configuration is nil |
-| `httpc.ErrInvalidURL` | URL validation failed |
 | `httpc.ErrInvalidHeader` | Header validation failed |
 | `httpc.ErrInvalidTimeout` | Timeout configuration invalid |
 | `httpc.ErrInvalidRetry` | Retry configuration invalid |

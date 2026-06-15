@@ -11,21 +11,23 @@ import (
 
 // httpHeaderPool reduces allocations for http.Header maps used in request building.
 // Header maps are allocated per-request and can be reused after clearing.
+//
+// Stores the map value directly rather than *http.Header: boxing a map into any
+// is allocation-free (a map value is a single-word pointer to its hmap), whereas
+// httpHeaderPool.Put(&h) would force the parameter h to escape to the heap on
+// every return, allocating a pointer box.
 var httpHeaderPool = sync.Pool{
 	New: func() any {
-		h := make(http.Header, 8)
-		return &h
+		return make(http.Header, 8)
 	},
 }
 
 // getHTTPHeader retrieves a cleared http.Header from the pool.
 func getHTTPHeader() http.Header {
-	ptr, ok := httpHeaderPool.Get().(*http.Header)
-	if !ok || ptr == nil {
-		h := make(http.Header, 8)
-		return h
+	h, ok := httpHeaderPool.Get().(http.Header)
+	if !ok || h == nil {
+		return make(http.Header, 8)
 	}
-	h := *ptr
 	for k := range h {
 		delete(h, k)
 	}
@@ -41,7 +43,7 @@ func putHTTPHeader(h http.Header) {
 	for k := range h {
 		delete(h, k)
 	}
-	httpHeaderPool.Put(&h)
+	httpHeaderPool.Put(h)
 }
 
 // CloneHeader creates a deep copy of headers using batch allocation.
@@ -138,8 +140,8 @@ func shouldEscape(c byte) bool {
 		c != '-' && c != '.' && c != '_' && c != '~'
 }
 
-// QueryEscapePool pools byte slices for query escaping.
-var QueryEscapePool = sync.Pool{
+// queryEscapePool pools byte slices for query escaping.
+var queryEscapePool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 0, 64)
 		return &b
@@ -182,7 +184,7 @@ func QueryEscape(s string) string {
 
 	// Slow path: escape using pooled buffer
 	// Safe from overflow: len(s) <= maxQueryEscapeSize (10MB), so len(s)*3 <= 30MB
-	bufPtr, ok := QueryEscapePool.Get().(*[]byte)
+	bufPtr, ok := queryEscapePool.Get().(*[]byte)
 	origPtr := bufPtr
 	if !ok || bufPtr == nil || cap(*bufPtr) < len(s)*3 {
 		tmp := make([]byte, 0, len(s)*3)
@@ -204,10 +206,10 @@ func QueryEscape(s string) string {
 	result := string(buf)
 	if cap(buf) <= 1024 {
 		*bufPtr = buf
-		QueryEscapePool.Put(bufPtr)
+		queryEscapePool.Put(bufPtr)
 	} else if origPtr != bufPtr && origPtr != nil {
 		*origPtr = (*origPtr)[:0]
-		QueryEscapePool.Put(origPtr)
+		queryEscapePool.Put(origPtr)
 	}
 	return result
 }

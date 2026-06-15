@@ -44,6 +44,7 @@ A fast, secure HTTP client library for Go with sensible defaults, minimal depend
 | **Secure by Default** | TLS 1.2+, SSRF protection, CRLF injection prevention, path traversal blocking |
 | **High Performance** | Connection pooling, HTTP/2, goroutine-safe, `sync.Pool` optimization |
 | **Built-in Resilience** | Smart retry with exponential backoff and jitter |
+| **Automatic Decompression** | Transparent gzip/deflate handling with zip-bomb protection |
 | **Developer Friendly** | Clean API, intuitive options pattern, comprehensive documentation |
 | **Minimal Dependencies** | 1 dependency (golang.org/x/sys), pure Go stdlib |
 | **Cookie Management** | Full cookie jar support with security validation |
@@ -291,6 +292,9 @@ httpc.WithMaxRetries(3)
 // Redirect control
 httpc.WithFollowRedirects(false)
 httpc.WithMaxRedirects(5)
+
+// Per-request SSRF override (escape hatch for one trusted internal URL)
+httpc.WithAllowPrivateIPs(true)
 ```
 
 ### Callbacks
@@ -318,7 +322,7 @@ httpc.WithOnResponse(func(resp httpc.ResponseMutator) error {
 | **Query** | `WithQuery(key, value)`, `WithQueryMap(map)` |
 | **Body** | `WithJSON(data)`, `WithXML(data)`, `WithForm(map)`, `WithFormData(*FormData)`, `WithFile(field, filename, content)`, `WithBody(data, ...BodyKind)`, `WithBinary([]byte, ...contentType)`, `WithStreamBody(bool)` |
 | **Cookies** | `WithCookie(cookie)`, `WithCookies([]Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
-| **Control** | `WithTimeout(dur)`, `WithMaxRetries(n)`, `WithContext(ctx)` |
+| **Control** | `WithTimeout(dur)`, `WithMaxRetries(n)`, `WithContext(ctx)`, `WithAllowPrivateIPs(bool)` |
 | **Redirects** | `WithFollowRedirects(bool)`, `WithMaxRedirects(n)` |
 | **Callbacks** | `WithOnRequest(fn)`, `WithOnResponse(fn)` |
 
@@ -379,6 +383,24 @@ fmt.Println(result.Meta.RedirectChain) // Redirect URLs
 fmt.Println(result.String())
 ```
 
+### Automatic Decompression
+
+HTTPC transparently decompresses `gzip` and `deflate` responses. It advertises
+`Accept-Encoding: gzip, deflate` by default (override or extend it with
+`WithHeader("Accept-Encoding", ...)`). A decompression-bomb guard caps the
+decompressed size at `Security.MaxDecompressedBodySize` (default 100 MB).
+
+```go
+result, _ := httpc.Get("https://httpbin.org/gzip",
+    httpc.WithHeaderMap(map[string]string{"Accept-Encoding": "gzip, deflate"}),
+)
+fmt.Println(result.Body()) // already decompressed
+```
+
+> **Note:** Brotli (`br`) and LZW (`compress`) are **not** supported and return an
+> error if a server sends them. Since httpc does not advertise them, this only
+> happens if you set `Accept-Encoding` manually.
+
 ---
 
 ## Context & Cancellation
@@ -408,9 +430,9 @@ File downloads include built-in security protections:
 - **Resume support** - Automatically resumes interrupted downloads
 
 ```go
-result, _ := httpc.DownloadFile(
+result, _ := httpc.Download(context.Background(),
     "https://example.com/file.zip",
-    "downloads/file.zip",
+    &httpc.DownloadConfig{FilePath: "downloads/file.zip"},
 )
 fmt.Printf("Downloaded: %s at %s/s\n",
     httpc.FormatBytes(result.BytesWritten),
@@ -426,7 +448,7 @@ opts.ProgressCallback = func(downloaded, total int64, speed float64) {
     pct := float64(downloaded) / float64(total) * 100
     fmt.Printf("\r%.1f%% - %s/s", pct, httpc.FormatSpeed(speed))
 }
-result, _ := httpc.DownloadWithOptions(url, opts)
+result, _ := httpc.Download(context.Background(), url, opts)
 ```
 
 ### Resume Download
@@ -435,7 +457,7 @@ result, _ := httpc.DownloadWithOptions(url, opts)
 opts := httpc.DefaultDownloadConfig()
 opts.FilePath = "downloads/large.zip"
 opts.ResumeDownload = true
-result, _ := httpc.DownloadWithOptions(url, opts)
+result, _ := httpc.Download(context.Background(), url, opts)
 if result.Resumed {
     fmt.Println("Download resumed from previous position")
 }
@@ -443,17 +465,22 @@ if result.Resumed {
 
 ### Download with Context
 
+`Download` accepts a `context.Context` directly, so cancellation and timeouts
+apply out of the box — there is no separate "WithContext" entry point:
+
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 defer cancel()
 
-result, _ := httpc.DownloadFileWithContext(ctx,
+result, _ := httpc.Download(ctx,
     "https://example.com/large.zip",
-    "downloads/large.zip",
+    &httpc.DownloadConfig{FilePath: "downloads/large.zip"},
 )
 
-// Full control with download config + context
-result, _ := httpc.DownloadWithOptionsWithContext(ctx, url, opts)
+// Full control: download config + context + request options
+result, _ := httpc.Download(ctx, url, opts,
+    httpc.WithBearerToken("your-token"),
+)
 ```
 
 ### DownloadConfig Fields
@@ -471,10 +498,7 @@ result, _ := httpc.DownloadWithOptionsWithContext(ctx, url, opts)
 
 | Function | Description |
 |----------|-------------|
-| `DownloadFile(url, filePath, ...options)` | Simple download |
-| `DownloadWithOptions(url, config, ...options)` | Download with progress/resume config |
-| `DownloadFileWithContext(ctx, url, filePath, ...options)` | Download with cancellation |
-| `DownloadWithOptionsWithContext(ctx, url, config, ...options)` | Full control with config + context |
+| `Download(ctx, url, cfg, ...options)` | **Canonical entry point** — single function for all package-level downloads |
 
 ### DownloadResult Fields
 
@@ -558,10 +582,8 @@ client.Session() // Underlying SessionManager
 ### File Downloads (relative paths)
 
 ```go
-result, _ := client.DownloadFile("/files/data.csv", "data.csv")
-result, _ := client.DownloadWithOptions("/files/large.zip", downloadOpts)
-result, _ := client.DownloadFileWithContext(ctx, "/files/data.csv", "data.csv")
-result, _ := client.DownloadWithOptionsWithContext(ctx, "/files/large.zip", downloadOpts)
+result, _ := client.Download(ctx, "/files/data.csv", &httpc.DownloadConfig{FilePath: "data.csv"})
+result, _ := client.Download(ctx, "/files/large.zip", downloadOpts)
 ```
 
 ### All HTTP Methods
@@ -729,8 +751,9 @@ fmt.Println(config.String())
 | `Security.MinTLSVersion` | `uint16` | `TLS 1.2` | Minimum TLS version |
 | `Security.MaxTLSVersion` | `uint16` | `TLS 1.3` | Maximum TLS version |
 | `Security.InsecureSkipVerify` | `bool` | `false` | Skip TLS verification (testing only!) |
+| `Security.CertificatePinner` | `CertificatePinner` | `nil` | Certificate pinning — reject MITM even if CA compromised |
 | `Security.MaxResponseBodySize` | `int64` | `10MB` | Max response body size |
-| `Security.MaxRequestBodySize` | `int64` | `0` | Max request body size (0 = uses MaxResponseBodySize) |
+| `Security.MaxRequestBodySize` | `int64` | `0` | Max request body size (0 = no limit; does not fall back to MaxResponseBodySize) |
 | `Security.AllowPrivateIPs` | `bool` | `false` | Allow private IPs (SSRF protection enabled by default) |
 | `Security.ValidateURL` | `bool` | `true` | Enable URL validation |
 | `Security.ValidateHeaders` | `bool` | `true` | Enable header validation |
@@ -868,6 +891,7 @@ config.Connection.EnableSystemProxy = true // Reads from environment and system 
 | Feature | Description |
 |---------|-------------|
 | **TLS 1.2+** | Modern encryption standards by default |
+| **Certificate Pinning** | Defense against MITM even with a compromised CA |
 | **SSRF Protection** | Two-layer DNS validation blocks private IPs |
 | **CRLF Injection Prevention** | Header and URL validation |
 | **Path Traversal Protection** | Safe file operations |
@@ -899,6 +923,53 @@ cfg := httpc.DefaultConfig()
 cfg.Security.SSRFExemptCIDRs = []string{"10.0.0.0/8", "100.64.0.0/10"}
 client, _ := httpc.New(cfg)
 ```
+
+For a single trusted internal call without relaxing the whole client, use the
+per-request `WithAllowPrivateIPs` option (it overrides the client's SSRF policy
+for that one request only):
+
+```go
+// Default client blocks private IPs; this call opts in for one request
+result, err := httpc.Get("http://localhost:8080/health",
+    httpc.WithAllowPrivateIPs(true),
+)
+```
+
+### Certificate Pinning
+
+Certificate pinning defends against man-in-the-middle attacks even when a trusted
+Certificate Authority is compromised: the TLS handshake is rejected unless the
+server presents a pinned public key. Enable it by assigning a `CertificatePinner`
+to `Security.CertificatePinner`.
+
+```go
+// Pin by base64-encoded SHA-256 hash of the SubjectPublicKeyInfo (SPKI).
+// Supply multiple hashes to support key rotation (accept if ANY matches).
+pinner, err := httpc.NewSPKIHashPinner(
+    "YLh1dUR9y6Kja30RrAn7JKnbQG/uEtLMkBgFF2fuihg=", // current key
+    "C5+lpZ7tcVwmwQIMcRtPbsQtWLABXhQzejna0wHFr8M=", // backup key (rotation)
+)
+if err != nil {
+    log.Fatal(err)
+}
+
+cfg := httpc.DefaultConfig()
+cfg.Security.CertificatePinner = pinner
+client, err := httpc.New(cfg)
+```
+
+Generate an SPKI hash from a certificate:
+
+```bash
+openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary | openssl enc -base64
+```
+
+| Function | Description |
+|----------|-------------|
+| `NewSPKIHashPinner(hashes ...string)` | Pin by base64 SHA-256 SPKI hashes (recommended; HPKP format) |
+| `NewPublicKeyPinner(publicKeys ...[]byte)` | Pin by DER-encoded PKIX public keys |
+| `NewCertificatePinnerChain(pinners ...CertificatePinner)` | Combine multiple pinners (accept if ANY matches) |
 
 ### Security Warning Output
 
@@ -971,7 +1042,6 @@ const (
 var (
     ErrClientClosed         // Client has been closed
     ErrNilConfig            // Nil configuration provided
-    ErrInvalidURL           // URL validation failed
     ErrInvalidHeader        // Header validation failed
     ErrInvalidTimeout       // Timeout is negative or exceeds limits
     ErrInvalidRetry         // Retry configuration is invalid
@@ -1066,10 +1136,7 @@ type Client interface {
     Delete(url string, options ...RequestOption) (*Result, error)
     Head(url string, options ...RequestOption) (*Result, error)
     Options(url string, options ...RequestOption) (*Result, error)
-    DownloadFile(url, filePath string, options ...RequestOption) (*DownloadResult, error)
-    DownloadWithOptions(url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
-    DownloadFileWithContext(ctx context.Context, url, filePath string, options ...RequestOption) (*DownloadResult, error)
-    DownloadWithOptionsWithContext(ctx context.Context, url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
+    Download(ctx context.Context, url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
     Close() error
 }
 ```
@@ -1139,12 +1206,6 @@ func (m *MockClient) Get(url string, options ...httpc.RequestOption) (*httpc.Res
 | **Core Features** | [05_request_options](examples/05_request_options.go), [06_error_handling](examples/06_error_handling.go), [07_timeout_retry](examples/07_timeout_retry.go), [08_client_configuration](examples/08_client_configuration.go), [09_redirects](examples/09_redirects.go), [10_cookies_advanced](examples/10_cookies_advanced.go) |
 | **Stateful Clients** | [11_session](examples/11_session.go), [12_domain_client](examples/12_domain_client.go), [13_proxy_configuration](examples/13_proxy_configuration.go), [14_doh](examples/14_doh.go) |
 | **Advanced** | [15_middleware](examples/15_middleware.go), [16_concurrent_requests](examples/16_concurrent_requests.go), [17_file_operations](examples/17_file_operations.go), [18_rest_api_client](examples/18_rest_api_client.go), [19_advanced_patterns](examples/19_advanced_patterns.go) |
-
-Run any example:
-
-```bash
-go run -tags examples examples/01_basic_usage.go
-```
 
 ---
 

@@ -28,10 +28,11 @@ const maxRetriesUnset = -1
 
 // headersMapPool reduces allocations for the per-request headers map (map[string]string).
 // Pooled maps are cleared before reuse and must not exceed 32 entries to prevent bloat.
+// Stores the map value directly: boxing a map into any is allocation-free, whereas
+// storing &m would force the parameter to escape (see httpHeaderPool for details).
 var headersMapPool = sync.Pool{
 	New: func() any {
-		m := make(map[string]string, 4)
-		return &m
+		return make(map[string]string, 4)
 	},
 }
 
@@ -39,18 +40,16 @@ var headersMapPool = sync.Pool{
 // Pooled maps are cleared before reuse and must not exceed 32 entries to prevent bloat.
 var queryParamsPool = sync.Pool{
 	New: func() any {
-		m := make(map[string]any, 4)
-		return &m
+		return make(map[string]any, 4)
 	},
 }
 
 func getHeadersMap() map[string]string {
-	ptr, ok := headersMapPool.Get().(*map[string]string)
-	if !ok || ptr == nil {
-		m := make(map[string]string, 4)
-		return m
+	m, ok := headersMapPool.Get().(map[string]string)
+	if !ok || m == nil {
+		return make(map[string]string, 4)
 	}
-	return *ptr
+	return m
 }
 
 func putHeadersMap(m map[string]string) {
@@ -60,16 +59,15 @@ func putHeadersMap(m map[string]string) {
 	for k := range m {
 		delete(m, k)
 	}
-	headersMapPool.Put(&m)
+	headersMapPool.Put(m)
 }
 
 func getQueryParamsMap() map[string]any {
-	ptr, ok := queryParamsPool.Get().(*map[string]any)
-	if !ok || ptr == nil {
-		m := make(map[string]any, 4)
-		return m
+	m, ok := queryParamsPool.Get().(map[string]any)
+	if !ok || m == nil {
+		return make(map[string]any, 4)
 	}
-	return *ptr
+	return m
 }
 
 func putQueryParamsMap(m map[string]any) {
@@ -79,7 +77,7 @@ func putQueryParamsMap(m map[string]any) {
 	for k := range m {
 		delete(m, k)
 	}
-	queryParamsPool.Put(&m)
+	queryParamsPool.Put(m)
 }
 
 // requestPool is a typed pool for Request objects that eliminates
@@ -240,13 +238,21 @@ type responseCallback func(resp *Response) error
 
 // Request represents an HTTP request with method, URL, headers, body, and options.
 type Request struct {
-	method          string
-	url             string
-	headers         map[string]string
-	queryParams     map[string]any
-	body            any
-	timeout         time.Duration
-	maxRetries      int
+	method      string
+	url         string
+	headers     map[string]string
+	queryParams map[string]any
+	body        any
+	timeout     time.Duration
+	maxRetries  int
+	// context carries the request's cancellation/deadline. Storing it here is an
+	// intentional, narrow exception to the "do not store context in a struct"
+	// guideline: Request is a short-lived, pooled, request-scoped object whose
+	// lifetime is bounded by a single request — mirroring net/http.Request. It is
+	// reset to its zero value when returned to the pool (see requestPool.put /
+	// ReleaseRequest) and is never retained beyond the request. Long-lived structs
+	// that outlive a request must continue to take context.Context as the first
+	// parameter instead.
 	context         context.Context
 	cookies         []http.Cookie
 	followRedirects *bool
@@ -255,6 +261,7 @@ type Request struct {
 	onResponse      responseCallback
 	streamBody      bool   // When true, skip buffering response body; caller reads via RawBodyReader
 	sanitizedURL    string // Cached per-request sanitized URL, set by middleware on first access
+	allowPrivateIPs *bool  // Per-request override of client-level AllowPrivateIPs (nil = use client policy)
 }
 
 // Compile-time interface check
@@ -272,6 +279,7 @@ func (r *Request) Context() context.Context    { return r.context }
 func (r *Request) Cookies() []http.Cookie      { return r.cookies }
 func (r *Request) FollowRedirects() *bool      { return r.followRedirects }
 func (r *Request) MaxRedirects() *int          { return r.maxRedirects }
+func (r *Request) AllowPrivateIPs() *bool      { return r.allowPrivateIPs }
 func (r *Request) SanitizedURL() string        { return r.sanitizedURL }
 func (r *Request) SetSanitizedURL(v string)    { r.sanitizedURL = v }
 
@@ -299,6 +307,7 @@ func (r *Request) SetContext(v context.Context) { r.context = v }
 func (r *Request) SetCookies(v []http.Cookie)   { r.cookies = v }
 func (r *Request) SetFollowRedirects(v *bool)   { r.followRedirects = v }
 func (r *Request) SetMaxRedirects(v *int)       { r.maxRedirects = v }
+func (r *Request) SetAllowPrivateIPs(v *bool)   { r.allowPrivateIPs = v }
 func (r *Request) StreamBody() bool             { return r.streamBody }
 func (r *Request) SetStreamBody(v bool)         { r.streamBody = v }
 
@@ -523,7 +532,7 @@ var ErrClientClosed = errors.New("client is closed")
 
 func (c *Client) Request(ctx context.Context, method, url string, options ...RequestOption) (*Response, error) {
 	if atomic.LoadInt32(&c.closed) == 1 {
-		return nil, fmt.Errorf("%w", ErrClientClosed)
+		return nil, ErrClientClosed
 	}
 
 	startTime := time.Now()
@@ -540,10 +549,18 @@ func (c *Client) Request(ctx context.Context, method, url string, options ...Req
 	for _, option := range options {
 		if option != nil {
 			if err := option(req); err != nil {
-				c.metrics.recordRequest(time.Since(startTime).Nanoseconds(), false)
+				// Caller-side configuration error, not a transport failure —
+				// do not count it against health metrics.
 				return nil, fmt.Errorf("failed to apply request option: %w", err)
 			}
 		}
+	}
+
+	// Propagate a per-request AllowPrivateIPs override to the connection dialer
+	// and the redirect-target validator via the request context. The pre-flight
+	// validator reads the same override directly from secReq below.
+	if override := req.AllowPrivateIPs(); override != nil {
+		req.SetContext(connection.WithAllowPrivateIPsOverride(req.Context(), *override))
 	}
 
 	// Use pooled security.Request for validation
@@ -553,12 +570,14 @@ func (c *Client) Request(ctx context.Context, method, url string, options ...Req
 	secReq.Headers = req.Headers()
 	secReq.QueryParams = req.QueryParams()
 	secReq.Body = req.Body()
+	secReq.AllowPrivateIPs = req.AllowPrivateIPs()
 
 	validationErr := c.validator.ValidateRequest(secReq)
 	c.putSecurityRequest(secReq)
 
 	if validationErr != nil {
-		c.metrics.recordRequest(time.Since(startTime).Nanoseconds(), false)
+		// Caller-side validation error, not a transport failure — do not
+		// count it against health metrics.
 		return nil, fmt.Errorf("request validation failed: %w", validationErr)
 	}
 
@@ -633,7 +652,15 @@ func (c *Client) sleepWithContext(ctx context.Context, duration time.Duration) e
 
 	select {
 	case <-ctx.Done():
-		timer.Stop()
+		// Per time.Timer docs: when Stop returns false the timer already fired
+		// and a value is buffered in timer.C. Drain it so the next pooled reuse
+		// does not observe a stale tick (which would wake a sleeper early).
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
 		timerPool.Put(timer)
 		return ctx.Err()
 	case <-timer.C:

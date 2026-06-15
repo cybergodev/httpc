@@ -116,11 +116,10 @@ func ValidateHeaderKeyValue(key, value string) error {
 		return fmt.Errorf("header value too long")
 	}
 
-	for i := 0; i < len(value); i++ {
-		c := value[i]
-		if (c < 0x20 && c != 0x09) || c == 0x7F {
-			return fmt.Errorf("header value contains invalid characters")
-		}
+	// Delegate control-character validation to IsValidHeaderString so there is a
+	// single implementation of the "no control chars except tab, no DEL" rule.
+	if !IsValidHeaderString(value) {
+		return fmt.Errorf("header value contains invalid characters")
 	}
 
 	return nil
@@ -175,8 +174,8 @@ func IsValidHeaderString(s string) bool {
 	return true
 }
 
-// ValidateCookieName validates HTTP cookie names.
-func ValidateCookieName(name string) error {
+// validateCookieName validates HTTP cookie names.
+func validateCookieName(name string) error {
 	return validateInputString(name, MaxCookieNameLen, "cookie name", func(r rune) error {
 		if r == ';' || r == ',' {
 			return fmt.Errorf("cookie name contains invalid characters")
@@ -185,8 +184,8 @@ func ValidateCookieName(name string) error {
 	})
 }
 
-// ValidateCookieValue validates HTTP cookie values.
-func ValidateCookieValue(value string) error {
+// validateCookieValue validates HTTP cookie values.
+func validateCookieValue(value string) error {
 	if len(value) > MaxCookieValueLen {
 		return fmt.Errorf("cookie value too long")
 	}
@@ -205,11 +204,11 @@ func ValidateCookie(cookie *http.Cookie) error {
 	if cookie == nil {
 		return fmt.Errorf("cookie is nil")
 	}
-	if err := ValidateCookieName(cookie.Name); err != nil {
+	if err := validateCookieName(cookie.Name); err != nil {
 		return err
 	}
 
-	if err := ValidateCookieValue(cookie.Value); err != nil {
+	if err := validateCookieValue(cookie.Value); err != nil {
 		return err
 	}
 

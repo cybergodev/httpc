@@ -25,9 +25,13 @@ func TestDetector_GetProxyFunc_NoProxy(t *testing.T) {
 	detector := NewDetector()
 	proxyFunc := detector.GetProxyFunc()
 
-	// Without proxy environment variables, should return nil (direct connection)
-	if proxyFunc != nil {
-		t.Log("GetProxyFunc returned a proxy function (platform-specific detection may have found one)")
+	// On Linux, proxy detection is environment-only (detectPlatform returns
+	// nil), so with the environment cleared the proxy func must be nil (direct
+	// connection). On Windows/macOS the platform detector also consults
+	// system-level config (WinHTTP / SystemConfiguration) that clearing env
+	// does not reach, so a non-nil func there reflects host config, not a bug.
+	if runtime.GOOS == "linux" && proxyFunc != nil {
+		t.Errorf("GetProxyFunc() = non-nil, want nil with no proxy environment on Linux")
 	}
 }
 

@@ -12,6 +12,11 @@ import (
 // 2. EnableSystemProxy (auto-detect)
 // 3. Direct connection (no proxy)
 func TestProxyConfigurationPriority(t *testing.T) {
+	// Note: the pure "EnableSystemProxy with no manual URL" case is intentionally
+	// omitted — its outcome depends on the host's OS-level proxy config (Windows
+	// registry / macOS system settings), which cannot be asserted deterministically.
+	// It is covered, machine-agnostically, by TestPoolManager_SystemProxy which only
+	// asserts that the transport is created. The cases below are all deterministic.
 	tests := []struct {
 		name              string
 		proxyURL          string
@@ -27,15 +32,7 @@ func TestProxyConfigurationPriority(t *testing.T) {
 			description:       "Manual proxy URL should be used",
 		},
 		{
-			name:              "System proxy enabled",
-			proxyURL:          "",
-			enableSystemProxy: true,
-			expectProxySet:    false, // May or may not be set depending on system
-			description:       "System proxy detection should be attempted",
-		},
-		{
 			name:              "Direct connection (default)",
-			proxyURL:          "",
 			enableSystemProxy: false,
 			expectProxySet:    false,
 			description:       "No proxy should be configured",
@@ -72,27 +69,28 @@ func TestProxyConfigurationPriority(t *testing.T) {
 			proxyFunc := transport.Proxy
 			hasProxy := proxyFunc != nil
 
+			// Assert in both directions: a proxy must be set exactly when expected.
 			if tt.expectProxySet && !hasProxy {
 				t.Errorf("%s: expected proxy to be set, but it was nil", tt.description)
 			}
+			if !tt.expectProxySet && hasProxy {
+				t.Errorf("%s: expected no proxy, but one was configured", tt.description)
+			}
 
+			// When a manual proxy is configured, verify it resolves to that URL.
 			if tt.proxyURL != "" && hasProxy {
-				// Verify that the manual proxy is correctly set
 				testURL, _ := url.Parse("https://www.example.com")
 				testReq := &http.Request{URL: testURL}
-				proxyURL, err := proxyFunc(testReq)
+				resolved, err := proxyFunc(testReq)
 				if err != nil {
 					t.Errorf("Proxy function returned error: %v", err)
 					return
 				}
-
 				expectedURL, _ := url.Parse(tt.proxyURL)
-				if proxyURL == nil || proxyURL.String() != expectedURL.String() {
-					t.Errorf("Expected proxy URL %s, got %v", expectedURL.String(), proxyURL)
+				if resolved == nil || resolved.String() != expectedURL.String() {
+					t.Errorf("Expected proxy URL %s, got %v", expectedURL.String(), resolved)
 				}
 			}
-
-			t.Logf("✓ %s: proxy set=%v", tt.description, hasProxy)
 		})
 	}
 }

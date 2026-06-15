@@ -4,15 +4,16 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 )
 
-// IsPrivateOrReservedIP checks if an IP address is private, reserved, or
+// isPrivateOrReservedIP checks if an IP address is private, reserved, or
 // otherwise not suitable for public internet communication.
 // This is used for SSRF (Server-Side Request Forgery) protection.
 //
 // SECURITY: This function handles IPv4-mapped IPv6 addresses (::ffff:x.x.x.x)
 // to prevent bypass attempts using mixed notation.
-func IsPrivateOrReservedIP(ip net.IP) bool {
+func isPrivateOrReservedIP(ip net.IP) bool {
 	// Normalize: handle IPv4-mapped IPv6 addresses (::ffff:127.0.0.1)
 	// This prevents SSRF bypass using mixed IPv4/IPv6 notation
 	if ip4 := ip.To4(); ip4 != nil {
@@ -52,7 +53,7 @@ func IsPrivateOrReservedIP(ip net.IP) bool {
 			ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 &&
 			ip[8] == 0 && ip[9] == 0 && ip[10] == 0 && ip[11] == 0 {
 			embeddedIP := net.IPv4(ip[12], ip[13], ip[14], ip[15])
-			return IsPrivateOrReservedIP(embeddedIP)
+			return isPrivateOrReservedIP(embeddedIP)
 		}
 	}
 
@@ -62,7 +63,7 @@ func IsPrivateOrReservedIP(ip net.IP) bool {
 // ValidateIP checks if an IP is allowed for outbound requests.
 // Returns an error if the IP is blocked by security policy.
 func ValidateIP(ip net.IP) error {
-	if IsPrivateOrReservedIP(ip) {
+	if isPrivateOrReservedIP(ip) {
 		return fmt.Errorf("blocked IP address")
 	}
 	return nil
@@ -85,8 +86,8 @@ func parseExemptCIDRs(cidrs []string) ([]*net.IPNet, error) {
 	return nets, nil
 }
 
-// IsIPExempted checks if an IP address matches any of the exempt CIDR ranges.
-func IsIPExempted(ip net.IP, nets []*net.IPNet) bool {
+// isIPExempted checks if an IP address matches any of the exempt CIDR ranges.
+func isIPExempted(ip net.IP, nets []*net.IPNet) bool {
 	for _, n := range nets {
 		if n.Contains(ip) {
 			return true
@@ -98,7 +99,7 @@ func IsIPExempted(ip net.IP, nets []*net.IPNet) bool {
 // ValidateIPWithExemptions checks if an IP is allowed, considering exempt CIDR ranges.
 // IPs that are private/reserved but match an exempt CIDR are allowed.
 func ValidateIPWithExemptions(ip net.IP, exemptNets []*net.IPNet) error {
-	if IsPrivateOrReservedIP(ip) && !IsIPExempted(ip, exemptNets) {
+	if isPrivateOrReservedIP(ip) && !isIPExempted(ip, exemptNets) {
 		return fmt.Errorf("blocked IP address")
 	}
 	return nil
@@ -112,14 +113,14 @@ func ValidateIPWithExemptions(ip net.IP, exemptNets []*net.IPNet) error {
 func FilterAllowedIPs(ips []net.IP, exemptNets []*net.IPNet) []net.IP {
 	allowed := make([]net.IP, 0, len(ips))
 	for _, ip := range ips {
-		if !IsPrivateOrReservedIP(ip) || IsIPExempted(ip, exemptNets) {
+		if !isPrivateOrReservedIP(ip) || isIPExempted(ip, exemptNets) {
 			allowed = append(allowed, ip)
 		}
 	}
 	return allowed
 }
 
-// IsLocalhost detects localhost variations including:
+// isLocalhost detects localhost variations including:
 // - "localhost" (case-insensitive)
 // - 127.0.0.1
 // - ::1
@@ -129,7 +130,7 @@ func FilterAllowedIPs(ips []net.IP, exemptNets []*net.IPNet) []net.IP {
 // - localhost.* subdomains (case-insensitive)
 //
 // Optimized to avoid repeated string allocations from strings.ToLower.
-func IsLocalhost(hostname string) bool {
+func isLocalhost(hostname string) bool {
 	// Fast path: check length before any string operations
 	hlen := len(hostname)
 	if hlen == 0 {
@@ -258,7 +259,7 @@ func ValidateSSRFHost(host string, exemptNets []*net.IPNet, resolveDNS bool) err
 		hostname = h
 	}
 
-	if IsLocalhost(hostname) {
+	if isLocalhost(hostname) {
 		return fmt.Errorf("localhost access blocked for security")
 	}
 
@@ -267,6 +268,15 @@ func ValidateSSRFHost(host string, exemptNets []*net.IPNet, resolveDNS bool) err
 			return fmt.Errorf("private/reserved IP address blocked")
 		}
 		return nil
+	}
+
+	// Block legacy integer/hex/octal IPv4 notation (e.g. "2130706433",
+	// "0x7f000001", "0177.0.0.1"). net.ParseIP rejects these, so without this
+	// guard they fall through and are allowed when resolveDNS is false. On cgo
+	// builds, getaddrinfo accepts them and may map them to private IPs (e.g.
+	// 127.0.0.1), bypassing SSRF protection.
+	if looksLikeLegacyIPLiteral(hostname) {
+		return fmt.Errorf("legacy IP literal notation blocked for security: %s", hostname)
 	}
 
 	if resolveDNS {
@@ -282,4 +292,49 @@ func ValidateSSRFHost(host string, exemptNets []*net.IPNet, resolveDNS bool) err
 	}
 
 	return nil
+}
+
+// looksLikeLegacyIPLiteral reports whether s uses a legacy integer, hex, or octal
+// IPv4 notation that net.ParseIP does not recognize but some platform resolvers
+// (cgo getaddrinfo) accept. Used to defensively block SSRF bypass attempts.
+//
+// Recognized legacy forms:
+//   - Pure decimal integer without dots: "2130706433"
+//   - Hex with 0x prefix (dotted or not): "0x7f000001", "0x7f.0.0.1"
+//   - Octal via leading-zero octets: "0177.0.0.1"
+func looksLikeLegacyIPLiteral(s string) bool {
+	if s == "" {
+		return false
+	}
+
+	// Hex form (whole or per-octet): 0x7f000001, 0x7f.0.0.1
+	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
+		return true
+	}
+
+	if !strings.Contains(s, ".") {
+		// Pure decimal integer host (no dots): 2130706433. A bare all-numeric
+		// label is not a legitimate DNS hostname.
+		for i := 0; i < len(s); i++ {
+			if s[i] < '0' || s[i] > '9' {
+				return false
+			}
+		}
+		return true
+	}
+
+	// Dotted form: flag leading-zero octets (octal) or hex octets.
+	for _, part := range strings.Split(s, ".") {
+		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(part, "0x") || strings.HasPrefix(part, "0X") {
+			return true
+		}
+		// Leading zero on a multi-char octet => octal (e.g. "0177"). "0" is fine.
+		if len(part) > 1 && part[0] == '0' {
+			return true
+		}
+	}
+	return false
 }

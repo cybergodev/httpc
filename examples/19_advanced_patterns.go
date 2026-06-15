@@ -96,8 +96,8 @@ func demonstrateResultPool() {
 
 	const numRequests = 10
 
-	// Results are automatically pooled internally for reduced GC pressure.
-	fmt.Println("Results are automatically returned to an internal pool by GC.")
+	// Internal responses are pooled; Result objects are freshly allocated and GC-reclaimed.
+	fmt.Println("Internal responses are pooled; Result objects are reclaimed by GC.")
 	start := time.Now()
 	for i := 0; i < numRequests; i++ {
 		resp, err := client.Get("https://httpbin.org/get")
@@ -122,8 +122,8 @@ func demonstrateStreamBody() {
 	defer client.Close()
 
 	// SaveToFile writes the response body directly to disk.
-	// For large file downloads, prefer DownloadFile/DownloadWithOptions
-	// which use streaming internally to avoid buffering the entire body.
+	// For large file downloads, prefer Download (with a DownloadConfig),
+	// which streams directly to disk and avoids buffering the entire body.
 	resp, err := client.Get("https://httpbin.org/get")
 	if err != nil {
 		log.Printf("Request failed: %v\n", err)
@@ -140,10 +140,10 @@ func demonstrateStreamBody() {
 		fmt.Println("Saved to downloads/response.json")
 	}
 
-	fmt.Println("\nWhen to use SaveToFile vs DownloadFile:")
+	fmt.Println("\nWhen to use SaveToFile vs Download:")
 	fmt.Println("  - SaveToFile: for small-to-medium responses already in memory")
-	fmt.Println("  - DownloadFile: for large files (streams directly to disk)")
-	fmt.Println("  - DownloadWithOptions: for large files with progress/checksum/resume")
+	fmt.Println("  - Download: for large files (streams directly to disk)")
+	fmt.Println("    (set cfg.ProgressCallback / Checksum / ResumeDownload for more)")
 	fmt.Println()
 }
 
@@ -252,7 +252,7 @@ func demonstrateMemoryOptimization() {
 
 	fmt.Println("Optimization tips:")
 	fmt.Println("  1. Reuse client instances (don't create new clients per request)")
-	fmt.Println("  2. Results are automatically pooled for reduced GC pressure")
+	fmt.Println("  2. Internal responses are pooled for reduced GC pressure")
 	fmt.Println("  3. Configure appropriate timeouts to avoid goroutine leaks")
 	fmt.Println("  4. Use PerformanceConfig() for high-concurrency applications")
 	fmt.Println("  5. Close clients when done (releases connection pool)")

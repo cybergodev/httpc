@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/cybergodev/httpc/internal/types"
 )
 
 // ============================================================================
@@ -778,44 +780,248 @@ func TestConvertToEngineConfig_NilConfig(t *testing.T) {
 	}
 }
 
+// driftTestRetryPolicy is a no-op RetryPolicy used only to assert that
+// RetryConfig.CustomPolicy propagates through convertToEngineConfig.
+type driftTestRetryPolicy struct{}
+
+func (driftTestRetryPolicy) ShouldRetry(types.ResponseReader, error, int) bool { return false }
+func (driftTestRetryPolicy) GetDelay(int) time.Duration                        { return 0 }
+func (driftTestRetryPolicy) MaxRetries() int                                   { return 9 }
+
+// TestConvertToEngineConfig_PropagatesAllFields is the configuration drift guard.
+//
+// It sets every public Config field that maps into engine.Config to a distinctive
+// sentinel value and asserts the value arrives unchanged. A silently un-mapped
+// field is exactly the failure this test exists to catch.
+//
+// WHEN YOU ADD A NEW PUBLIC Config FIELD THAT MUST REACH THE ENGINE: add an
+// assertion here. New fields silently missing from convertToEngineConfig are
+// the top configuration risk this suite guards against.
+//
+// Derived fields (with no 1:1 source field) are asserted against their
+// documented derivation rule so the mapping contract stays explicit:
+//   - KeepAlive: hard-coded defaultKeepAlive (30s) — no public knob
+//   - MaxIdleConnsPerHost: derived from MaxConnsPerHost via calculateIdleConnsPerHost
+//   - MinTLSVersion/MaxTLSVersion: defaulted to TLS 1.2/1.3 when zero
+//   - MaxRetryDelay: defaulted to 30s when zero
+//   - CookieJar: created when EnableCookies is true
+//   - ExemptNets: parsed from SSRFExemptCIDRs via parseSSRFExemptCIDRs
+//   - RedirectWhitelist: built from Security.RedirectWhitelist when non-empty
+func TestConvertToEngineConfig_PropagatesAllFields(t *testing.T) {
+	cfg := DefaultConfig()
+
+	// --- Distinctive sentinel values (chosen to differ from DefaultConfig) ---
+	cfg.Timeouts.Request = 111 * time.Second
+	cfg.Timeouts.Dial = 112 * time.Second
+	cfg.Timeouts.TLSHandshake = 113 * time.Second
+	cfg.Timeouts.ResponseHeader = 114 * time.Second
+	cfg.Timeouts.IdleConn = 115 * time.Second
+
+	cfg.Connection.MaxIdleConns = 31
+	cfg.Connection.MaxConnsPerHost = 21
+	cfg.Connection.MaxResponseHeaderBytes = 2222
+	cfg.Connection.ProxyURL = "http://sentinel-proxy:8080"
+	cfg.Connection.EnableSystemProxy = true
+	cfg.Connection.EnableHTTP2 = false
+	cfg.Connection.EnableCookies = true
+	cfg.Connection.EnableDoH = true
+	cfg.Connection.DoHCacheTTL = 77 * time.Second
+
+	sentinelTLS := &tls.Config{MinVersion: tls.VersionTLS13}
+	cfg.Security.TLSConfig = sentinelTLS
+	cfg.Security.MinTLSVersion = tls.VersionTLS12
+	cfg.Security.MaxTLSVersion = tls.VersionTLS13
+	cfg.Security.InsecureSkipVerify = true
+	cfg.Security.MaxResponseBodySize = 9991
+	cfg.Security.MaxRequestBodySize = 9992
+	cfg.Security.MaxDecompressedBodySize = 9993
+	cfg.Security.ValidateURL = false
+	cfg.Security.ValidateHeaders = false
+	cfg.Security.AllowPrivateIPs = true
+	cfg.Security.StrictContentLength = false
+	pinner, err := NewSPKIHashPinner(testSPKIHash)
+	if err != nil {
+		t.Fatalf("NewSPKIHashPinner: %v", err)
+	}
+	cfg.Security.CertificatePinner = pinner
+	cfg.Security.SSRFExemptCIDRs = []string{"10.0.0.0/8"}
+	cfg.Security.RedirectWhitelist = []string{"sentinel.example.com"}
+
+	cfg.Retry.MaxRetries = 7
+	cfg.Retry.Delay = 9 * time.Second
+	cfg.Retry.MaxRetryDelay = 13 * time.Second
+	cfg.Retry.BackoffFactor = 3.5
+	cfg.Retry.EnableJitter = false
+	cfg.Retry.CustomPolicy = driftTestRetryPolicy{}
+
+	cfg.Middleware.UserAgent = "sentinel-ua/9.9"
+	cfg.Middleware.Headers = map[string]string{"X-Sentinel": "v1", "X-Other": "v2"}
+	cfg.Middleware.FollowRedirects = false
+	cfg.Middleware.MaxRedirects = 4
+
+	// SSRFExemptCIDRs must be parsed into parsedCIDRs before conversion.
+	if err := cfg.parseSSRFExemptCIDRs(); err != nil {
+		t.Fatalf("parseSSRFExemptCIDRs: %v", err)
+	}
+
+	engCfg, err := convertToEngineConfig(cfg)
+	if err != nil {
+		t.Fatalf("convertToEngineConfig error: %v", err)
+	}
+
+	// --- Direct 1:1 mappings (the drift guard proper) ---
+	assertions := []struct {
+		name string
+		got  any
+		want any
+	}{
+		{"Timeouts.Request -> Timeout", engCfg.Timeout, cfg.Timeouts.Request},
+		{"Timeouts.Dial -> DialTimeout", engCfg.DialTimeout, cfg.Timeouts.Dial},
+		{"Timeouts.TLSHandshake", engCfg.TLSHandshakeTimeout, cfg.Timeouts.TLSHandshake},
+		{"Timeouts.ResponseHeader", engCfg.ResponseHeaderTimeout, cfg.Timeouts.ResponseHeader},
+		{"Timeouts.IdleConn", engCfg.IdleConnTimeout, cfg.Timeouts.IdleConn},
+
+		{"Connection.MaxIdleConns", engCfg.MaxIdleConns, cfg.Connection.MaxIdleConns},
+		{"Connection.MaxConnsPerHost", engCfg.MaxConnsPerHost, cfg.Connection.MaxConnsPerHost},
+		{"Connection.MaxResponseHeaderBytes", engCfg.MaxResponseHeaderBytes, cfg.Connection.MaxResponseHeaderBytes},
+		{"Connection.ProxyURL", engCfg.ProxyURL, cfg.Connection.ProxyURL},
+		{"Connection.EnableSystemProxy", engCfg.EnableSystemProxy, cfg.Connection.EnableSystemProxy},
+		{"Connection.EnableHTTP2", engCfg.EnableHTTP2, cfg.Connection.EnableHTTP2},
+		{"Connection.EnableCookies", engCfg.EnableCookies, cfg.Connection.EnableCookies},
+		{"Connection.EnableDoH", engCfg.EnableDoH, cfg.Connection.EnableDoH},
+		{"Connection.DoHCacheTTL", engCfg.DoHCacheTTL, cfg.Connection.DoHCacheTTL},
+
+		{"Security.InsecureSkipVerify", engCfg.InsecureSkipVerify, cfg.Security.InsecureSkipVerify},
+		{"Security.MaxResponseBodySize", engCfg.MaxResponseBodySize, cfg.Security.MaxResponseBodySize},
+		{"Security.MaxRequestBodySize", engCfg.MaxRequestBodySize, cfg.Security.MaxRequestBodySize},
+		{"Security.MaxDecompressedBodySize", engCfg.MaxDecompressedBodySize, cfg.Security.MaxDecompressedBodySize},
+		{"Security.ValidateURL", engCfg.ValidateURL, cfg.Security.ValidateURL},
+		{"Security.ValidateHeaders", engCfg.ValidateHeaders, cfg.Security.ValidateHeaders},
+		{"Security.AllowPrivateIPs", engCfg.AllowPrivateIPs, cfg.Security.AllowPrivateIPs},
+		{"Security.StrictContentLength", engCfg.StrictContentLength, cfg.Security.StrictContentLength},
+		{"Security.MinTLSVersion (explicit)", engCfg.MinTLSVersion, cfg.Security.MinTLSVersion},
+		{"Security.MaxTLSVersion (explicit)", engCfg.MaxTLSVersion, cfg.Security.MaxTLSVersion},
+
+		{"Retry.MaxRetries", engCfg.MaxRetries, cfg.Retry.MaxRetries},
+		{"Retry.Delay -> RetryDelay", engCfg.RetryDelay, cfg.Retry.Delay},
+		{"Retry.MaxRetryDelay (explicit)", engCfg.MaxRetryDelay, cfg.Retry.MaxRetryDelay},
+		{"Retry.BackoffFactor", engCfg.BackoffFactor, cfg.Retry.BackoffFactor},
+		{"Retry.EnableJitter -> Jitter", engCfg.Jitter, cfg.Retry.EnableJitter},
+
+		{"Middleware.UserAgent", engCfg.UserAgent, cfg.Middleware.UserAgent},
+		{"Middleware.FollowRedirects", engCfg.FollowRedirects, cfg.Middleware.FollowRedirects},
+		{"Middleware.MaxRedirects", engCfg.MaxRedirects, cfg.Middleware.MaxRedirects},
+	}
+	for _, a := range assertions {
+		if a.got != a.want {
+			t.Errorf("%s: got %v, want %v", a.name, a.got, a.want)
+		}
+	}
+
+	// --- Pointer / interface / map identity (not comparable via the table above) ---
+	if engCfg.TLSConfig != sentinelTLS {
+		t.Errorf("TLSConfig pointer not propagated: got %p, want %p", engCfg.TLSConfig, sentinelTLS)
+	}
+	if engCfg.CertificatePinner != pinner {
+		t.Error("CertificatePinner not propagated (interface identity mismatch)")
+	}
+	if engCfg.CustomRetryPolicy != cfg.Retry.CustomPolicy {
+		t.Error("CustomRetryPolicy not propagated (interface identity mismatch)")
+	}
+	if len(engCfg.Headers) != 2 || engCfg.Headers["X-Sentinel"] != "v1" {
+		t.Errorf("Middleware.Headers not propagated: got %v", engCfg.Headers)
+	}
+
+	// --- Derived fields (documented derivation rules) ---
+	if engCfg.KeepAlive != 30*time.Second {
+		t.Errorf("KeepAlive (hard-coded default): got %v, want 30s", engCfg.KeepAlive)
+	}
+	if wantIdle := calculateIdleConnsPerHost(cfg.Connection.MaxConnsPerHost); engCfg.MaxIdleConnsPerHost != wantIdle {
+		t.Errorf("MaxIdleConnsPerHost: got %d, want %d (derived from MaxConnsPerHost=%d)",
+			engCfg.MaxIdleConnsPerHost, wantIdle, cfg.Connection.MaxConnsPerHost)
+	}
+	if engCfg.CookieJar == nil {
+		t.Error("CookieJar should be non-nil when EnableCookies=true")
+	}
+	if len(engCfg.ExemptNets) != 1 || engCfg.ExemptNets[0].String() != "10.0.0.0/8" {
+		t.Errorf("ExemptNets not parsed from SSRFExemptCIDRs: got %+v", engCfg.ExemptNets)
+	}
+	if engCfg.RedirectWhitelist == nil {
+		t.Error("RedirectWhitelist should be built when Security.RedirectWhitelist is non-empty")
+	}
+}
+
+// TestConvertToEngineConfig_DerivedDefaults covers the zero-value defaulting
+// paths for TLS version, retry delay, and cookie jar.
+func TestConvertToEngineConfig_DerivedDefaults(t *testing.T) {
+	t.Run("TLS versions default to 1.2/1.3", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Security.MinTLSVersion = 0
+		cfg.Security.MaxTLSVersion = 0
+		engCfg, err := convertToEngineConfig(cfg)
+		if err != nil {
+			t.Fatalf("convertToEngineConfig: %v", err)
+		}
+		if engCfg.MinTLSVersion != tls.VersionTLS12 || engCfg.MaxTLSVersion != tls.VersionTLS13 {
+			t.Errorf("TLS defaults: got min=%d max=%d, want TLS1.2/TLS1.3", engCfg.MinTLSVersion, engCfg.MaxTLSVersion)
+		}
+	})
+
+	t.Run("MaxRetryDelay defaults to 30s", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Retry.MaxRetryDelay = 0
+		engCfg, err := convertToEngineConfig(cfg)
+		if err != nil {
+			t.Fatalf("convertToEngineConfig: %v", err)
+		}
+		if engCfg.MaxRetryDelay != 30*time.Second {
+			t.Errorf("MaxRetryDelay default: got %v, want 30s", engCfg.MaxRetryDelay)
+		}
+	})
+
+	t.Run("CookieJar nil when cookies disabled", func(t *testing.T) {
+		cfg := DefaultConfig()
+		engCfg, err := convertToEngineConfig(cfg)
+		if err != nil {
+			t.Fatalf("convertToEngineConfig: %v", err)
+		}
+		if engCfg.CookieJar != nil {
+			t.Error("CookieJar should be nil when EnableCookies=false")
+		}
+	})
+}
+
 func TestIsTestEnvironment_BoundaryConditions(t *testing.T) {
 	t.Parallel()
 
-	origArgs := os.Args[0]
-	origGoTest := os.Getenv("GO_TEST")
-	origGotest := os.Getenv("GOTEST")
-	defer func() {
-		os.Args[0] = origArgs
-		os.Setenv("GO_TEST", origGoTest)
-		os.Setenv("GOTEST", origGotest)
-	}()
+	// Exercise the pure detection logic directly. These tests MUST NOT mutate
+	// os.Args / environment variables: they are process-global and other
+	// parallel tests read them via New() -> isTestEnvironment(), so writing
+	// them here would data-race under -race.
+	cases := []struct {
+		name       string
+		executable string
+		goTest     string
+		gotest     string
+		want       bool
+	}{
+		{name: "GO_TEST env var", executable: "/usr/bin/myapp", goTest: "1", gotest: "", want: true},
+		{name: "GOTEST env var", executable: "/usr/bin/myapp", goTest: "", gotest: "1", want: true},
+		{name: "non-test binary returns false", executable: "/usr/bin/myapp", goTest: "", gotest: "", want: false},
+		{name: "test infix pattern", executable: "/tmp/my.test.custom", goTest: "", gotest: "", want: true},
+		{name: "dot-test suffix", executable: "runner.test", goTest: "", gotest: "", want: true},
+		{name: "dot-test-exe suffix", executable: "runner.test.exe", goTest: "", gotest: "", want: true},
+	}
 
-	t.Run("GO_TEST env var", func(t *testing.T) {
-		os.Args[0] = "/usr/bin/myapp"
-		os.Setenv("GO_TEST", "1")
-		os.Setenv("GOTEST", "")
-		if !isTestEnvironment() {
-			t.Error("GO_TEST=1 should return true")
-		}
-	})
-
-	t.Run("non-test binary returns false", func(t *testing.T) {
-		os.Args[0] = "/usr/bin/myapp"
-		os.Setenv("GO_TEST", "")
-		os.Setenv("GOTEST", "")
-		if isTestEnvironment() {
-			t.Error("non-test binary with no env vars should return false")
-		}
-	})
-
-	t.Run("test infix pattern", func(t *testing.T) {
-		os.Args[0] = "/tmp/my.test.custom"
-		os.Setenv("GO_TEST", "")
-		os.Setenv("GOTEST", "")
-		if !isTestEnvironment() {
-			t.Error("binary with .test. infix should return true")
-		}
-	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := isTestEnvironmentFrom(tc.executable, tc.goTest, tc.gotest); got != tc.want {
+				t.Errorf("isTestEnvironmentFrom(%q, %q, %q) = %v, want %v",
+					tc.executable, tc.goTest, tc.gotest, got, tc.want)
+			}
+		})
+	}
 }
 
 func TestWarnTestingConfigInProduction(t *testing.T) {

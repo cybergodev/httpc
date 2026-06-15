@@ -60,10 +60,6 @@ var (
 	// Always provide a valid Config or use DefaultConfig().
 	ErrNilConfig = errors.New("config cannot be nil")
 
-	// ErrInvalidURL is returned when URL validation fails.
-	// URLs must have a valid scheme (http/https) and host.
-	ErrInvalidURL = errors.New("invalid URL")
-
 	// ErrInvalidHeader is returned when header validation fails.
 	// Headers must not contain control characters or exceed size limits.
 	ErrInvalidHeader = errors.New("invalid header")

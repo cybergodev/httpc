@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -227,7 +228,7 @@ func TestPanicSafety(t *testing.T) {
 				return
 			}
 			defer client.Close()
-			_, err = client.DownloadFile(server.URL, "")
+			_, err = client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: ""})
 			if err == nil {
 				t.Error("Expected error for empty file path")
 			}
@@ -297,6 +298,47 @@ func TestPanicSafety(t *testing.T) {
 				t.Error("Expected error when using closed client")
 			}
 		}},
+		// SEC-003: the default safety net must convert panics to errors even when
+		// the user has NOT installed RecoveryMiddleware.
+		{"MiddlewarePanicDefaultNet", func() {
+			cfg := testConfig()
+			cfg.Middleware.Middlewares = []MiddlewareFunc{
+				func(next Handler) Handler {
+					return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
+						panic("internal panic without recovery middleware")
+					}
+				},
+			}
+			client, err := New(cfg)
+			if err != nil {
+				return
+			}
+			defer client.Close()
+			_, err = client.Get(server.URL)
+			if err == nil {
+				t.Error("Expected error from panic caught by default safety net")
+			}
+		}},
+		{"DownloadPanicDefaultNet", func() {
+			cfg := testConfig()
+			cfg.Middleware.Middlewares = []MiddlewareFunc{
+				func(next Handler) Handler {
+					return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
+						panic("internal panic during download")
+					}
+				},
+			}
+			client, err := New(cfg)
+			if err != nil {
+				return
+			}
+			defer client.Close()
+			dest := filepath.Join(t.TempDir(), "out.bin")
+			_, err = client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: dest})
+			if err == nil {
+				t.Error("Expected error from panic caught by download safety net")
+			}
+		}},
 	}
 
 	for _, tt := range tests {
@@ -304,6 +346,129 @@ func TestPanicSafety(t *testing.T) {
 			assertNoPanic(t, tt.name, tt.fn)
 		})
 	}
+}
+
+// ============================================================================
+// PER-REQUEST AllowPrivateIPs OVERRIDE TESTS
+// ============================================================================
+
+// Test_WithAllowPrivateIPs_OverridesClientPolicy verifies that the per-request
+// WithAllowPrivateIPs(true) option lets a request reach a localhost server even
+// when the client has SSRF protection enabled (AllowPrivateIPs=false). This
+// exercises all three SSRF layers: pre-flight validator, connection dialer.
+func Test_WithAllowPrivateIPs_OverridesClientPolicy(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Security.AllowPrivateIPs = false // SSRF protection enabled at client level
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("local-ok"))
+	}))
+	defer server.Close()
+
+	t.Run("OverrideTrueReachesLocalhost", func(t *testing.T) {
+		result, err := client.Get(server.URL, WithAllowPrivateIPs(true), WithTimeout(5*time.Second))
+		if err != nil {
+			t.Fatalf("Expected request to succeed with per-request override, got: %v", err)
+		}
+		if result.StatusCode() != http.StatusOK {
+			t.Errorf("Expected status 200, got %d", result.StatusCode())
+		}
+	})
+
+	t.Run("NoOverrideStillBlocked", func(t *testing.T) {
+		// Regression guard: without the option, the secure default must still block localhost.
+		_, err := client.Get(server.URL, WithTimeout(5*time.Second))
+		if err == nil {
+			t.Fatal("SECURITY ISSUE: Expected localhost to be blocked without per-request override")
+		}
+		if !strings.Contains(err.Error(), "blocked") && !strings.Contains(err.Error(), "localhost") {
+			t.Errorf("Expected SSRF blocking error, got: %v", err)
+		}
+	})
+}
+
+// Test_WithAllowPrivateIPs_FalseReEnablesProtection verifies that passing false
+// re-enables SSRF protection on a permissive client (AllowPrivateIPs=true) for
+// that single request. This validates the *bool semantics (nil=client default,
+// non-nil=override in either direction).
+func Test_WithAllowPrivateIPs_FalseReEnablesProtection(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true // Permissive client
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	// Permissive client would normally reach localhost; the per-request false override blocks it.
+	_, err = client.Get(server.URL, WithAllowPrivateIPs(false), WithTimeout(5*time.Second))
+	if err == nil {
+		t.Fatal("SECURITY ISSUE: Expected localhost to be blocked by per-request WithAllowPrivateIPs(false)")
+	}
+	if !strings.Contains(err.Error(), "blocked") && !strings.Contains(err.Error(), "localhost") {
+		t.Errorf("Expected SSRF blocking error, got: %v", err)
+	}
+}
+
+// Test_WithAllowPrivateIPs_RedirectOverride verifies the per-request override
+// also permits following a redirect to a localhost target, exercising the
+// transport's redirect-target SSRF check in addition to the dialer.
+func Test_WithAllowPrivateIPs_RedirectOverride(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Security.AllowPrivateIPs = false // SSRF protection enabled
+	cfg.Middleware.FollowRedirects = true
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	// Final target: a real localhost server the redirect resolves to.
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("redirected-ok"))
+	}))
+	defer target.Close()
+
+	// Redirector: 302 to the localhost target.
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	t.Run("OverrideFollowsLocalRedirect", func(t *testing.T) {
+		result, err := client.Get(redirector.URL, WithAllowPrivateIPs(true), WithTimeout(5*time.Second))
+		if err != nil {
+			t.Fatalf("Expected redirect to succeed with per-request override, got: %v", err)
+		}
+		if result.StatusCode() != http.StatusOK {
+			t.Errorf("Expected status 200 after redirect, got %d", result.StatusCode())
+		}
+	})
+
+	t.Run("NoOverrideBlocksLocalRedirect", func(t *testing.T) {
+		_, err := client.Get(redirector.URL, WithTimeout(5*time.Second))
+		if err == nil {
+			t.Fatal("SECURITY ISSUE: Expected redirect to localhost to be blocked without override")
+		}
+		if !strings.Contains(err.Error(), "blocked") && !strings.Contains(err.Error(), "redirect") {
+			t.Errorf("Expected redirect blocking error, got: %v", err)
+		}
+	})
 }
 
 // ============================================================================
