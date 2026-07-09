@@ -152,11 +152,19 @@ func parseWindowsProxyString(proxyStr string) (*url.URL, error) {
 		}
 	}
 
-	// Simple server:port format
+	// Simple server:port format (possibly with an explicit scheme).
+	// Normalize the bare "socks" scheme to "socks5": net/http's Transport proxy
+	// support recognizes socks5/socks5h but not "socks://", so leaving a value
+	// like "socks://host:1080" unchanged would yield a "socks" scheme the
+	// transport cannot use (silently ignored or a confusing dial error).
+	if after, ok := strings.CutPrefix(proxyStr, "socks://"); ok {
+		proxyStr = "socks5://" + after
+	}
+
 	if !strings.HasPrefix(proxyStr, "http://") &&
 		!strings.HasPrefix(proxyStr, "https://") &&
-		!strings.HasPrefix(proxyStr, "socks://") &&
-		!strings.HasPrefix(proxyStr, "socks5://") {
+		!strings.HasPrefix(proxyStr, "socks5://") &&
+		!strings.HasPrefix(proxyStr, "socks5h://") {
 		proxyStr = "http://" + proxyStr
 	}
 

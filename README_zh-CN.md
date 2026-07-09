@@ -465,6 +465,8 @@ if result.Resumed {
 
 ### 带 Context 的下载
 
+`Download` 直接接收 `context.Context`，因此取消和超时开箱即用 — 无需单独的 "WithContext" 入口：
+
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 defer cancel()
@@ -474,8 +476,10 @@ result, _ := httpc.Download(ctx,
     &httpc.DownloadConfig{FilePath: "downloads/large.zip"},
 )
 
-// 使用下载配置 + Context 完全控制
-result, _ := httpc.Download(ctx, url, opts)
+// 完全控制：下载配置 + Context + 请求选项
+result, _ := httpc.Download(ctx, url, opts,
+    httpc.WithBearerToken("your-token"),
+)
 ```
 
 ### DownloadConfig 字段
@@ -1189,7 +1193,15 @@ func (m *MockClient) Get(url string, options ...httpc.RequestOption) (*httpc.Res
 
 ### 示例代码
 
-19 个可运行的示例覆盖所有功能，按从基础到高级排序。
+21 个可运行的示例覆盖所有功能，按从基础到高级排序。
+每个示例都是独立的 `package main`，并带有 `//go:build examples` 构建标签（因此不会进入常规构建），需逐个运行：
+
+```bash
+go run examples/01_basic_usage.go
+```
+
+> 调用真实端点（`httpbin.org`、`example.com`）的示例需要网络访问。
+> 证书固定和 SSRF 防护示例是自包含的 — 被拒绝*正是*防护按预期工作的体现。
 
 | 类别 | 示例 |
 |------|------|
@@ -1197,6 +1209,7 @@ func (m *MockClient) Get(url string, options ...httpc.RequestOption) (*httpc.Res
 | **核心功能** | [05_request_options](examples/05_request_options.go), [06_error_handling](examples/06_error_handling.go), [07_timeout_retry](examples/07_timeout_retry.go), [08_client_configuration](examples/08_client_configuration.go), [09_redirects](examples/09_redirects.go), [10_cookies_advanced](examples/10_cookies_advanced.go) |
 | **有状态客户端** | [11_session](examples/11_session.go), [12_domain_client](examples/12_domain_client.go), [13_proxy_configuration](examples/13_proxy_configuration.go), [14_doh](examples/14_doh.go) |
 | **高级** | [15_middleware](examples/15_middleware.go), [16_concurrent_requests](examples/16_concurrent_requests.go), [17_file_operations](examples/17_file_operations.go), [18_rest_api_client](examples/18_rest_api_client.go), [19_advanced_patterns](examples/19_advanced_patterns.go) |
+| **安全** | [20_certificate_pinning](examples/20_certificate_pinning.go), [21_ssrf_protection](examples/21_ssrf_protection.go) |
 
 ---
 

@@ -300,15 +300,26 @@ func (r *DoHResolver) lookupWithProvider(ctx context.Context, provider *DoHProvi
 	chA := make(chan lookupResult, 1)
 	chAAAA := make(chan lookupResult, 1)
 
+	// lookup runs a single record-type query in a panic-guarded goroutine.
+	// recover does not cross goroutine boundaries: an unguarded panic inside
+	// lookupRecordType would terminate the whole process, bypassing the
+	// request-path safety nets. Convert any panic into a lookup error so the
+	// caller's fallback path (r.fallbackLookup) still runs. Each goroutine
+	// sends exactly once on a capacity-1 channel, so the recover's send cannot
+	// block or race with the normal send.
+	lookup := func(recordType string, ch chan<- lookupResult) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				ch <- lookupResult{err: fmt.Errorf("doh %s lookup panic recovered: %v", recordType, rec)}
+			}
+		}()
+		ips, err := r.lookupRecordType(ctx, provider, escapedHost, recordType)
+		ch <- lookupResult{ips: ips, err: err}
+	}
+
 	// Query A and AAAA records concurrently
-	go func() {
-		ips, err := r.lookupRecordType(ctx, provider, escapedHost, "A")
-		chA <- lookupResult{ips: ips, err: err}
-	}()
-	go func() {
-		ips, err := r.lookupRecordType(ctx, provider, escapedHost, "AAAA")
-		chAAAA <- lookupResult{ips: ips, err: err}
-	}()
+	go lookup("A", chA)
+	go lookup("AAAA", chAAAA)
 
 	resA := <-chA
 	resAAAA := <-chAAAA
@@ -380,11 +391,21 @@ func (r *DoHResolver) lookupRecordType(ctx context.Context, provider *DoHProvide
 		return nil, fmt.Errorf("DoH request returned status %d", resp.StatusCode)
 	}
 
-	return r.parseResponse(resp, provider, escapedHost)
+	return r.parseResponse(resp, escapedHost)
 }
 
-// parseResponse parses DoH response with size limits to prevent memory exhaustion
-func (r *DoHResolver) parseResponse(resp *http.Response, provider *DoHProvider, host string) ([]net.IPAddr, error) {
+// parseResponse parses DoH response with size limits to prevent memory exhaustion.
+//
+// The parser is selected by the response Content-Type, not by provider name. Every
+// request sends "Accept: application/dns-json", but a provider may answer with
+// JSON (application/dns-json / application/json) or DNS wire format
+// (application/dns-message / application/dns-wire). Name-based dispatch was
+// fragile: a custom provider named like a built-in, or a built-in serving an
+// unexpected content type, would hit the wrong parser (e.g. Cloudflare forced to
+// wire format even when it served JSON for the requested Accept header). When the
+// Content-Type is missing or unrecognized we try JSON (matching the Accept header)
+// and fall back to wire format, so a misconfigured server still resolves.
+func (r *DoHResolver) parseResponse(resp *http.Response, host string) ([]net.IPAddr, error) {
 	// SECURITY: Limit response body size to prevent memory exhaustion attacks
 	limitedReader := io.LimitReader(resp.Body, maxDoHResponseSize+1)
 	body, err := io.ReadAll(limitedReader)
@@ -397,24 +418,29 @@ func (r *DoHResolver) parseResponse(resp *http.Response, provider *DoHProvider, 
 		return nil, fmt.Errorf("DoH response exceeds maximum size limit (%d bytes)", maxDoHResponseSize)
 	}
 
-	// Check response type
-	contentType := resp.Header.Get("Content-Type")
-
-	switch provider.Name {
-	case "google", "ali":
-		if contentType == "application/dns-json" || contentType == "application/json" {
-			return r.parseJSONResponse(body, host)
-		}
-		return r.parseWireFormatResponse(body, host)
-	case "cloudflare":
-		return r.parseWireFormatResponse(body, host)
-	default:
-		// Try JSON first, then wire format
-		if contentType == "application/dns-json" || contentType == "application/json" {
-			return r.parseJSONResponse(body, host)
-		}
+	switch dohMediaType(resp.Header.Get("Content-Type")) {
+	case "application/dns-json", "application/json":
+		return r.parseJSONResponse(body, host)
+	case "application/dns-message", "application/dns-wire":
 		return r.parseWireFormatResponse(body, host)
 	}
+
+	// Unknown or missing Content-Type: try JSON (matches the Accept header we
+	// sent) and fall back to wire format so a misconfigured server still resolves.
+	if ips, jsonErr := r.parseJSONResponse(body, host); jsonErr == nil {
+		return ips, nil
+	}
+	return r.parseWireFormatResponse(body, host)
+}
+
+// dohMediaType extracts the media type from a Content-Type header value,
+// lowercased and stripped of parameters (e.g. "application/json; charset=utf-8"
+// becomes "application/json"). Returns "" for an empty/blank value.
+func dohMediaType(contentType string) string {
+	if i := strings.IndexByte(contentType, ';'); i >= 0 {
+		contentType = contentType[:i]
+	}
+	return strings.ToLower(strings.TrimSpace(contentType))
 }
 
 // parseJSONResponse parses JSON DoH response (Google and AliDNS format)

@@ -214,10 +214,53 @@ func QueryEscape(s string) string {
 	return result
 }
 
+// appendQueryEscape appends the URL-query-escaped form of s directly to b.
+// Writing straight into the builder avoids the intermediate escaped string
+// allocation that b.WriteString(QueryEscape(s)) would incur whenever s
+// contains characters that need escaping. Inputs with no escapable bytes are
+// written verbatim after a single scan. Mirrors QueryEscape's semantics
+// (RFC 3986 unreserved set) and large-input safety fallback.
+func appendQueryEscape(b *strings.Builder, s string) {
+	// SECURITY: delegate very large inputs to the standard library to avoid the
+	// per-byte loop cost and keep parity with QueryEscape's overflow guard.
+	if len(s) > maxQueryEscapeSize {
+		b.WriteString(url.QueryEscape(s))
+		return
+	}
+
+	// Fast scan: locate the first byte that needs escaping.
+	firstEscape := -1
+	for i := 0; i < len(s); i++ {
+		if shouldEscape(s[i]) {
+			firstEscape = i
+			break
+		}
+	}
+	if firstEscape < 0 {
+		b.WriteString(s) // nothing to escape — single bulk write
+		return
+	}
+
+	// Slow path: write the leading verbatim run, then escape the remainder.
+	b.WriteString(s[:firstEscape])
+	const hex = "0123456789ABCDEF"
+	for i := firstEscape; i < len(s); i++ {
+		c := s[i]
+		if !shouldEscape(c) {
+			b.WriteByte(c)
+			continue
+		}
+		b.WriteByte('%')
+		b.WriteByte(hex[c>>4])
+		b.WriteByte(hex[c&0x0F])
+	}
+}
+
 // appendQueryParams appends query parameters to an existing raw query string.
 // This is more efficient than creating url.Values when you have an existing query.
-// Optimized to write numeric values directly via strconv.Append* to avoid
-// intermediate string allocations that FormatQueryParam would incur.
+// Optimized to write numeric values directly via strconv.Append* and to escape
+// string keys/values straight into the builder (appendQueryEscape), avoiding the
+// intermediate string allocations that QueryEscape would incur.
 func appendQueryParams(existingQuery string, params map[string]any) string {
 	if len(params) == 0 {
 		return existingQuery
@@ -243,7 +286,7 @@ func appendQueryParams(existingQuery string, params map[string]any) string {
 		} else {
 			sb.WriteByte('&')
 		}
-		sb.WriteString(QueryEscape(key))
+		appendQueryEscape(sb, key)
 		sb.WriteByte('=')
 
 		writeQueryParamValue(sb, value, numBuf[:0])
@@ -256,12 +299,18 @@ func appendQueryParams(existingQuery string, params map[string]any) string {
 
 // writeQueryParamValue appends a query parameter value to sb.
 // Numeric and bool values are written directly via strconv.Append*
-// to avoid intermediate string allocations. Strings are URL-escaped.
+// to avoid intermediate string allocations. Strings are URL-escaped straight
+// into the builder via appendQueryEscape.
+// nil emits nothing, matching FormatQueryParam (which formats nil as "");
+// without this guard the default %v branch would render the literal "<nil>".
 func writeQueryParamValue(sb *strings.Builder, value any, numBuf []byte) {
+	if value == nil {
+		return
+	}
 	switch v := value.(type) {
 	case string:
 		if v != "" {
-			sb.WriteString(QueryEscape(v))
+			appendQueryEscape(sb, v)
 		}
 	case int:
 		sb.Write(strconv.AppendInt(numBuf, int64(v), 10))
@@ -288,10 +337,10 @@ func writeQueryParamValue(sb *strings.Builder, value any, numBuf []byte) {
 	default:
 		if s, ok := value.(fmt.Stringer); ok {
 			if strValue := s.String(); strValue != "" {
-				sb.WriteString(QueryEscape(strValue))
+				appendQueryEscape(sb, strValue)
 			}
 		} else if strValue := fmt.Sprintf("%v", value); strValue != "" {
-			sb.WriteString(QueryEscape(strValue))
+			appendQueryEscape(sb, strValue)
 		}
 	}
 }

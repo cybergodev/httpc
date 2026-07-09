@@ -1043,9 +1043,10 @@ func TestGetSystemPaths_TableDriven(t *testing.T) {
 		t.Error("getSystemPaths() should return at least one path")
 	}
 
-	// Verify all paths end with separator
+	// Verify all paths end with separator (Windows env-var patterns like
+	// "${SystemRoot}" are exempt — they are expanded at check time).
 	for _, p := range paths {
-		if !(strings.HasPrefix(p, "%") && strings.HasSuffix(p, "%")) && !strings.HasSuffix(p, "/") && !strings.HasSuffix(p, "\\") {
+		if !(strings.HasPrefix(p, "${") && strings.HasSuffix(p, "}")) && !strings.HasSuffix(p, "/") && !strings.HasSuffix(p, "\\") {
 			t.Errorf("system path %q should end with separator", p)
 		}
 	}
@@ -1114,4 +1115,118 @@ func TestCheckParentDirSymlinks_BoundaryConditions(t *testing.T) {
 			t.Errorf("error should mention system path, got: %v", err)
 		}
 	})
+}
+
+// ----------------------------------------------------------------------------
+// writeDownloadBody error paths and checksum/progress coverage (FIX-001)
+//
+// isSystemPath's env-var expansion branch (download.go:671-679) runs on Windows
+// only, expanding the ${SystemRoot}/${windir}/${ProgramFiles} patterns at check
+// time. It is platform-gated and cannot run on this (non-Windows) host, so it is
+// not exercised here. The non-Windows path-normalization branch (:660) is
+// likewise platform-gated.
+// ----------------------------------------------------------------------------
+
+// helloSHA256 is the SHA-256 of the literal "hello", used for checksum tests.
+const helloSHA256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+
+func TestWriteDownloadBody_UnsupportedChecksumAlgorithm(t *testing.T) {
+	// A bad algorithm must be rejected BEFORE the destination file is touched
+	// (the SEC guard at download.go:343 — a config error must not O_TRUNC a file).
+	dest := filepath.Join(t.TempDir(), "should_not_exist")
+	opts := &DownloadConfig{
+		FilePath:          dest,
+		Checksum:          "deadbeef",
+		ChecksumAlgorithm: "md5", // unsupported
+	}
+
+	_, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, false, 0, 200, 5, time.Now(), nil)
+	if err == nil || !strings.Contains(err.Error(), "unsupported checksum algorithm") {
+		t.Fatalf("expected unsupported-algorithm error, got %v", err)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Errorf("destination must not be created on bad algorithm; statErr=%v", statErr)
+	}
+}
+
+func TestWriteDownloadBody_OpenFileFailure(t *testing.T) {
+	// Passing a directory as FilePath makes OpenFile fail (cannot open a dir for writing).
+	dir := t.TempDir()
+	opts := &DownloadConfig{FilePath: dir, ChecksumAlgorithm: ChecksumSHA256}
+
+	_, err := writeDownloadBody(strings.NewReader("hello"), dir, opts, false, 0, 200, 5, time.Now(), nil)
+	if err == nil || !strings.Contains(err.Error(), "failed to open file") {
+		t.Errorf("expected 'failed to open file' error, got %v", err)
+	}
+}
+
+func TestWriteDownloadBody_ChecksumMatch(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "out.bin")
+	opts := &DownloadConfig{
+		FilePath:          dest,
+		Checksum:          helloSHA256,
+		ChecksumAlgorithm: ChecksumSHA256,
+	}
+
+	res, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, false, 0, 200, 5, time.Now(), nil)
+	if err != nil {
+		t.Fatalf("expected success on matching checksum, got %v", err)
+	}
+	if res.BytesWritten != 5 {
+		t.Errorf("expected 5 bytes written, got %d", res.BytesWritten)
+	}
+	got, readErr := os.ReadFile(dest)
+	if readErr != nil {
+		t.Fatalf("dest not readable: %v", readErr)
+	}
+	if string(got) != "hello" {
+		t.Errorf("dest content = %q, want %q", got, "hello")
+	}
+}
+
+func TestWriteDownloadBody_ChecksumMismatchRemovesFile(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "corrupt.bin")
+	opts := &DownloadConfig{
+		FilePath:          dest,
+		Checksum:          "00", // intentionally wrong
+		ChecksumAlgorithm: ChecksumSHA256,
+	}
+
+	_, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, false, 0, 200, 5, time.Now(), nil)
+	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("expected checksum mismatch error, got %v", err)
+	}
+	// A mismatched checksum must remove the corrupted download.
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Errorf("corrupted file must be removed; statErr=%v", statErr)
+	}
+}
+
+func TestWriteDownloadBody_ProgressCallback(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "prog.bin")
+	var lastDownloaded, lastTotal int64
+	var callbackInvoked bool
+	opts := &DownloadConfig{
+		FilePath: dest,
+		ProgressCallback: func(downloaded, total int64, speed float64) {
+			lastDownloaded = downloaded
+			lastTotal = total
+			callbackInvoked = true
+		},
+		ChecksumAlgorithm: ChecksumSHA256,
+	}
+
+	res, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, false, 0, 200, 5, time.Now(), nil)
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if !callbackInvoked {
+		t.Error("progress callback was not invoked")
+	}
+	if lastDownloaded != 5 || lastTotal != 5 {
+		t.Errorf("final progress = (%d/%d), want (5/5)", lastDownloaded, lastTotal)
+	}
+	if res.BytesWritten != 5 {
+		t.Errorf("expected 5 bytes written, got %d", res.BytesWritten)
+	}
 }

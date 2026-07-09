@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -643,6 +644,25 @@ func TestParseRetryAfterHeader(t *testing.T) {
 				t.Errorf("Expected delay around 30s for RFC1123Z, got %v", delay)
 			}
 		})
+
+		// Cap branches: a future date beyond maxRetryAfterDelay (60s) must be
+		// capped at exactly 60s in both supported date formats
+		// (retry.go:89-91 RFC1123, :99-101 RFC1123Z).
+		t.Run("RFC1123 future date capped at 60s", func(t *testing.T) {
+			farFuture := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC1123)
+			delay := parseRetryAfterHeader(http.Header{"Retry-After": {farFuture}})
+			if delay != 60*time.Second {
+				t.Errorf("RFC1123 far-future date: expected 60s cap, got %v", delay)
+			}
+		})
+
+		t.Run("RFC1123Z future date capped at 60s", func(t *testing.T) {
+			farFuture := time.Now().Add(1 * time.Hour).UTC().Format(time.RFC1123Z)
+			delay := parseRetryAfterHeader(http.Header{"Retry-After": {farFuture}})
+			if delay != 60*time.Second {
+				t.Errorf("RFC1123Z far-future date: expected 60s cap, got %v", delay)
+			}
+		})
 	})
 }
 
@@ -682,6 +702,159 @@ func TestRetryEngine_GetDelayWithResponse(t *testing.T) {
 
 		if delay != 200*time.Millisecond {
 			t.Errorf("Expected 200ms exponential delay, got %v", delay)
+		}
+	})
+}
+
+// retryableTimeoutErr is a minimal net.Error used to drive the retry loop:
+// classifyError maps a net.Error with Timeout()==true to ErrorTypeTimeout,
+// which IsRetryable() reports as retryable. fmt.Errorf("connection refused")
+// (used elsewhere) classifies as ErrorTypeNetwork and is NOT retried, so a
+// custom net.Error is required to genuinely exercise the error-retry path.
+type retryableTimeoutErr struct{}
+
+func (retryableTimeoutErr) Error() string   { return "network timeout occurred" }
+func (retryableTimeoutErr) Timeout() bool   { return true }
+func (retryableTimeoutErr) Temporary() bool { return true }
+
+// TestExecuteWithRetry_RetryableErrorExhaustsRetries covers the error branch
+// of executeWithRetry (client.go:775-799): a retryable error is re-attempted
+// until MaxRetries is exhausted. Asserts two transport calls (1 + 1 retry),
+// that the returned error is a *ClientError, and that Attempts==2.
+func TestExecuteWithRetry_RetryableErrorExhaustsRetries(t *testing.T) {
+	mock := newMockTransport(200, "should not be reached")
+	mock.SetError(retryableTimeoutErr{}) // always fails, but is retryable
+
+	config := &Config{
+		Timeout:         30 * time.Second,
+		AllowPrivateIPs: true,
+		MaxRetries:      1,
+		RetryDelay:      time.Millisecond,
+		BackoffFactor:   1.0,
+		UserAgent:       "test/1.0",
+	}
+	client, err := NewClient(config, func(opts *clientOptions) {
+		opts.customTransport = mock
+	})
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	_, err = client.Request(backgroundCtx, "GET", "https://example.com")
+	if err == nil {
+		t.Fatal("expected error after retries exhausted, got nil")
+	}
+	if got := mock.GetCallCount(); got != 2 {
+		t.Errorf("expected 2 transport calls (1 + 1 retry), got %d", got)
+	}
+	var clientErr *ClientError
+	if errors.As(err, &clientErr) {
+		if clientErr.Attempts != 2 {
+			t.Errorf("expected Attempts=2, got %d", clientErr.Attempts)
+		}
+	} else {
+		t.Errorf("expected *ClientError, got %T: %v", err, err)
+	}
+}
+
+// TestExecuteWithRetry_BodyBufferedForRetry covers the io.Reader body-buffering
+// path (client.go:748-768): a streaming (io.Reader) body is read into a []byte
+// once so every retry attempt re-sends the full payload instead of an exhausted
+// reader. Driven by a custom RequestOption that sets the body as a reader, with
+// a retryable error forcing the loop to iterate.
+func TestExecuteWithRetry_BodyBufferedForRetry(t *testing.T) {
+	mock := newMockTransport(200, "should not be reached")
+	mock.SetError(retryableTimeoutErr{}) // retryable → buffer-then-retry path
+
+	config := &Config{
+		Timeout:         30 * time.Second,
+		AllowPrivateIPs: true,
+		MaxRetries:      1,
+		RetryDelay:      time.Millisecond,
+		BackoffFactor:   1.0,
+		UserAgent:       "test/1.0",
+	}
+	client, err := NewClient(config, func(opts *clientOptions) {
+		opts.customTransport = mock
+	})
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	// Custom option sets the body as an io.Reader, triggering the buffering
+	// branch in executeWithRetry.
+	bodyOption := func(r *Request) error {
+		r.SetBody(strings.NewReader("payload-that-must-be-buffered-for-retry"))
+		return nil
+	}
+
+	_, err = client.Request(backgroundCtx, "POST", "https://example.com", bodyOption)
+	if err == nil {
+		t.Fatal("expected error after retries exhausted, got nil")
+	}
+	if got := mock.GetCallCount(); got != 2 {
+		t.Errorf("expected 2 transport calls (buffered body retried), got %d", got)
+	}
+}
+
+// TestSleepWithContext covers the three control-flow branches of
+// sleepWithContext (client.go:640-669): nil context (time.Sleep), timer-fires,
+// and context-cancelled-during-sleep (including the timer-drain sub-branch).
+// sleepWithContext touches only the package-level timerPool, so a zero-value
+// *Client is sufficient and avoids constructing a full transport stack.
+func TestSleepWithContext(t *testing.T) {
+	c := &Client{} // sleepWithContext uses only the timer pool, not client state
+
+	t.Run("nil context sleeps and returns nil", func(t *testing.T) {
+		start := time.Now()
+		//nolint:staticcheck // SA1012: nil ctx is deliberate — covers sleepWithContext:641
+		if err := c.sleepWithContext(nil, 5*time.Millisecond); err != nil {
+			t.Errorf("nil context should return nil, got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed < 4*time.Millisecond {
+			t.Errorf("expected to actually sleep ~5ms, slept %v", elapsed)
+		}
+	})
+
+	t.Run("timer fires returns nil", func(t *testing.T) {
+		if err := c.sleepWithContext(context.Background(), 5*time.Millisecond); err != nil {
+			t.Errorf("expected nil when timer fires, got %v", err)
+		}
+	})
+
+	t.Run("context cancelled during sleep", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		go func() {
+			time.Sleep(2 * time.Millisecond)
+			cancel()
+		}()
+
+		start := time.Now()
+		err := c.sleepWithContext(ctx, 5*time.Second)
+		elapsed := time.Since(start)
+
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("expected context.Canceled, got %v", err)
+		}
+		if elapsed > 1*time.Second {
+			t.Errorf("sleep should return promptly on cancel, took %v", elapsed)
+		}
+	})
+
+	// The timer-drain sub-branch (client.go:658-661) only runs when the timer
+	// has already fired by the time ctx is cancelled — a genuine race. Run many
+	// iterations so both the drain and no-drain sub-branches are exercised
+	// under -race.
+	t.Run("cancel races timer for drain coverage", func(t *testing.T) {
+		for i := 0; i < 50; i++ {
+			ctx, cancel := context.WithCancel(context.Background())
+			go func() {
+				time.Sleep(time.Millisecond)
+				cancel()
+			}()
+			_ = c.sleepWithContext(ctx, 2*time.Millisecond)
 		}
 	})
 }

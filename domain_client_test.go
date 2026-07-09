@@ -1324,6 +1324,77 @@ func TestDomainClient_BuildURL(t *testing.T) {
 		}
 		_ = resp
 	})
+
+	// The following subtests cover buildURL branches left cold by the cases
+	// above: request-path trailing-slash restoration, base+path query merging,
+	// fragment handling, and the invalid-path parse error.
+
+	t.Run("request trailing slash preserved", func(t *testing.T) {
+		var gotPath string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer ts.Close()
+
+		dc2, _ := httpc.NewDomain(ts.URL+"/api", cfg)
+		defer dc2.Close()
+
+		if _, err := dc2.Get("sub/"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotPath != "/api/sub/" {
+			t.Errorf("expected trailing slash restored to %q, got path %q", "/api/sub/", gotPath)
+		}
+	})
+
+	t.Run("base and path query params merged", func(t *testing.T) {
+		var gotQuery string
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotQuery = r.URL.RawQuery
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer ts.Close()
+
+		// Base URL carries its own query; the request adds more. Root base path
+		// keeps the buildURL escape-check dormant so the merge branch is reached.
+		dc2, _ := httpc.NewDomain(ts.URL+"/?a=1", cfg)
+		defer dc2.Close()
+
+		if _, err := dc2.Get("/p?b=2"); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if gotQuery != "a=1&b=2" {
+			t.Errorf("expected merged query %q, got %q", "a=1&b=2", gotQuery)
+		}
+	})
+
+	t.Run("fragment handled without error", func(t *testing.T) {
+		// Fragments are stripped by the HTTP client before sending, so they are
+		// not observable server-side; this case exists to execute buildURL's
+		// fragment branch and confirm no error.
+		dc2, _ := httpc.NewDomain(server.URL+"/api", cfg)
+		defer dc2.Close()
+
+		if _, err := dc2.Get("/v1/users#section"); err != nil {
+			t.Errorf("fragment path should not error: %v", err)
+		}
+	})
+
+	t.Run("invalid path rejected", func(t *testing.T) {
+		dc2, _ := httpc.NewDomain(server.URL+"/api", cfg)
+		defer dc2.Close()
+
+		_, err := dc2.Get("%zz") // invalid percent-encoding -> url.Parse error
+		if err == nil || !strings.Contains(err.Error(), "invalid path") {
+			t.Errorf("expected 'invalid path' error, got %v", err)
+		}
+	})
+
+	// NOTE: buildURL's "preserve base trailing slash when request path is empty"
+	// branch (domain_client.go:293) is intentionally not covered: the path-traversal
+	// escape check at :285 runs first and rejects any non-root base ending in "/"
+	// before :293 can execute, making the branch unreachable in practice.
 }
 func TestDomainClient_NilReceiver(t *testing.T) {
 	var dc *httpc.DomainClient

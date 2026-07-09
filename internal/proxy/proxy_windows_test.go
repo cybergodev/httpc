@@ -85,6 +85,16 @@ func TestParseWindowsProxyString(t *testing.T) {
 			wantErr:  false,
 		},
 		{
+			name:    "bare socks:// normalized to socks5://",
+			input:   "socks://proxy.example.com:1080",
+			wantURL: "socks5://proxy.example.com:1080",
+		},
+		{
+			name:    "socks5h:// preserved",
+			input:   "socks5h://proxy.example.com:1080",
+			wantURL: "socks5h://proxy.example.com:1080",
+		},
+		{
 			name:     "Per-protocol with FTP fallback to HTTP",
 			input:    "ftp=ftp-proxy:2121;http=http-proxy:8888",
 			wantHost: "http-proxy",

@@ -55,7 +55,6 @@ type PoolManager struct {
 	hostCount atomic.Int64
 
 	closed int32
-	mu     sync.RWMutex
 
 	lastEviction int64 // Unix timestamp of last eviction run (atomic)
 }
@@ -112,15 +111,18 @@ type Config struct {
 // SetCertPinner sets the certificate pinner for TLS certificate verification.
 func (c *Config) SetCertPinner(p certPinner) { c.certPinner = p }
 
-// hostStats tracks per-host connection statistics
+// hostStats tracks per-host connection statistics.
+//
+// Only fields that are actually consumed are maintained here. Per-host dial
+// latency and failed-connection counts were previously tracked but never
+// surfaced — GetMetrics reports aggregate pool counters (total/active/
+// rejected), not per-host figures — so they were removed to avoid a
+// per-connection mutex Lock/Unlock and atomic op in the dial hot path.
 type hostStats struct {
-	Host           string
-	ActiveConns    int64
-	TotalConns     int64
-	FailedConns    int64
-	LastUsed       int64      // Unix timestamp
-	AverageLatency int64      // Nanoseconds
-	mu             sync.Mutex // Protects AverageLatency updates
+	Host        string
+	ActiveConns int64
+	TotalConns  int64
+	LastUsed    int64 // Unix timestamp
 }
 
 // metrics provides connection pool performance metrics
@@ -207,15 +209,13 @@ func NewPoolManager(config *Config) (*PoolManager, error) {
 	// 2. System proxy detection (if enabled)
 	// 3. Direct connection (no proxy)
 	if config.ProxyURL != "" {
-		proxyURL, err := url.Parse(config.ProxyURL)
+		// Shared validator (same one ValidateConfig uses): accepts http/https and
+		// socks5/socks5h, and checks the host. Routing through it here — instead of
+		// a local http/https-only check — keeps the pool from rejecting socks5
+		// proxies that the public Config layer already accepted.
+		proxyURL, err := validation.ValidateProxyURL(config.ProxyURL)
 		if err != nil {
-			return nil, fmt.Errorf("invalid proxy URL: %w", err)
-		}
-		if proxyURL.Host == "" {
-			return nil, fmt.Errorf("invalid proxy URL: empty host")
-		}
-		if scheme := proxyURL.Scheme; scheme != "http" && scheme != "https" {
-			return nil, fmt.Errorf("invalid proxy URL scheme %q: must be http or https", scheme)
+			return nil, err
 		}
 		// Proxy URL is explicitly configured by the developer, not user-supplied input.
 		// SSRF validation targets request URLs (attacker-controlled), not developer-chosen
@@ -224,25 +224,36 @@ func NewPoolManager(config *Config) (*PoolManager, error) {
 		pm.proxyAddrs = append(pm.proxyAddrs, proxyURL.Host)
 		transport.Proxy = http.ProxyURL(proxyURL)
 	} else if config.EnableSystemProxy {
-		// No manual proxy, but system proxy detection is enabled
+		// No manual proxy, but system proxy detection is enabled.
 		// Automatically detect system proxy settings (reads from Windows registry,
-		// macOS system settings, environment variables, etc.)
+		// macOS system settings, environment variables, etc.).
 		detector := proxy.NewDetector()
-		if proxyFunc := detector.GetProxyFunc(); proxyFunc != nil {
-			testURL, _ := url.Parse("https://example.com")
-			testReq := &http.Request{URL: testURL}
-			pu, err := proxyFunc(testReq)
-			if err == nil && pu != nil {
-				pm.proxyAddrs = append(pm.proxyAddrs, pu.Host)
-
-				transport.Proxy = proxyFunc
-			} else {
-				transport.Proxy = proxyFunc
+		proxyFunc := detector.GetProxyFunc()
+		if proxyFunc != nil {
+			// The transport consults proxyFunc on every request, but the proxy host
+			// is seeded into proxyAddrs (used to bypass SSRF validation for the proxy
+			// connection itself) only from a one-shot probe at construction time.
+			// Probe both http and https because ProxyFromEnvironment may return a
+			// different proxy per scheme (HTTP_PROXY vs HTTPS_PROXY).
+			//
+			// LIMITATION: if the environment later resolves to a proxy on a
+			// private/loopback address (e.g. 127.0.0.1) that was absent at
+			// construction, SSRF protection may block it because that host is not in
+			// proxyAddrs. For dynamically-changing localhost proxies, set
+			// Connection.ProxyURL explicitly (always exempted) or AllowPrivateIPs.
+			transport.Proxy = proxyFunc
+			for _, scheme := range []string{"http", "https"} {
+				testURL, _ := url.Parse(scheme + "://example.com")
+				if pu, err := proxyFunc(&http.Request{URL: testURL}); err == nil && pu != nil {
+					if !slices.Contains(pm.proxyAddrs, pu.Host) {
+						pm.proxyAddrs = append(pm.proxyAddrs, pu.Host)
+					}
+				}
 			}
 		}
-		// If proxyFunc is nil, transport.Proxy remains nil (direct connection)
+		// If proxyFunc is nil, transport.Proxy remains nil (direct connection).
 	}
-	// If neither condition is met, transport.Proxy remains nil (direct connection)
+	// If neither condition is met, transport.Proxy remains nil (direct connection).
 
 	pm.transport = transport
 	return pm, nil
@@ -271,14 +282,11 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 				return nil, fmt.Errorf("%w (max %d)", ErrPoolExhausted, pm.config.MaxTotalConns)
 			}
 		}
-		startTime := time.Now()
-
 		// Proxy connections bypass SSRF validation and DoH resolution —
 		// the proxy address is explicitly configured by the user.
 		if pm.isProxyAddr(address) {
 			conn, err := dialer.DialContext(ctx, network, address)
-			connTime := time.Since(startTime).Nanoseconds()
-			stats := pm.updateConnectionMetrics(address, connTime, err == nil)
+			stats := pm.updateConnectionMetrics(address, err == nil)
 
 			if err != nil {
 				atomic.AddInt64(&pm.rejectedConns, 1)
@@ -344,10 +352,8 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 			var lastErr error
 			for _, ip := range resolvedIPs {
 				ipAddress := net.JoinHostPort(ip.String(), port)
-				attemptStart := time.Now()
 				conn, err := dialer.DialContext(ctx, network, ipAddress)
-				connTime := time.Since(attemptStart).Nanoseconds()
-				stats := pm.updateConnectionMetrics(address, connTime, err == nil)
+				stats := pm.updateConnectionMetrics(address, err == nil)
 
 				if err == nil {
 					atomic.AddInt64(&pm.activeConns, 1)
@@ -385,8 +391,7 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 		}
 
 		conn, err := dialer.DialContext(ctx, network, address)
-		connTime := time.Since(startTime).Nanoseconds()
-		stats := pm.updateConnectionMetrics(address, connTime, err == nil)
+		stats := pm.updateConnectionMetrics(address, err == nil)
 
 		if err != nil {
 			atomic.AddInt64(&pm.rejectedConns, 1)
@@ -472,7 +477,7 @@ func (pm *PoolManager) createTLSConfig() *tls.Config {
 		tlsConfig := pm.config.TLSConfig.Clone()
 		// Add certificate pinning verification if configured
 		if pm.config.certPinner != nil {
-			tlsConfig.VerifyPeerCertificate = pm.createVerifyPeerCertificate(tlsConfig)
+			tlsConfig.VerifyPeerCertificate = pm.createVerifyPeerCertificate()
 		}
 		return tlsConfig
 	}
@@ -501,28 +506,27 @@ func (pm *PoolManager) createTLSConfig() *tls.Config {
 
 	// Add certificate pinning verification if configured
 	if pm.config.certPinner != nil {
-		tlsConfig.VerifyPeerCertificate = pm.createVerifyPeerCertificate(tlsConfig)
+		tlsConfig.VerifyPeerCertificate = pm.createVerifyPeerCertificate()
 	}
 
 	return tlsConfig
 }
 
-// createVerifyPeerCertificate creates a certificate verification function
-// that combines standard verification with certificate pinning
-func (pm *PoolManager) createVerifyPeerCertificate(tlsConfig *tls.Config) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+// createVerifyPeerCertificate creates a certificate verification callback that
+// enforces certificate pinning on top of Go's standard verification.
+//
+// When InsecureSkipVerify is true, Go skips all chain/hostname validation and
+// invokes this callback with verifiedChains=nil; pinning is then the sole
+// verification gate (rawCerts still carries the server's certificates, so
+// SPKI/hash pinners work). When InsecureSkipVerify is false, Go performs full
+// validation first and this callback adds the pinning check on top. Either way
+// the only failure mode is the pin check, so the callback returns nil after a
+// successful pin.
+func (pm *PoolManager) createVerifyPeerCertificate() func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-		// First, run the pinner verification
 		if err := pm.config.certPinner.VerifyPeerCertificate(rawCerts, verifiedChains); err != nil {
 			return fmt.Errorf("certificate pinning failed: %w", err)
 		}
-
-		// If InsecureSkipVerify is true, we skip standard verification
-		if tlsConfig.InsecureSkipVerify {
-			return nil
-		}
-
-		// Otherwise, standard TLS verification is performed by Go's TLS implementation
-		// This function only adds the pinning check on top of standard verification
 		return nil
 	}
 }
@@ -563,7 +567,7 @@ func (tc *trackedConn) Close() error {
 
 // updateConnectionMetrics efficiently updates per-host connection statistics.
 // Returns the hostStats pointer so callers can capture it for trackedConn.
-func (pm *PoolManager) updateConnectionMetrics(host string, connTime int64, success bool) *hostStats {
+func (pm *PoolManager) updateConnectionMetrics(host string, success bool) *hostStats {
 	// Trigger lazy eviction of stale host entries to prevent unbounded map growth.
 	pm.evictStaleHosts()
 
@@ -573,7 +577,7 @@ func (pm *PoolManager) updateConnectionMetrics(host string, connTime int64, succ
 		if !ok || stats == nil {
 			return nil // Defensive: skip update if type assertion fails
 		}
-		pm.updateHostStats(stats, connTime, success)
+		pm.updateHostStats(stats, success)
 		return stats
 	}
 
@@ -596,29 +600,16 @@ func (pm *PoolManager) updateConnectionMetrics(host string, connTime int64, succ
 		return nil // Defensive: skip update if type assertion fails
 	}
 
-	pm.updateHostStats(stats, connTime, success)
+	pm.updateHostStats(stats, success)
 	return stats
 }
 
 // updateHostStats applies connection metrics to an existing hostStats entry.
-func (pm *PoolManager) updateHostStats(stats *hostStats, connTime int64, success bool) {
+func (pm *PoolManager) updateHostStats(stats *hostStats, success bool) {
 	if success {
 		atomic.AddInt64(&stats.TotalConns, 1)
 		atomic.AddInt64(&stats.ActiveConns, 1)
-
-		// Use mutex for latency update to ensure consistency under high contention
-		stats.mu.Lock()
-		current := stats.AverageLatency
-		if current == 0 {
-			stats.AverageLatency = connTime
-		} else {
-			stats.AverageLatency = (current*9 + connTime) / 10
-		}
-		stats.mu.Unlock()
-	} else {
-		atomic.AddInt64(&stats.FailedConns, 1)
 	}
-
 	atomic.StoreInt64(&stats.LastUsed, time.Now().Unix())
 }
 
@@ -691,9 +682,6 @@ func (pm *PoolManager) Close() error {
 	if !atomic.CompareAndSwapInt32(&pm.closed, 0, 1) {
 		return nil
 	}
-
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
 
 	var closeErr error
 

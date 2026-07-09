@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,12 +27,22 @@ var retryableStatusCodes = map[int]bool{
 	504: true, // Gateway Timeout
 }
 
-// retryableStatusPrefixes are pre-built search strings for fallback status detection.
-// Avoids fmt.Sprintf allocation in isRetryableHTTPStatus fallback path.
-var retryableStatusPrefixes = []string{
-	"HTTP 408", "HTTP 429",
-	"HTTP 500", "HTTP 502", "HTTP 503", "HTTP 504",
-}
+// retryableStatusPrefixes are pre-built search strings for fallback status
+// detection, derived from retryableStatusCodes so the two declarations cannot
+// drift. Sorted for deterministic iteration. Avoids fmt.Sprintf allocation in
+// the isRetryableHTTPStatus fallback path.
+var retryableStatusPrefixes = func() []string {
+	codes := make([]int, 0, len(retryableStatusCodes))
+	for code := range retryableStatusCodes {
+		codes = append(codes, code)
+	}
+	sort.Ints(codes)
+	prefixes := make([]string, len(codes))
+	for i, code := range codes {
+		prefixes[i] = "HTTP " + strconv.Itoa(code)
+	}
+	return prefixes
+}()
 
 // ErrorType represents the classification of an HTTP client error.
 type ErrorType int

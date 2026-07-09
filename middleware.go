@@ -213,6 +213,14 @@ func RequestIDMiddleware(headerName string, generator func() string) MiddlewareF
 // TimeoutMiddleware creates a middleware that enforces a maximum duration for requests.
 // If the request exceeds the timeout, the context is canceled and an error is returned.
 // This timeout applies at the middleware level, before the client's built-in timeout.
+//
+// Caveat — streaming and Download: this middleware cancels its derived context as soon
+// as the handler returns (defer cancel()), which for Download happens once the response
+// headers have been received but before the body stream is consumed. The cancel therefore
+// fires immediately on the first byte of the body, surfacing as a "context canceled"
+// error long before the requested timeout elapses. Do NOT wrap Download (or any
+// WithStreamBody request) with TimeoutMiddleware; use WithTimeout instead, whose deadline
+// is applied on the engine's overall context and survives the body read.
 func TimeoutMiddleware(timeout time.Duration) MiddlewareFunc {
 	return func(next Handler) Handler {
 		return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {

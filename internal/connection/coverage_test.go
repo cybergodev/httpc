@@ -12,74 +12,24 @@ import (
 	"time"
 )
 
-// TestUpdateConnectionMetrics verifies per-host connection statistics tracking
-// including baseline latency, weighted moving average, and failure counting.
+// TestUpdateConnectionMetrics verifies per-host connection statistics tracking.
+// Successful dials increment TotalConns/ActiveConns, and every update records
+// the host. (Per-host latency and failed-connection counts were removed —
+// GetMetrics reports aggregate pool counters instead — so the weighted-average
+// and FailedConns assertions were retired with them.)
 func TestUpdateConnectionMetrics(t *testing.T) {
 	tests := []struct {
-		name    string
-		updates []struct {
-			host     string
-			connTime int64
-			success  bool
-		}
+		name            string
+		host            string
+		successes       int
+		recordFailure   bool // additionally record one failed update
 		wantTotalConns  int64
-		wantFailedConns int64
-		wantAvgLatency  int64
+		wantActiveConns int64
 	}{
-		{
-			name: "First connection sets baseline latency",
-			updates: []struct {
-				host     string
-				connTime int64
-				success  bool
-			}{
-				{host: "api.example.com", connTime: 100, success: true},
-			},
-			wantTotalConns:  1,
-			wantFailedConns: 0,
-			wantAvgLatency:  100,
-		},
-		{
-			name: "Second connection applies weighted average",
-			updates: []struct {
-				host     string
-				connTime int64
-				success  bool
-			}{
-				{host: "api.example.com", connTime: 1000, success: true},
-				{host: "api.example.com", connTime: 1000, success: true},
-			},
-			wantTotalConns:  2,
-			wantFailedConns: 0,
-			wantAvgLatency:  (1000*9 + 1000) / 10, // (9000+1000)/10 = 1000
-		},
-		{
-			name: "Failed connection increments FailedConns only",
-			updates: []struct {
-				host     string
-				connTime int64
-				success  bool
-			}{
-				{host: "fail.example.com", connTime: 0, success: false},
-			},
-			wantTotalConns:  0,
-			wantFailedConns: 1,
-			wantAvgLatency:  0,
-		},
-		{
-			name: "Mixed success and failure on same host",
-			updates: []struct {
-				host     string
-				connTime int64
-				success  bool
-			}{
-				{host: "mixed.example.com", connTime: 500, success: true},
-				{host: "mixed.example.com", connTime: 0, success: false},
-			},
-			wantTotalConns:  1,
-			wantFailedConns: 1,
-			wantAvgLatency:  500,
-		},
+		{name: "single success", host: "api.example.com", successes: 1, wantTotalConns: 1, wantActiveConns: 1},
+		{name: "repeated success", host: "api.example.com", successes: 3, wantTotalConns: 3, wantActiveConns: 3},
+		{name: "failed only tracks host without counting", host: "fail.example.com", recordFailure: true, wantTotalConns: 0, wantActiveConns: 0},
+		{name: "mixed success and failure", host: "mixed.example.com", successes: 1, recordFailure: true, wantTotalConns: 1, wantActiveConns: 1},
 	}
 
 	for _, tt := range tests {
@@ -90,65 +40,28 @@ func TestUpdateConnectionMetrics(t *testing.T) {
 			}
 			defer func() { _ = pm.Close() }()
 
-			var lastStats *hostStats
-			for _, u := range tt.updates {
-				lastStats = pm.updateConnectionMetrics(u.host, u.connTime, u.success)
+			var stats *hostStats
+			for i := 0; i < tt.successes; i++ {
+				stats = pm.updateConnectionMetrics(tt.host, true)
+			}
+			if tt.recordFailure {
+				stats = pm.updateConnectionMetrics(tt.host, false)
 			}
 
-			if lastStats == nil {
+			if stats == nil {
 				t.Fatal("updateConnectionMetrics() returned nil stats")
 			}
 
-			if got := atomic.LoadInt64(&lastStats.TotalConns); got != tt.wantTotalConns {
+			if got := atomic.LoadInt64(&stats.TotalConns); got != tt.wantTotalConns {
 				t.Errorf("TotalConns = %d, want %d", got, tt.wantTotalConns)
 			}
-
-			if got := atomic.LoadInt64(&lastStats.FailedConns); got != tt.wantFailedConns {
-				t.Errorf("FailedConns = %d, want %d", got, tt.wantFailedConns)
+			if got := atomic.LoadInt64(&stats.ActiveConns); got != tt.wantActiveConns {
+				t.Errorf("ActiveConns = %d, want %d", got, tt.wantActiveConns)
 			}
-
-			if tt.wantAvgLatency != 0 {
-				lastStats.mu.Lock()
-				got := lastStats.AverageLatency
-				lastStats.mu.Unlock()
-				if got != tt.wantAvgLatency {
-					t.Errorf("AverageLatency = %d, want %d", got, tt.wantAvgLatency)
-				}
+			if _, ok := pm.hostConns.Load(tt.host); !ok {
+				t.Errorf("host %q not tracked after update", tt.host)
 			}
 		})
-	}
-}
-
-// TestUpdateConnectionMetrics_WeightedAverage verifies the (current*9 + new)/10
-// formula applied on successive updates to the same host.
-func TestUpdateConnectionMetrics_WeightedAverage(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	host := "avg.example.com"
-
-	// First update: sets baseline
-	pm.updateConnectionMetrics(host, 100, true)
-
-	// Second update: should compute (100*9 + 200) / 10 = 110
-	pm.updateConnectionMetrics(host, 200, true)
-
-	value, ok := pm.hostConns.Load(host)
-	if !ok {
-		t.Fatal("host entry not found")
-	}
-	stats := value.(*hostStats)
-
-	stats.mu.Lock()
-	got := stats.AverageLatency
-	stats.mu.Unlock()
-
-	want := int64((100*9 + 200) / 10) // 110
-	if got != want {
-		t.Errorf("AverageLatency after second update = %d, want %d", got, want)
 	}
 }
 
@@ -167,7 +80,7 @@ func TestTrackedConn_Lifecycle(t *testing.T) {
 	atomic.StoreInt64(&pm.activeConns, initialActive)
 
 	// Create stats entry for the host
-	stats := pm.updateConnectionMetrics("test.example.com:443", 100, true)
+	stats := pm.updateConnectionMetrics("test.example.com:443", true)
 
 	if stats == nil {
 		t.Fatal("updateConnectionMetrics returned nil stats")
@@ -240,7 +153,7 @@ func TestTrackedConn_ConcurrentClose(t *testing.T) {
 	}
 	defer func() { _ = pm.Close() }()
 
-	stats := pm.updateConnectionMetrics("concurrent.example.com:443", 100, true)
+	stats := pm.updateConnectionMetrics("concurrent.example.com:443", true)
 	atomic.AddInt64(&pm.activeConns, 1)
 
 	server, client := net.Pipe()
@@ -861,7 +774,7 @@ func TestUpdateConnectionMetrics_InvalidType(t *testing.T) {
 
 	pm.hostConns.Store("bad-type.example.com", "not a hostStats")
 
-	result := pm.updateConnectionMetrics("bad-type.example.com", 100, true)
+	result := pm.updateConnectionMetrics("bad-type.example.com", true)
 	if result != nil {
 		t.Errorf("expected nil result for invalid type, got %v", result)
 	}
@@ -879,7 +792,7 @@ func TestUpdateConnectionMetrics_NilValue(t *testing.T) {
 	var nilStats *hostStats = nil
 	pm.hostConns.Store("nil-value.example.com", nilStats)
 
-	result := pm.updateConnectionMetrics("nil-value.example.com", 100, true)
+	result := pm.updateConnectionMetrics("nil-value.example.com", true)
 	if result != nil {
 		t.Errorf("expected nil result for nil value, got %v", result)
 	}

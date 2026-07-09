@@ -619,6 +619,16 @@ func (r *pooledJSONBuffer) release() {
 	jsonBufferWrapperPool.Put(r)
 }
 
+// Pre-canonicalized forms of the header keys set on every request. Computing
+// these once at init time avoids a per-request http.CanonicalHeaderKey
+// allocation (which allocates even for already-canonical input) on the hot
+// path. Keys are stored exactly as http.CanonicalHeaderKey would produce them.
+var (
+	hdrContentType    = http.CanonicalHeaderKey("Content-Type")
+	hdrAcceptEncoding = http.CanonicalHeaderKey("Accept-Encoding")
+	hdrUserAgent      = http.CanonicalHeaderKey("User-Agent")
+)
+
 type requestProcessor struct {
 	config *Config
 }
@@ -784,28 +794,50 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 	// Set Content-Length from known body types
 	p.setContentLength(httpReq, body)
 
-	if contentType != "" && httpReq.Header.Get("Content-Type") == "" {
-		httpReq.Header.Set("Content-Type", contentType)
+	// Header values are stored in http.Header as []string. http.Header.Set
+	// allocates a fresh []string{value} on every call; assigning len-1 windows
+	// into one shared backing slice (headerVals) instead collapses N per-request
+	// allocations down to one. Each entry is a cap-1 slice (headerVals[i:i+1:i+1])
+	// so entries never alias each other, matching Set's single-value semantics.
+	// The backing array is retained with the header map (transferred to the
+	// Result via captureRequestHeaders), exactly as individual slices would be.
+	headerVals := make([]string, 0, 8)
+	// setHeader stores a single-value header. canonKey must already be in
+	// http.CanonicalHeaderKey form. The fixed keys set on every request
+	// (Content-Type / Accept-Encoding / User-Agent) use the pre-canonicalized
+	// package vars above, and config headers canonicalize once per request, so
+	// neither pays the per-call http.CanonicalHeaderKey allocation on the hot
+	// path. Only per-request user headers (req.Headers) still canonicalize,
+	// since their keys are caller-supplied and unbounded.
+	setHeader := func(canonKey, value string) {
+		idx := len(headerVals)
+		headerVals = append(headerVals, value)
+		httpReq.Header[canonKey] = headerVals[idx : idx+1 : idx+1]
+	}
+
+	if contentType != "" && httpReq.Header.Get(hdrContentType) == "" {
+		setHeader(hdrContentType, contentType)
 	}
 
 	for key, value := range p.config.Headers {
-		if httpReq.Header.Get(key) == "" {
-			httpReq.Header.Set(key, value)
+		canonKey := http.CanonicalHeaderKey(key)
+		if httpReq.Header.Get(canonKey) == "" {
+			setHeader(canonKey, value)
 		}
 	}
 
 	for key, value := range req.Headers() {
-		httpReq.Header.Set(key, value)
+		setHeader(http.CanonicalHeaderKey(key), value)
 	}
 
 	// Add Accept-Encoding automatically since DisableCompression is true
 	// and we handle decompression manually. Allows user override via WithHeader.
-	if httpReq.Header.Get("Accept-Encoding") == "" {
-		httpReq.Header.Set("Accept-Encoding", "gzip, deflate")
+	if httpReq.Header.Get(hdrAcceptEncoding) == "" {
+		setHeader(hdrAcceptEncoding, "gzip, deflate")
 	}
 
-	if httpReq.Header.Get("User-Agent") == "" && p.config.UserAgent != "" {
-		httpReq.Header.Set("User-Agent", p.config.UserAgent)
+	if httpReq.Header.Get(hdrUserAgent) == "" && p.config.UserAgent != "" {
+		setHeader(hdrUserAgent, p.config.UserAgent)
 	}
 
 	// Add cookies to the request
@@ -878,7 +910,12 @@ func escapeQuotes(s string) string {
 	}
 
 	result := sb.String()
-	stringBuilderPool.Put(sb)
+	// Discard oversized builders so a malicious multipart filename (user-controlled,
+	// full of escape chars) can't grow the pooled backing array and bloat memory.
+	// Mirrors putQueryBuilder's cap guard.
+	if sb.Cap() <= 4096 {
+		stringBuilderPool.Put(sb)
+	}
 	return result
 }
 

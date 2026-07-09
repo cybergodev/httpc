@@ -1,6 +1,7 @@
 package validation
 
 import (
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -99,35 +100,23 @@ func TestIsPrivateOrReservedIP(t *testing.T) {
 	}
 }
 
-func TestValidateIP(t *testing.T) {
-	tests := []struct {
-		name    string
-		ip      string
-		wantErr bool
-	}{
-		{"public IP no error", "8.8.8.8", false},
-		{"private IP error", "192.168.1.1", true},
-		{"loopback error", "127.0.0.1", true},
-		{"IPv4-mapped private error", "::ffff:192.168.1.1", true},
-		{"IPv6 private error", "fc00::1", true},
-		{"IPv6 link-local error", "fe80::1", true},
+// parseExemptCIDRs is a test-only helper that parses CIDR strings into net.IPNet
+// slices. It mirrors the CIDR parsing performed by the public Config layer
+// (Config.parseSSRFExemptCIDRs) so the validation tests below can build exempt
+// ranges without importing the httpc package.
+func parseExemptCIDRs(cidrs []string) ([]*net.IPNet, error) {
+	if len(cidrs) == 0 {
+		return nil, nil
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			ip := net.ParseIP(tt.ip)
-			if ip == nil {
-				t.Fatalf("Failed to parse IP: %s", tt.ip)
-			}
-			err := ValidateIP(ip)
-			if tt.wantErr && err == nil {
-				t.Errorf("ValidateIP(%s) expected error, got nil", tt.ip)
-			}
-			if !tt.wantErr && err != nil {
-				t.Errorf("ValidateIP(%s) unexpected error: %v", tt.ip, err)
-			}
-		})
+	nets := make([]*net.IPNet, 0, len(cidrs))
+	for _, cidr := range cidrs {
+		_, ipNet, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
+		}
+		nets = append(nets, ipNet)
 	}
+	return nets, nil
 }
 
 func TestIsLocalhost(t *testing.T) {
@@ -507,6 +496,62 @@ func TestValidateAndParseURL_BoundaryConditions(t *testing.T) {
 	}
 }
 
+func TestValidateProxyURL(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		proxyURL    string
+		wantErr     bool
+		errContains string
+		wantScheme  string
+		wantHost    string
+	}{
+		{"empty", "", true, "cannot be empty", "", ""},
+		{"valid http", "http://proxy.example.com:8080", false, "", "http", "proxy.example.com:8080"},
+		{"valid https", "https://proxy.example.com:8443", false, "", "https", "proxy.example.com:8443"},
+		{"valid socks5", "socks5://127.0.0.1:1080", false, "", "socks5", "127.0.0.1:1080"},
+		{"valid socks5h", "socks5h://127.0.0.1:1080", false, "", "socks5h", "127.0.0.1:1080"},
+		// Userinfo is preserved on the parsed URL (used by http.ProxyURL) but is
+		// NOT part of u.Host, so it must not leak into proxyAddrs.
+		{"keeps userinfo out of host", "http://user:pass@proxy.example.com:8080", false, "", "http", "proxy.example.com:8080"},
+		{"missing host", "http://", true, "missing host", "", ""},
+		{"missing scheme", "//proxy.example.com:8080", true, "missing scheme", "", ""},
+		{"bad scheme ftp", "ftp://proxy.com", true, "unsupported proxy URL scheme", "", ""},
+		// socks5 is supported; socks4 is not — guards the accepted scheme set.
+		{"socks4 not supported", "socks4://proxy.com", true, "unsupported proxy URL scheme", "", ""},
+		{"garbage url", "://", true, "invalid proxy URL", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := ValidateProxyURL(tt.proxyURL)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected error, got nil")
+				}
+				if !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("error = %q, want to contain %q", err.Error(), tt.errContains)
+				}
+				if u != nil {
+					t.Errorf("expected nil URL on error, got %+v", u)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if u == nil {
+				t.Fatalf("expected non-nil URL")
+			}
+			if u.Scheme != tt.wantScheme {
+				t.Errorf("scheme = %q, want %q", u.Scheme, tt.wantScheme)
+			}
+			if u.Host != tt.wantHost {
+				t.Errorf("host = %q, want %q", u.Host, tt.wantHost)
+			}
+		})
+	}
+}
+
 func TestValidateSSRFHost_BoundaryConditions(t *testing.T) {
 	t.Parallel()
 	t.Run("host with port", func(t *testing.T) {
@@ -583,6 +628,45 @@ func TestValidateSSRFHost_IPv6WithPort(t *testing.T) {
 			err := ValidateSSRFHost(tt.host, nil, false)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateSSRFHost(%q) err = %v, wantErr %v", tt.host, err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestLooksLikeLegacyIPLiteral exercises the obfuscation vectors that
+// looksLikeLegacyIPLiteral must flag so SSRF protection cannot be bypassed by
+// encoding a private address as a decimal integer, hex, or octal literal.
+func TestLooksLikeLegacyIPLiteral(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		want bool
+	}{
+		// Hex (whole-address or per-octet prefix)
+		{"hex whole address", "0x7f000001", true},
+		{"hex uppercase prefix", "0X7f000001", true},
+		{"hex dotted", "0x7f.0.0.1", true},
+		{"hex per-octet", "192.0x00.0.1", true},
+		// Pure decimal integer (no dots)
+		{"decimal integer localhost", "2130706433", true},
+		{"decimal zero", "0", true},
+		// Octal via leading-zero octets
+		{"octal localhost", "0177.0.0.1", true},
+		{"octal leading octet", "010.0.0.1", true},
+
+		// --- Not legacy literals ---
+		{"empty string", "", false},
+		{"normal dotted decimal", "192.168.1.1", false},
+		{"public dotted decimal", "1.2.3.4", false},
+		{"max dotted decimal", "255.255.255.255", false},
+		{"hostname", "example.com", false},
+		{"single zero octet is not octal", "0.0.0.0", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := looksLikeLegacyIPLiteral(tt.host); got != tt.want {
+				t.Errorf("looksLikeLegacyIPLiteral(%q) = %v, want %v", tt.host, got, tt.want)
 			}
 		})
 	}

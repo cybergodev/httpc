@@ -4,6 +4,51 @@ All notable changes to the cybergodev/httpc library will be documented in this f
 
 ---
 
+## v1.5.3 - Socks5 Proxy Fix, DoH Crash Guard & Performance (2026-07-10)
+
+### Fixed
+- socks5/socks5h proxies now accepted at client creation — the connection pool previously rejected them (http/https only) despite public config validation accepting socks5
+- EnableSystemProxy now seeds SSRF-exempt proxy addresses from both http and https probes instead of https-only
+- WithQuery/WithQueryMap skip nil values at the API layer — WithQuery("k", nil) emits no param instead of "?k=%3Cnil%3E"
+- executeWithRetry releases the discarded retry response before the backoff sleep, freeing the connection slot for the full delay instead of holding it idle
+- Windows system-path env patterns fixed from dead "%VAR%" to live "${VAR}" (os.ExpandEnv only expands $VAR/${VAR}); now also protects non-C-drive installs
+- examples/04_compression.go: removed an os.Exit(1) that terminated the whole program after the first sub-example
+- download.go: response-release defer moved before extractDownloadFields so a panic there can no longer leak the pooled response
+
+### Security
+- DoH resolver A/AAAA lookup goroutines now recover panics into a lookup error — a panic previously bypassed the request-path safety nets and could crash the whole process
+- Validated-URL cache no longer persists URLs with embedded credentials (user:pass@host) — revalidated per call instead of cached for the cache lifetime
+
+### Performance
+- Query-string escaping writes straight into the builder: one-escape values ~-47% time / -50% allocs; BenchmarkMicro_ManyQueryParams 85→80 allocs/op
+- Content-Type/Accept-Encoding/User-Agent pre-canonicalized; per-call http.CanonicalHeaderKey skipped on the hot path
+- requestProcessor.Build batches per-request header value slices into one backing array (allocs/op geomean -3.34% across benchmarks)
+- captureRequestHeaders transfers header ownership to the Result instead of cloning — -1 alloc/op (-4 on the retry path)
+- Removed a dead per-dial mutex Lock/Unlock (latency rolling average) and atomic (failed-conn count) from the connection path
+- Removed dead PoolManager.sync.RWMutex, acquired only in Close() where it protected no field
+
+### Changed
+- WithBody(BodyForm) and WithForm share a single validate-then-encode path (non-breaking; only the WithBody wrong-type error loses a "convert to form data: " text prefix)
+- Manual/system proxy branches consolidated onto a single shared ValidateProxyURL validator so the public Config validator and internal pool cannot drift
+- validateFormInput no longer re-validates the form key once per value (split into validateFormKey + validateFormValue)
+- retryableStatusPrefixes now derived from retryableStatusCodes instead of a hand-maintained parallel slice (prevents silent drift)
+- createVerifyPeerCertificate signature simplified (dead InsecureSkipVerify branch removed); doc clarifies pinning + InsecureSkipVerify semantics
+- resultBuilderPool.Put gated on Cap() <= 4096, matching the form/error builder cap guards
+- mergeNilSubConfigs now copies default sub-configs (fresh headers map) instead of aliasing shared DefaultConfig() pointers
+- TimeoutMiddleware godoc documents the streaming/Download caveat (use WithTimeout for Download)
+- WithMaxRedirects godoc clarifies 0 ≠ disabled (use WithFollowRedirects(false)); redirect-limit and cookie-scrub comments corrected
+
+### Added
+- New examples: certificate pinning (examples/20_certificate_pinning.go) and SSRF protection (examples/21_ssrf_protection.go)
+- Test-suite expansion (FIX-001): table-driven tests across client, domain-client, download, retry, transport-security, pools, request, netutil, decompression; tautological mock self-tests removed
+
+### Removed
+- Unused hostStats latency/failure fields and their mutex (never surfaced in GetMetrics)
+- Unused ValidateIP and parseExemptCIDRs from netutil (referenced only by tests; parseExemptCIDRs relocated as a test helper)
+- Dead cfg.Connection == nil branch in NewDomain (mergeNilSubConfigs already guarantees non-nil)
+
+---
+
 ## v1.5.2 - Per-Request SSRF Override, Panic Safety Net & Deprecated-API Removal (2026-06-15)
 
 ### Breaking

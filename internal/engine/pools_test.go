@@ -159,6 +159,54 @@ func TestWriteQueryParamValue_Types(t *testing.T) {
 	}
 }
 
+// TestWriteQueryParamValue_MatchesQueryEscapeFormatQueryParam is a contract
+// test for the duplicated query-value type switch (code-quality review
+// D-002 / M2).
+//
+// writeQueryParamValue (pools.go) and FormatQueryParam (request.go) format a
+// query value through independent type switches. This test pins their
+// relationship: for every supported type, the bytes written by
+// writeQueryParamValue must equal QueryEscape(FormatQueryParam(v)). Numeric and
+// bool values contain no characters QueryEscape changes, so the escape is a
+// no-op there; strings, fmt.Stringer values, and the default %v path are
+// escaped in both formulations. Adding a type to one switch without the other
+// will fail here.
+//
+// nil is excluded from this table: WithQuery/WithQueryMap skip nil upstream,
+// and both writeQueryParamValue and FormatQueryParam format nil as "" (the
+// former via an early return, the latter via its nil case), so they agree.
+func TestWriteQueryParamValue_MatchesQueryEscapeFormatQueryParam(t *testing.T) {
+	t.Parallel()
+
+	values := []any{
+		"", "hello", "with space", "a&b=c", "ünïcödé",
+		int(42), int(-42), int(0),
+		int64(12345678901234), int64(-1),
+		int32(99), int32(-99),
+		uint(100), uint(0),
+		uint64(18446744073709551615),
+		uint32(4294967295),
+		float64(3.14), float64(-0.5), float64(0),
+		float32(2.5), float32(-2.5),
+		bool(true), bool(false),
+		time.Duration(5 * time.Second),
+		struct{}{},
+	}
+
+	for _, v := range values {
+		var sb strings.Builder
+		var numBuf [32]byte
+		writeQueryParamValue(&sb, v, numBuf[:0])
+		got := sb.String()
+
+		want := QueryEscape(FormatQueryParam(v))
+		if got != want {
+			t.Errorf("writeQueryParamValue(%T %v) = %q, want QueryEscape(FormatQueryParam) = %q",
+				v, v, got, want)
+		}
+	}
+}
+
 func TestGetMIMEHeader_ReuseAndClear(t *testing.T) {
 	t.Parallel()
 
@@ -189,4 +237,84 @@ func TestGetMIMEHeader_ReuseAndClear(t *testing.T) {
 		t.Errorf("expected 1 header after populate, got %d", len(*h2))
 	}
 	putMIMEHeader(h2)
+}
+
+// TestAcquireReleaseRequest_ResetContract validates the pooled-Request reset
+// contract: a fresh request carries the maxRetriesUnset sentinel (so it
+// inherits the client's retry config), and ReleaseRequest resets every field
+// in place so a recycled request does not leak prior-request state.
+func TestAcquireReleaseRequest_ResetContract(t *testing.T) {
+	t.Parallel()
+
+	req := AcquireRequest()
+	if req == nil {
+		t.Fatal("AcquireRequest returned nil")
+	}
+	// Fresh requests must carry the unset sentinel, NOT 0 (which means disabled).
+	if req.maxRetries != maxRetriesUnset {
+		t.Errorf("fresh request maxRetries=%d, want %d (unset sentinel)", req.maxRetries, maxRetriesUnset)
+	}
+
+	// Populate fields, then release.
+	req.SetMethod("POST")
+	req.SetURL("https://example.com/x")
+	req.SetHeader("X-Test", "v")
+	req.SetMaxRetries(5)
+
+	ReleaseRequest(req)
+
+	// ReleaseRequest resets the struct in place via *req = Request{...}.
+	if req.method != "" || req.url != "" || req.maxRetries != maxRetriesUnset {
+		t.Errorf("ReleaseRequest did not reset: method=%q url=%q maxRetries=%d",
+			req.method, req.url, req.maxRetries)
+	}
+	// The headers map must have been returned to its pool (nil after reset).
+	if req.headers != nil {
+		t.Errorf("headers should be nil after reset, got %v", req.headers)
+	}
+}
+
+// TestReleaseRequest_NilIsNoOp confirms ReleaseRequest tolerates nil defensively.
+func TestReleaseRequest_NilIsNoOp(t *testing.T) {
+	t.Parallel()
+	ReleaseRequest(nil) // must not panic
+}
+
+// TestTransferHeaders_OwnershipContract validates the header ownership-transfer
+// contract (client.go:387): TransferHeaders returns the map and severs the
+// Response's reference, so a second call returns nil. This avoids a redundant
+// clone when the public layer takes ownership of response headers.
+func TestTransferHeaders_OwnershipContract(t *testing.T) {
+	t.Parallel()
+	resp := &Response{headers: http.Header{"X-A": []string{"1"}}}
+
+	h := resp.TransferHeaders()
+	if h.Get("X-A") != "1" {
+		t.Errorf("TransferHeaders did not return the header map, got %v", h)
+	}
+	if resp.headers != nil {
+		t.Error("Response.headers should be nil after transfer")
+	}
+	// Second transfer returns nil — ownership already moved.
+	if resp.TransferHeaders() != nil {
+		t.Error("second TransferHeaders should return nil after ownership transfer")
+	}
+}
+
+// TestTransferRequestHeaders_OwnershipContract mirrors the above for request
+// headers (client.go:394).
+func TestTransferRequestHeaders_OwnershipContract(t *testing.T) {
+	t.Parallel()
+	resp := &Response{requestHeaders: http.Header{"Authorization": []string{"Bearer x"}}}
+
+	h := resp.TransferRequestHeaders()
+	if h.Get("Authorization") != "Bearer x" {
+		t.Errorf("TransferRequestHeaders did not return the header map, got %v", h)
+	}
+	if resp.requestHeaders != nil {
+		t.Error("Response.requestHeaders should be nil after transfer")
+	}
+	if resp.TransferRequestHeaders() != nil {
+		t.Error("second TransferRequestHeaders should return nil after ownership transfer")
+	}
 }
