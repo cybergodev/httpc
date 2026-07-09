@@ -81,7 +81,7 @@ func WithBearerToken(token string) RequestOption {
 			return fmt.Errorf("token cannot be empty")
 		}
 		if err := validation.ValidateToken(token); err != nil {
-			return err
+			return fmt.Errorf("invalid token: %w", err)
 		}
 
 		r.SetHeader("Authorization", "Bearer "+token)
@@ -134,7 +134,6 @@ func WithQueryMap(params map[string]any) RequestOption {
 	}
 }
 
-// queryValueLength returns the string length of a formatted query value.
 // queryValueLength returns the formatted length of a query parameter value
 // WITHOUT materializing the formatted string. For numeric and bool types it
 // formats into a stack-allocated buffer (strconv.Append*) and measures the
@@ -260,15 +259,11 @@ func WithBody(data any, kind ...BodyKind) RequestOption {
 			r.SetBody(data)
 			r.SetHeader("Content-Type", "application/xml")
 		case BodyForm:
-			formData, err := convertToForm(data)
-			if err != nil {
-				return fmt.Errorf("convert to form data: %w", err)
-			}
-			if err := validateFormInput(data); err != nil {
+			// Shared validate-then-encode path with WithForm (see applyFormBody),
+			// so both entry points use identical ordering and cannot drift.
+			if err := applyFormBody(r, data); err != nil {
 				return err
 			}
-			r.SetBody(formData)
-			r.SetHeader("Content-Type", "application/x-www-form-urlencoded")
 		case BodyBinary:
 			binaryData, err := convertToBinary(data)
 			if err != nil {
@@ -353,6 +348,25 @@ func convertToForm(data any) (string, error) {
 	}
 }
 
+// applyFormBody validates, URL-encodes, and sets a form body on the request.
+// It is the single shared implementation for the two form-body entry points
+// (WithForm and WithBody(data, BodyForm)). Both now use the same
+// validate-then-encode ordering — validation runs first, so invalid input is
+// rejected before any encoding work — which removes the previous duplication
+// and the inconsistent ordering that existed between the two paths.
+func applyFormBody(r *engine.Request, data any) error {
+	if err := validateFormInput(data); err != nil {
+		return err
+	}
+	encoded, err := convertToForm(data)
+	if err != nil {
+		return err
+	}
+	r.SetBody(encoded)
+	r.SetHeader("Content-Type", "application/x-www-form-urlencoded")
+	return nil
+}
+
 // convertToBinary converts data to []byte for binary body.
 func convertToBinary(data any) ([]byte, error) {
 	switch v := data.(type) {
@@ -419,36 +433,34 @@ func WithForm(data map[string]string) RequestOption {
 		if data == nil {
 			return fmt.Errorf("form data cannot be nil")
 		}
-		if err := validateFormInput(data); err != nil {
-			return err
-		}
-		encoded, err := convertToForm(data)
-		if err != nil {
-			return err
-		}
-		r.SetBody(encoded)
-		r.SetHeader("Content-Type", "application/x-www-form-urlencoded")
-		return nil
+		// Shared validate-then-encode path with WithBody(BodyForm) (see applyFormBody).
+		return applyFormBody(r, data)
 	}
 }
 
-// validateFormField checks form field key and value for control characters
-// and size limits. Less restrictive than header validation — allows
+// validateFormKey checks a form field key (name) for emptiness, length, and
+// control characters. Less restrictive than header validation — allows
 // underscores, dots, brackets, and other characters valid in form field names.
-func validateFormField(key, value string) error {
+func validateFormKey(key string) error {
 	if key == "" {
 		return fmt.Errorf("form field key cannot be empty")
 	}
 	if len(key) > validation.MaxHeaderKeyLen {
 		return fmt.Errorf("form field key too long: %s (max %d)", key, validation.MaxHeaderKeyLen)
 	}
-	if len(value) > validation.MaxValueLen {
-		return fmt.Errorf("form field value too long for key %s (max %d)", key, validation.MaxValueLen)
-	}
 	for i := 0; i < len(key); i++ {
 		if key[i] < 0x20 || key[i] == 0x7F {
 			return fmt.Errorf("form field key %q contains control characters", key)
 		}
+	}
+	return nil
+}
+
+// validateFormValue checks a single form field value for size and control
+// characters. The key is used only for error context.
+func validateFormValue(key, value string) error {
+	if len(value) > validation.MaxValueLen {
+		return fmt.Errorf("form field value too long for key %s (max %d)", key, validation.MaxValueLen)
 	}
 	for i := 0; i < len(value); i++ {
 		if (value[i] < 0x20 && value[i] != 0x09) || value[i] == 0x7F {
@@ -456,6 +468,15 @@ func validateFormField(key, value string) error {
 		}
 	}
 	return nil
+}
+
+// validateFormField checks form field key and value for control characters
+// and size limits. Convenience wrapper around validateFormKey + validateFormValue.
+func validateFormField(key, value string) error {
+	if err := validateFormKey(key); err != nil {
+		return err
+	}
+	return validateFormValue(key, value)
 }
 
 // validateFormInput validates all fields in form input data.
@@ -471,11 +492,13 @@ func validateFormInput(data any) error {
 		}
 	case url.Values:
 		for k, vals := range v {
-			if err := validateFormField(k, ""); err != nil {
+			// Validate the key once (covers the case of a key with no values,
+			// which the per-value loop below would skip).
+			if err := validateFormKey(k); err != nil {
 				return err
 			}
 			for _, val := range vals {
-				if err := validateFormField(k, val); err != nil {
+				if err := validateFormValue(k, val); err != nil {
 					return err
 				}
 			}
@@ -612,8 +635,16 @@ func WithAllowPrivateIPs(allow bool) RequestOption {
 }
 
 // WithStreamBody enables streaming mode where the response body is not buffered
-// into memory. The caller reads the body directly via the engine Response's
-// RawBodyReader. Used internally for file downloads to avoid buffering large files.
+// into memory; the body is read directly via the engine Response's RawBodyReader.
+//
+// IMPORTANT: streaming is only effective through Download (and any other path
+// that consumes the engine Response directly). When used with the standard
+// request methods — Get, Post, Put, Patch, Delete, Head, Options, or Request —
+// the response is converted to a Result whose body is fully read, and the
+// underlying stream is then closed by the deferred response release. The
+// returned Result therefore has an empty body, and the stream cannot be
+// consumed by the caller. To actually stream a large body without buffering,
+// use Download.
 func WithStreamBody(stream bool) RequestOption {
 	return func(r *engine.Request) error {
 		r.SetStreamBody(stream)

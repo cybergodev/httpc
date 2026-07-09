@@ -249,7 +249,9 @@ func (t *transport) checkRedirect(req *http.Request, via []*http.Request) error 
 		}
 	}
 
-	// Check redirect limit (0 means unlimited)
+	// Redirect limit. WithMaxRedirects requires 1..50 and the config default is
+	// 10. maxRedirects == 0 is the "not explicitly set" sentinel and falls
+	// through to the default cap of 10 below — there is no unlimited mode.
 	if settings.maxRedirects > 0 && len(via) >= settings.maxRedirects {
 		return fmt.Errorf("stopped after %d redirects", settings.maxRedirects)
 	}
@@ -386,10 +388,15 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 				for k := range cookieMap {
 					delete(cookieMap, k)
 				}
-				// SECURITY: Clear each populated Cookie's sensitive fields to prevent
-				// cross-request data leakage through pooled memory. The pooled backing
-				// array retains cookie pointers until overwritten, so we must zero
-				// Value/Domain/Path explicitly.
+				// SECURITY: Clear each populated Cookie's sensitive fields so they do
+				// not persist in pooled memory. `populated` is the slice that actually
+				// received the merged cookies: on the common path (merged count <= the
+				// pool slice capacity) it aliases the pooled backing array, so this
+				// fully scrubs it. On the rare reallocation path (count > capacity),
+				// `populated` is a fresh array and the pooled array's pre-reallocation
+				// slots retain their previous pointers until overwritten on the next
+				// reuse; those pointers reference this same request's cookies (request
+				// cookies plus jar cookies for this URL), so the residual is low-impact.
 				for i := range populated {
 					if populated[i] != nil {
 						populated[i].Value = ""
@@ -399,13 +406,14 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 						populated[i].Raw = ""
 					}
 				}
-				// Clear the slice but keep capacity for reuse. *mergedPtr holds the
-				// original pooled backing array (independent of any reallocation that
-				// populated may have triggered); a reallocated array was already
-				// scrubbed above and is left for GC rather than bloating the pool.
+				// Reset the pooled slice header to length 0, keeping its backing
+				// array for reuse. *mergedPtr still references the original pooled
+				// backing array; any reallocated array (the count > capacity path)
+				// was scrubbed above via `populated` and is left for GC rather than
+				// returned to the pool.
 				*mergedPtr = (*mergedPtr)[:0]
 
-				// Return slices to pool (now cleared of sensitive data)
+				// Return the map and slice headers to their pools.
 				cookieMapPool.Put(cookieMapPtr)
 				cookieSlicePool.Put(mergedPtr)
 			}()

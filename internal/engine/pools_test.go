@@ -159,6 +159,54 @@ func TestWriteQueryParamValue_Types(t *testing.T) {
 	}
 }
 
+// TestWriteQueryParamValue_MatchesQueryEscapeFormatQueryParam is a contract
+// test for the duplicated query-value type switch (code-quality review
+// D-002 / M2).
+//
+// writeQueryParamValue (pools.go) and FormatQueryParam (request.go) format a
+// query value through independent type switches. This test pins their
+// relationship: for every supported type, the bytes written by
+// writeQueryParamValue must equal QueryEscape(FormatQueryParam(v)). Numeric and
+// bool values contain no characters QueryEscape changes, so the escape is a
+// no-op there; strings, fmt.Stringer values, and the default %v path are
+// escaped in both formulations. Adding a type to one switch without the other
+// will fail here.
+//
+// nil is excluded: it is filtered upstream (WithQuery/WithQueryMap skip nil
+// values) and the two functions intentionally differ on it (FormatQueryParam
+// returns "", while writeQueryParamValue would render "<nil>").
+func TestWriteQueryParamValue_MatchesQueryEscapeFormatQueryParam(t *testing.T) {
+	t.Parallel()
+
+	values := []any{
+		"", "hello", "with space", "a&b=c", "ünïcödé",
+		int(42), int(-42), int(0),
+		int64(12345678901234), int64(-1),
+		int32(99), int32(-99),
+		uint(100), uint(0),
+		uint64(18446744073709551615),
+		uint32(4294967295),
+		float64(3.14), float64(-0.5), float64(0),
+		float32(2.5), float32(-2.5),
+		bool(true), bool(false),
+		time.Duration(5 * time.Second),
+		struct{}{},
+	}
+
+	for _, v := range values {
+		var sb strings.Builder
+		var numBuf [32]byte
+		writeQueryParamValue(&sb, v, numBuf[:0])
+		got := sb.String()
+
+		want := QueryEscape(FormatQueryParam(v))
+		if got != want {
+			t.Errorf("writeQueryParamValue(%T %v) = %q, want QueryEscape(FormatQueryParam) = %q",
+				v, v, got, want)
+		}
+	}
+}
+
 func TestGetMIMEHeader_ReuseAndClear(t *testing.T) {
 	t.Parallel()
 

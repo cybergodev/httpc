@@ -921,7 +921,7 @@ func TestPoolManager_EvictStaleHosts(t *testing.T) {
 	// Add multiple host entries directly
 	hosts := []string{"host1.example.com", "host2.example.com", "host3.example.com"}
 	for _, host := range hosts {
-		pm.updateConnectionMetrics(host, 100, true)
+		pm.updateConnectionMetrics(host, true)
 	}
 
 	// Verify entries exist
@@ -949,7 +949,7 @@ func TestPoolManager_EvictStaleHosts(t *testing.T) {
 	atomic.StoreInt64(&pm.lastEviction, 0)
 
 	// Trigger eviction via updateConnectionMetrics
-	pm.updateConnectionMetrics("newhost.example.com", 100, true)
+	pm.updateConnectionMetrics("newhost.example.com", true)
 
 	// Stale entries should be evicted, only newhost remains
 	remaining := 0
@@ -981,7 +981,7 @@ func TestPoolManager_EvictStaleHostsPreservesActive(t *testing.T) {
 	atomic.StoreInt64(&pm.lastEviction, 0)
 
 	// Trigger eviction
-	pm.updateConnectionMetrics("trigger.example.com", 100, true)
+	pm.updateConnectionMetrics("trigger.example.com", true)
 
 	// The stale-but-active entry should NOT be evicted
 	_, exists := pm.hostConns.Load("active-stale.example.com")
@@ -1002,7 +1002,7 @@ func TestPoolManager_EvictionThrottling(t *testing.T) {
 
 	// Add many hosts - eviction should be skipped
 	for i := 0; i < 100; i++ {
-		pm.updateConnectionMetrics(fmt.Sprintf("host%d.example.com", i), 100, true)
+		pm.updateConnectionMetrics(fmt.Sprintf("host%d.example.com", i), true)
 	}
 
 	// All 100 hosts should still exist (eviction was throttled)
@@ -1036,9 +1036,11 @@ func TestNewPoolManager_InvalidProxyURL(t *testing.T) {
 		proxy   string
 		wantErr string
 	}{
-		{"empty host", "http://", "empty host"},
-		{"bad scheme", "ftp://proxy.com", "invalid proxy URL scheme"},
+		{"empty host", "http://", "missing host"},
+		{"bad scheme", "ftp://proxy.com", "unsupported proxy URL scheme"},
 		{"invalid URL", "://", "invalid proxy URL"},
+		// socks5 is valid; socks4 is not (regression guard for the scheme set).
+		{"socks4 rejected", "socks4://proxy.com", "unsupported proxy URL scheme"},
 	}
 
 	for _, tc := range tests {

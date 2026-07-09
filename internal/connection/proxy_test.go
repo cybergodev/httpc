@@ -118,6 +118,10 @@ func TestValidProxyURLs(t *testing.T) {
 		"https://proxy.example.com:8443",
 		"http://proxy.example.com:7890",
 		"http://proxy2.example.com:8080",
+		// socks5 is supported natively by net/http.Transport; the pool must not
+		// reject schemes the public Config validator already accepts.
+		"socks5://proxy.example.com:1080",
+		"socks5h://proxy.example.com:1080",
 	}
 
 	for _, validURL := range validURLs {

@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/cookiejar"
-	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -460,19 +459,11 @@ func ValidateConfig(cfg *Config) error {
 			}
 		}
 		if cfg.Connection.ProxyURL != "" {
-			pu, err := url.Parse(cfg.Connection.ProxyURL)
-			if err != nil {
-				return fmt.Errorf("%w: Connection.ProxyURL invalid: %w", ErrInvalidConnection, err)
-			}
-			// Reject malformed proxy URLs early instead of failing deep in the
-			// transport layer with an opaque error.
-			switch pu.Scheme {
-			case "http", "https", "socks5", "socks5h":
-			default:
-				return fmt.Errorf("%w: Connection.ProxyURL unsupported scheme %q (want http, https, socks5, or socks5h)", ErrInvalidConnection, pu.Scheme)
-			}
-			if pu.Host == "" {
-				return fmt.Errorf("%w: Connection.ProxyURL missing host", ErrInvalidConnection)
+			// Delegate to the shared validator so the public Config layer and the
+			// internal connection pool enforce identical rules (scheme set, host
+			// presence). Previously these two layers drifted on socks5.
+			if _, err := validation.ValidateProxyURL(cfg.Connection.ProxyURL); err != nil {
+				return fmt.Errorf("%w: Connection.ProxyURL: %w", ErrInvalidConnection, err)
 			}
 		}
 		if cfg.Connection.DoHCacheTTL < 0 {

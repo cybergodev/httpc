@@ -60,32 +60,6 @@ func isPrivateOrReservedIP(ip net.IP) bool {
 	return false
 }
 
-// ValidateIP checks if an IP is allowed for outbound requests.
-// Returns an error if the IP is blocked by security policy.
-func ValidateIP(ip net.IP) error {
-	if isPrivateOrReservedIP(ip) {
-		return fmt.Errorf("blocked IP address")
-	}
-	return nil
-}
-
-// parseExemptCIDRs parses a list of CIDR strings into net.IPNet slices.
-// Returns nil, nil for empty input.
-func parseExemptCIDRs(cidrs []string) ([]*net.IPNet, error) {
-	if len(cidrs) == 0 {
-		return nil, nil
-	}
-	nets := make([]*net.IPNet, 0, len(cidrs))
-	for _, cidr := range cidrs {
-		_, ipNet, err := net.ParseCIDR(cidr)
-		if err != nil {
-			return nil, fmt.Errorf("invalid CIDR %q: %w", cidr, err)
-		}
-		nets = append(nets, ipNet)
-	}
-	return nets, nil
-}
-
 // isIPExempted checks if an IP address matches any of the exempt CIDR ranges.
 func isIPExempted(ip net.IP, nets []*net.IPNet) bool {
 	for _, n := range nets {
@@ -120,14 +94,17 @@ func FilterAllowedIPs(ips []net.IP, exemptNets []*net.IPNet) []net.IP {
 	return allowed
 }
 
-// isLocalhost detects localhost variations including:
-// - "localhost" (case-insensitive)
-// - 127.0.0.1
-// - ::1
-// - 0.0.0.0
-// - ::
-// - 127.x.x.x range
-// - localhost.* subdomains (case-insensitive)
+// isLocalhost detects localhost variations by hostname string:
+//   - "localhost" (case-insensitive)
+//   - 127.0.0.1, ::1, 0.0.0.0, ::
+//   - the 127.x.x.x range
+//   - "localhost.localdomain" and "localhost.localdomain." (case-insensitive)
+//
+// Arbitrary localhost.* subdomains are intentionally NOT matched here: names
+// such as localhost.example.com may be legitimate public domains. Hosts that
+// resolve to loopback IPs are still blocked at the dialer layer (see
+// ValidateSSRFHost and isPrivateOrReservedIP), so excluding them here only
+// affects this early hostname-string fast path, not overall SSRF protection.
 //
 // Optimized to avoid repeated string allocations from strings.ToLower.
 func isLocalhost(hostname string) bool {
@@ -246,6 +223,44 @@ func ValidateAndParseURL(urlStr string) (*url.URL, error) {
 		return nil, fmt.Errorf("unsupported URL scheme: %s", parsedURL.Scheme)
 	}
 	return parsedURL, nil
+}
+
+// ValidateProxyURL parses and validates a proxy URL string, returning the parsed
+// URL so callers do not need to re-parse.
+//
+// Accepted schemes: http, https, socks5, socks5h. The socks5 schemes are
+// supported natively by net/http.Transport when set via transport.Proxy =
+// http.ProxyURL(u), so they must not be rejected here.
+//
+// This is the single source of truth for proxy URL validation, shared by the
+// public Config validator (ValidateConfig) and the internal connection pool
+// (NewPoolManager). Centralizing it prevents the two layers from drifting —
+// which is what previously let the public layer accept socks5 while the pool
+// rejected it with a different error.
+func ValidateProxyURL(rawURL string) (*url.URL, error) {
+	if rawURL == "" {
+		return nil, fmt.Errorf("proxy URL cannot be empty")
+	}
+
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+	}
+
+	switch u.Scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		if u.Scheme == "" {
+			return nil, fmt.Errorf("invalid proxy URL %q: missing scheme", rawURL)
+		}
+		return nil, fmt.Errorf("unsupported proxy URL scheme %q (want http, https, socks5, or socks5h)", u.Scheme)
+	}
+
+	if u.Host == "" {
+		return nil, fmt.Errorf("invalid proxy URL %q: missing host", rawURL)
+	}
+
+	return u, nil
 }
 
 // ValidateSSRFHost checks whether a hostname (which may include a port) should be

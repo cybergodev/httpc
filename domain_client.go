@@ -68,9 +68,8 @@ func NewDomain(baseURL string, config ...*Config) (DomainClienter, error) {
 	if err != nil {
 		return nil, err
 	}
-	if cfg.Connection == nil {
-		cfg.Connection = &ConnectionConfig{}
-	}
+	// mergeNilSubConfigs (invoked by prepareConfig) guarantees cfg.Connection is
+	// non-nil, so we can enable cookies on it directly.
 	cfg.Connection.EnableCookies = true
 	client, err := newFromPreparedConfig(cfg)
 	if err != nil {
