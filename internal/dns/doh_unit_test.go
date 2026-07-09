@@ -1,10 +1,14 @@
 package dns
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -961,5 +965,119 @@ func TestDoHResolver_CacheFullTriggersEviction(t *testing.T) {
 
 	if size := r.CacheSize(); size != 0 {
 		t.Errorf("expected cache size 0 after all expired, got %d", size)
+	}
+}
+
+// TestDoHResolver_LookupGoroutinePanicRecovered (SEC-003) verifies that a panic
+// inside the concurrent A/AAAA lookup goroutines is recovered and converted into
+// a lookup error instead of crashing the process. recover() does not cross
+// goroutine boundaries, so without the per-goroutine safety net the nil-client
+// dereference triggered here would terminate the whole test binary.
+func TestDoHResolver_LookupGoroutinePanicRecovered(t *testing.T) {
+	// Construct a resolver with a nil HTTP client. lookupRecordType builds a
+	// valid request URL from the template, then dereferences r.client on Do(),
+	// panicking inside the lookup goroutine.
+	r := &DoHResolver{}
+	provider := &DoHProvider{
+		Name:     "test",
+		Template: "https://dns.example.test/resolve?name={name}&type={type}",
+	}
+
+	ips, err := r.lookupWithProvider(context.Background(), provider, "example.com")
+
+	if err == nil {
+		t.Fatal("expected panic-recovered error from lookupWithProvider, got nil")
+	}
+	if !strings.Contains(err.Error(), "panic recovered") {
+		t.Errorf("expected error to mention 'panic recovered', got: %v", err)
+	}
+	if len(ips) != 0 {
+		t.Errorf("expected no IPs on panic, got %d", len(ips))
+	}
+}
+
+// TestDoH_dohMediaType verifies Content-Type media-type extraction strips
+// parameters, trims whitespace, and lowercases.
+func TestDoH_dohMediaType(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"application/dns-json", "application/dns-json"},
+		{"application/json; charset=utf-8", "application/json"},
+		{"  Application/dns-message ", "application/dns-message"},
+		{"", ""},
+		{"text/plain; charset=ascii", "text/plain"},
+	}
+	for _, tt := range tests {
+		if got := dohMediaType(tt.in); got != tt.want {
+			t.Errorf("dohMediaType(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+// TestDoH_parseResponse_DispatchByContentType verifies the parser is selected by
+// the response Content-Type (not provider name) and that a missing/unknown
+// Content-Type falls back to a JSON-then-wire sniff.
+func TestDoH_parseResponse_DispatchByContentType(t *testing.T) {
+	jsonBody := []byte(`{"Status":0,"Answer":[{"name":"example.com","type":1,"data":"1.2.3.4"}]}`)
+	wireBody := buildDNSWireResponse(0x1234, "example.com", []struct {
+		recordType uint16
+		ttl        uint32
+		rdata      []byte
+	}{{recordType: 1, ttl: 60, rdata: []byte{1, 2, 3, 4}}})
+
+	r := &DoHResolver{}
+
+	tests := []struct {
+		name        string
+		contentType string
+		body        []byte
+		wantIP      string
+	}{
+		{"json via application/dns-json", "application/dns-json", jsonBody, "1.2.3.4"},
+		{"json via application/json", "application/json", jsonBody, "1.2.3.4"},
+		{"json with charset param", "application/json; charset=utf-8", jsonBody, "1.2.3.4"},
+		{"wire via application/dns-message", "application/dns-message", wireBody, "1.2.3.4"},
+		{"wire via application/dns-wire", "application/dns-wire", wireBody, "1.2.3.4"},
+		{"missing content-type sniffs json", "", jsonBody, "1.2.3.4"},
+		{"unknown content-type sniffs json", "text/plain", jsonBody, "1.2.3.4"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &http.Response{
+				Header: http.Header{},
+				Body:   io.NopCloser(bytes.NewReader(tt.body)),
+			}
+			resp.Header.Set("Content-Type", tt.contentType)
+			ips, err := r.parseResponse(resp, "example.com")
+			if err != nil {
+				t.Fatalf("parseResponse error: %v", err)
+			}
+			if len(ips) != 1 || ips[0].IP.String() != tt.wantIP {
+				t.Errorf("got %v, want single IP %s", ips, tt.wantIP)
+			}
+		})
+	}
+}
+
+// TestDoH_parseResponse_CloudflareJSONNotForcedToWire is a regression guard: a
+// provider literally named "cloudflare" returning JSON (Content-Type
+// application/dns-json) must be parsed as JSON. The old name-based switch forced
+// cloudflare to wire format regardless of Content-Type, which would mis-parse a
+// JSON response and break DoH.
+func TestDoH_parseResponse_CloudflareJSONNotForcedToWire(t *testing.T) {
+	jsonBody := []byte(`{"Status":0,"Answer":[{"name":"example.com","type":1,"data":"5.6.7.8"}]}`)
+	r := &DoHResolver{}
+	resp := &http.Response{
+		Header: http.Header{},
+		Body:   io.NopCloser(bytes.NewReader(jsonBody)),
+	}
+	resp.Header.Set("Content-Type", "application/dns-json")
+	ips, err := r.parseResponse(resp, "example.com")
+	if err != nil {
+		t.Fatalf("parseResponse error: %v", err)
+	}
+	if len(ips) != 1 || ips[0].IP.String() != "5.6.7.8" {
+		t.Errorf("cloudflare-named JSON response mis-dispatched: got %v, want 5.6.7.8", ips)
 	}
 }

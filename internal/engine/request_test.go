@@ -2,7 +2,9 @@ package engine
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -223,5 +225,146 @@ func TestRequest_Clone(t *testing.T) {
 
 	if original.Headers()["Content-Type"] != "application/json" {
 		t.Error("Original header was modified")
+	}
+}
+
+// TestURLCache_EvictRawIfNeeded covers the raw-cache eviction logic
+// (request.go:278): when the raw map reaches rawCacheMaxSize, entries whose
+// parsed URL no longer appears in the sanitized entries map are removed until
+// the size drops below rawCacheMaxSize/2. A local urlCache is used so the
+// process-wide globalURLCache is untouched.
+func TestURLCache_EvictRawIfNeeded(t *testing.T) {
+	c := &urlCache{
+		raw:     make(map[string]*url.URL, rawCacheMaxSize+1),
+		entries: make(map[string]*url.URL, 1),
+		maxSize: 1024,
+	}
+
+	// One "live" entry: present in both raw and entries (same pointer).
+	liveURL := &url.URL{Path: "/live"}
+	c.entries["sanitized-live"] = liveURL
+	c.raw["http://example.com/0"] = liveURL
+
+	// Fill the rest with "stale" entries whose pointers are NOT in entries,
+	// pushing len(raw) past rawCacheMaxSize so eviction triggers.
+	for i := 1; i <= rawCacheMaxSize; i++ {
+		key := fmt.Sprintf("http://example.com/%d", i)
+		c.raw[key] = &url.URL{Path: fmt.Sprintf("/stale-%d", i)}
+	}
+	if len(c.raw) < rawCacheMaxSize {
+		t.Fatalf("setup error: raw cache not over threshold, len=%d", len(c.raw))
+	}
+
+	c.evictRawIfNeeded()
+
+	// The live entry is always retained (its pointer is found in entries).
+	if _, ok := c.raw["http://example.com/0"]; !ok {
+		t.Error("live entry should be retained after eviction")
+	}
+	// Eviction must have reduced the raw cache below the threshold.
+	if len(c.raw) >= rawCacheMaxSize {
+		t.Errorf("eviction did not reduce raw cache: len=%d (threshold %d)",
+			len(c.raw), rawCacheMaxSize)
+	}
+}
+
+// TestURLCache_EvictRaw_NoopBelowThreshold confirms eviction is a no-op when
+// the raw cache is under rawCacheMaxSize.
+func TestURLCache_EvictRaw_NoopBelowThreshold(t *testing.T) {
+	c := &urlCache{
+		raw:     map[string]*url.URL{"http://example.com/a": {Path: "/a"}},
+		entries: map[string]*url.URL{},
+		maxSize: 1024,
+	}
+	c.evictRawIfNeeded()
+	if len(c.raw) != 1 {
+		t.Errorf("eviction should be a no-op below threshold, got len=%d", len(c.raw))
+	}
+}
+
+// TestURLCache_PopulateRawCache covers the lazy-init (nil raw) branch and the
+// existing-key no-op of populateRawCache (request.go:393).
+func TestURLCache_PopulateRawCache(t *testing.T) {
+	c := &urlCache{
+		entries: make(map[string]*url.URL),
+		keys:    []string{},
+		maxSize: 1024,
+		// raw intentionally nil → exercises the lazy-init branch.
+	}
+	parsed := &url.URL{Path: "/x"}
+	c.populateRawCache("http://example.com/x", parsed)
+	if c.raw == nil || c.raw["http://example.com/x"] != parsed {
+		t.Error("populateRawCache did not lazily init raw and store the entry")
+	}
+	// Re-populating an existing key is a no-op (no duplicate, no eviction).
+	c.populateRawCache("http://example.com/x", parsed)
+	if len(c.raw) != 1 {
+		t.Errorf("duplicate populate should be a no-op, got len=%d", len(c.raw))
+	}
+}
+
+// TestURLCache_EvictOldest covers the entries-LRU eviction (request.go:419):
+// when entries exceed maxSize the oldest key is dropped, its raw entry is
+// cleaned up, and the keys slice is advanced.
+func TestURLCache_EvictOldest(t *testing.T) {
+	oldest := &url.URL{Path: "/oldest"}
+	newest := &url.URL{Path: "/newest"}
+	c := &urlCache{
+		entries: map[string]*url.URL{"k1": oldest, "k2": newest},
+		raw: map[string]*url.URL{
+			"http://example.com/oldest": oldest,
+			"http://example.com/newest": newest,
+		},
+		keys:    []string{"k1", "k2"},
+		maxSize: 1, // tiny so eviction triggers with two entries
+	}
+
+	c.evictOldest()
+
+	if _, ok := c.entries["k1"]; ok {
+		t.Error("oldest entry (k1) should be evicted")
+	}
+	if _, ok := c.entries["k2"]; !ok {
+		t.Error("newest entry (k2) should be retained")
+	}
+	if _, ok := c.raw["http://example.com/oldest"]; ok {
+		t.Error("raw entry for the evicted URL should be removed")
+	}
+	if _, ok := c.raw["http://example.com/newest"]; !ok {
+		t.Error("raw entry for the retained URL should remain")
+	}
+	if len(c.keys) != 1 || c.keys[0] != "k2" {
+		t.Errorf("keys slice should advance to [k2], got %v", c.keys)
+	}
+}
+
+// TestRequest_AccessorRoundTrip locks the round-trip contract of the small
+// Request accessors/mutators that are not exercised elsewhere
+// (SanitizedURL/SetSanitizedURL, EnsureQueryParams lazy-init + identity,
+// SetAllowPrivateIPs). Consolidated into one test to avoid accessor sprawl.
+func TestRequest_AccessorRoundTrip(t *testing.T) {
+	r := &Request{maxRetries: maxRetriesUnset}
+
+	r.SetSanitizedURL("https://sanitized.example.com/x")
+	if r.SanitizedURL() != "https://sanitized.example.com/x" {
+		t.Errorf("SanitizedURL round-trip failed: %q", r.SanitizedURL())
+	}
+
+	// EnsureQueryParams lazily allocates a pooled map and returns the SAME
+	// map on subsequent calls.
+	qp := r.EnsureQueryParams()
+	if qp == nil {
+		t.Fatal("EnsureQueryParams returned nil")
+	}
+	qp["page"] = 1
+	if r.EnsureQueryParams()["page"] != 1 {
+		t.Error("EnsureQueryParams should return the same map instance")
+	}
+
+	// AllowPrivateIPs override round-trips through the *bool pointer.
+	allow := true
+	r.SetAllowPrivateIPs(&allow)
+	if r.AllowPrivateIPs() == nil || *r.AllowPrivateIPs() != true {
+		t.Error("SetAllowPrivateIPs round-trip failed")
 	}
 }

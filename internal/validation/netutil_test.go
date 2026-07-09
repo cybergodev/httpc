@@ -632,3 +632,42 @@ func TestValidateSSRFHost_IPv6WithPort(t *testing.T) {
 		})
 	}
 }
+
+// TestLooksLikeLegacyIPLiteral exercises the obfuscation vectors that
+// looksLikeLegacyIPLiteral must flag so SSRF protection cannot be bypassed by
+// encoding a private address as a decimal integer, hex, or octal literal.
+func TestLooksLikeLegacyIPLiteral(t *testing.T) {
+	tests := []struct {
+		name string
+		host string
+		want bool
+	}{
+		// Hex (whole-address or per-octet prefix)
+		{"hex whole address", "0x7f000001", true},
+		{"hex uppercase prefix", "0X7f000001", true},
+		{"hex dotted", "0x7f.0.0.1", true},
+		{"hex per-octet", "192.0x00.0.1", true},
+		// Pure decimal integer (no dots)
+		{"decimal integer localhost", "2130706433", true},
+		{"decimal zero", "0", true},
+		// Octal via leading-zero octets
+		{"octal localhost", "0177.0.0.1", true},
+		{"octal leading octet", "010.0.0.1", true},
+
+		// --- Not legacy literals ---
+		{"empty string", "", false},
+		{"normal dotted decimal", "192.168.1.1", false},
+		{"public dotted decimal", "1.2.3.4", false},
+		{"max dotted decimal", "255.255.255.255", false},
+		{"hostname", "example.com", false},
+		{"single zero octet is not octal", "0.0.0.0", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := looksLikeLegacyIPLiteral(tt.host); got != tt.want {
+				t.Errorf("looksLikeLegacyIPLiteral(%q) = %v, want %v", tt.host, got, tt.want)
+			}
+		})
+	}
+}

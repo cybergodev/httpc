@@ -1198,7 +1198,17 @@ func (m *MockClient) Get(url string, options ...httpc.RequestOption) (*httpc.Res
 
 ### Example Code
 
-19 runnable examples covering all features, ordered from basic to advanced.
+21 runnable examples covering all features, ordered from basic to advanced.
+Each example is a standalone `package main` guarded by a `//go:build examples`
+tag (so it stays out of the normal build), so run them one at a time:
+
+```bash
+go run examples/01_basic_usage.go
+```
+
+> Examples that call live endpoints (`httpbin.org`, `example.com`) require
+> network access. The certificate-pinning and SSRF-protection examples are
+> self-contained — a rejection *is* the protection working as designed.
 
 | Category | Examples |
 |----------|----------|
@@ -1206,6 +1216,7 @@ func (m *MockClient) Get(url string, options ...httpc.RequestOption) (*httpc.Res
 | **Core Features** | [05_request_options](examples/05_request_options.go), [06_error_handling](examples/06_error_handling.go), [07_timeout_retry](examples/07_timeout_retry.go), [08_client_configuration](examples/08_client_configuration.go), [09_redirects](examples/09_redirects.go), [10_cookies_advanced](examples/10_cookies_advanced.go) |
 | **Stateful Clients** | [11_session](examples/11_session.go), [12_domain_client](examples/12_domain_client.go), [13_proxy_configuration](examples/13_proxy_configuration.go), [14_doh](examples/14_doh.go) |
 | **Advanced** | [15_middleware](examples/15_middleware.go), [16_concurrent_requests](examples/16_concurrent_requests.go), [17_file_operations](examples/17_file_operations.go), [18_rest_api_client](examples/18_rest_api_client.go), [19_advanced_patterns](examples/19_advanced_patterns.go) |
+| **Security** | [20_certificate_pinning](examples/20_certificate_pinning.go), [21_ssrf_protection](examples/21_ssrf_protection.go) |
 
 ---
 

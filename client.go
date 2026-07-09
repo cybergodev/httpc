@@ -261,36 +261,53 @@ func deepCopyConfig(src *Config) *Config {
 	return &dst
 }
 
-// mergeNilSubConfigs fills nil sub-config pointers with defaults from DefaultConfig.
-// This allows callers to partially configure a Config — any nil sub-config gets
-// sensible defaults, while non-nil sub-configs are used as-is.
+// mergeNilSubConfigs fills nil sub-config pointers with copies of the defaults
+// from DefaultConfig. This allows callers to partially configure a Config — any
+// nil sub-config gets sensible defaults, while non-nil sub-configs are used as-is.
+//
+// Each default is copied (not aliased) so the resulting Config owns its sub-configs
+// exclusively, matching the isolation that deepCopyConfig already provides for the
+// non-nil sub-configs. Without this, every client built from a partially-specified
+// Config would share the same DefaultConfig() sub-config pointers.
 func mergeNilSubConfigs(cfg *Config) *Config {
 	def := DefaultConfig()
 	if cfg.Timeouts == nil {
-		cfg.Timeouts = def.Timeouts
+		cp := *def.Timeouts
+		cfg.Timeouts = &cp
 	}
 	if cfg.Connection == nil {
-		cfg.Connection = def.Connection
+		cp := *def.Connection
+		cfg.Connection = &cp
 	}
 	if cfg.Security == nil {
-		cfg.Security = def.Security
+		cp := *def.Security
+		cfg.Security = &cp
 	}
 	if cfg.Retry == nil {
-		cfg.Retry = def.Retry
+		cp := *def.Retry
+		cfg.Retry = &cp
 	}
 	if cfg.Middleware == nil {
-		cfg.Middleware = def.Middleware
+		cp := *def.Middleware
+		// Give each client its own headers map rather than aliasing the default's.
+		cp.Headers = make(map[string]string, len(def.Middleware.Headers))
+		maps.Copy(cp.Headers, def.Middleware.Headers)
+		cfg.Middleware = &cp
 	}
 	return cfg
 }
 
 // buildMiddlewareChain constructs a middleware chain from the provided middlewares.
-// The final handler copies the middleware-modified request fields into a fresh engine
+// The terminal handler copies the middleware-modified request fields into a fresh engine
 // request and executes it. This avoids re-applying user options (double execution) and
-// uses a single option closure to forward all mutable state including callbacks.
+// uses a single option closure to forward all mutable state.
 //
-// Callbacks (OnRequest/OnResponse) are extracted before the chain runs and forwarded
-// via closure, avoiding a direct dependency on the engine.Request concrete type.
+// Callbacks (OnRequest/OnResponse) and the per-request SSRF override (AllowPrivateIPs)
+// live on the concrete *engine.Request, not on the shared RequestMutator interface:
+// their signatures reference *engine.Request/*engine.Response, and surfacing them
+// through internal/types would create an import cycle (engine -> types). The terminal
+// handler therefore reads them via a concrete-type assertion. This is a deliberate,
+// bounded coupling to *engine.Request with a graceful fallback — see finalHandler.
 func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler {
 	finalHandler := func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
 		reqCtx := req.Context()
@@ -298,9 +315,15 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 			reqCtx = ctx
 		}
 
-		// Extract callbacks from the concrete engine.Request before forwarding.
-		// We capture them in the closure so the final handler doesn't need
-		// a type assertion on each invocation — only once at chain entry.
+		// Read the engine-specific hooks (callbacks + per-request SSRF override) from
+		// the concrete *engine.Request. These are not part of RequestMutator (see the
+		// buildMiddlewareChain doc above), so we assert once here and forward the
+		// captured values through the option closure below. Middleware that mutates the
+		// request in place — as all built-in middlewares do — leaves req as an
+		// *engine.Request, so the assertion succeeds and the hooks are forwarded.
+		// Should a middleware replace req with a non-*engine.Request value, the
+		// assertion fails and these hooks are silently skipped; request replacement is
+		// therefore unsupported for callbacks/SSRF-override (mirrors getOrComputeSanitizedURL).
 		var onRequest func(*engine.Request) error
 		var onResponse func(*engine.Response) error
 		var allowPrivateIPs *bool

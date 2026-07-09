@@ -24,6 +24,10 @@ var resultBuilderPool = sync.Pool{
 const (
 	maxBodyPreview   = 200 // Maximum body preview length in String()
 	truncationMarker = "...[truncated]"
+	// maxResultBuilderCap bounds the backing array retained by resultBuilderPool.
+	// Mirrors the cap guards on formBuilderPool / errorBuilderPool so a result
+	// with an unusually large header set cannot bloat the pooled builder.
+	maxResultBuilderCap = 4096
 )
 
 // sensitiveHeaders contains header names that should be masked in String() and audit output.
@@ -333,7 +337,11 @@ func (r *Result) String() string {
 	b.WriteByte('}')
 
 	result := b.String()
-	resultBuilderPool.Put(b)
+	// Guard against retaining an oversized backing array in the pool — matches
+	// the cap guards on formBuilderPool and errorBuilderPool.
+	if b.Cap() <= maxResultBuilderCap {
+		resultBuilderPool.Put(b)
+	}
 	return result
 }
 

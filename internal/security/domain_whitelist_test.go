@@ -91,11 +91,11 @@ func TestDomainWhitelist_IsAllowed(t *testing.T) {
 		{"EXAMPLE.com", true}, // case insensitive
 		{"API.EXAMPLE.COM", true},
 
-		// Wildcard matches
-		{"test.org", true},          // *.test.org matches test.org
+		// Wildcard matches (strict subdomains only — NOT the bare apex)
+		{"test.org", false},         // *.test.org does NOT match apex test.org
 		{"sub.test.org", true},      // *.test.org matches sub.test.org
 		{"deep.sub.test.org", true}, // *.test.org matches deep.sub.test.org
-		{"example.net", true},       // *.example.net matches example.net
+		{"example.net", false},      // *.example.net does NOT match apex example.net
 		{"sub.example.net", true},   // *.example.net matches sub.example.net
 
 		// Non-matches

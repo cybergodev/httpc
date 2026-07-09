@@ -134,8 +134,12 @@ func (v *Validator) validateURL(urlStr string, override *bool) error {
 		return err
 	}
 
-	// Only cache the result when it is stable for this client (no per-request override).
-	if override != nil {
+	// Only cache the result when it is stable for this client: no per-request
+	// override, and no embedded credentials. The cache is keyed by the raw urlStr,
+	// so a URL carrying userinfo (user:pass@host) would persist those credentials
+	// in the validatedURLs map and urlKeys slice; validation depends only on the
+	// host, so credentialed URLs are simply revalidated on each call instead.
+	if override != nil || parsedURL.User != nil {
 		return nil
 	}
 

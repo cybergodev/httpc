@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"os"
 
 	"github.com/cybergodev/httpc"
 )
@@ -49,8 +48,6 @@ func demonstrateGzipDecompression() {
 	body := resp.Body()
 	fmt.Printf("   Decompressed body length: %d bytes\n", len(body))
 	fmt.Printf("   Body preview: %.200s...\n\n", body)
-
-	os.Exit(1)
 }
 
 // demonstrateGzipFromServer shows gzip decompression from another server

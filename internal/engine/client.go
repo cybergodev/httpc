@@ -808,16 +808,24 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 
 			// Check if response status is retryable using policy
 			if policy.ShouldRetry(resp, nil, attempt) && attempt < maxRetries {
-				// Use built-in engine delay for Retry-After header support,
-				// otherwise delegate to the policy's GetDelay
+				// Compute the delay while resp is still valid — the built-in
+				// policy may read a Retry-After header from it.
 				var delay time.Duration
 				if engPolicy, ok := policy.(*retryEngine); ok {
 					delay = engPolicy.GetDelayWithResponse(attempt, resp)
 				} else {
 					delay = policy.GetDelay(attempt)
 				}
+
+				// Release this discarded response now rather than carrying it as
+				// lastResp across the backoff sleep and the next attempt. For a
+				// streaming response the body reader pins a connection until
+				// ReleaseResponse closes it, so releasing before the sleep frees
+				// that slot for the full delay instead of holding it idle.
+				ReleaseResponse(resp)
+				lastResp = nil
+
 				if sleepErr := c.sleepWithContext(req.Context(), delay); sleepErr != nil {
-					releaseLastResp(&lastResp)
 					return nil, classifyErrorWithSanitizedURL(sleepErr, sanitizedURL, reqMethod, attempt+1)
 				}
 				continue
@@ -862,15 +870,28 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 	return nil, fmt.Errorf("request failed after %d attempts", maxRetries+1)
 }
 
-// captureRequestHeaders builds a complete header map from an http.Request.
-// Go's http.Request stores Content-Length and Host as separate struct fields,
-// not in the Header map. This function clones the Header map and enriches it
-// with those fields so callers see the full set of sent headers.
+// captureRequestHeaders builds a complete header map from an http.Request by
+// taking ownership of httpReq.Header and enriching it with Content-Length and
+// Host (which net/http stores as separate Request fields, not in the Header map).
+//
+// Rather than cloning the pooled header map built by requestProcessor.Build, it
+// transfers ownership to the caller (which retains it via the Result). This
+// mirrors the response-header transfer pattern (Response.TransferHeaders) and
+// removes the per-request CloneHeader copy — saving the clone's map allocation,
+// its backing-array allocation, and the value-copy loop.
+//
+// httpReq.Header is set to nil so the caller's deferred putHTTPHeader observes
+// nil at function-exit and skips recycling a map still referenced by the Result.
+// On error paths where this function is never reached, httpReq.Header stays
+// non-nil and is recycled by the deferred putHTTPHeader as before. Consuming one
+// pooled map per success-path request is safe: sync.Pool simply allocates a fresh
+// map on the next get when the pool is empty — no leak, no double-recycle.
 func captureRequestHeaders(httpReq *http.Request) http.Header {
 	if httpReq == nil {
 		return nil
 	}
-	h := CloneHeader(httpReq.Header)
+	h := httpReq.Header
+	httpReq.Header = nil // transfer ownership; deferred putHTTPHeader reads nil and skips
 	if h == nil {
 		h = make(http.Header, 4)
 	}
@@ -1015,7 +1036,11 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 	if err != nil {
 		return nil, classifyErrorWithSanitizedURL(err, sanitizeOnce(), req.Method(), 0)
 	}
-	defer putHTTPHeader(httpReq.Header)
+	// Read httpReq.Header at defer-run time, not at registration: captureRequestHeaders
+	// transfers header ownership to the Result on success and nils the field, so the
+	// closure observes nil and skips recycling. On error paths captureRequestHeaders is
+	// never reached, the field stays non-nil, and the header is recycled normally.
+	defer func() { putHTTPHeader(httpReq.Header) }()
 
 	httpResp, err := c.transport.RoundTrip(httpReq)
 

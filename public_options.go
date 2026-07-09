@@ -98,10 +98,14 @@ func WithQuery(key string, value any) RequestOption {
 			return err
 		}
 
-		if value != nil {
-			if valueLen := queryValueLength(value); valueLen > validation.MaxValueLen {
-				return fmt.Errorf("query value too long (max %d)", validation.MaxValueLen)
-			}
+		// Skip nil values: a nil value emits no parameter, consistent with
+		// engine.FormatQueryParam (which formats nil as ""). Previously nil was
+		// stored raw and later rendered as the literal "<nil>" in the URL.
+		if value == nil {
+			return nil
+		}
+		if valueLen := queryValueLength(value); valueLen > validation.MaxValueLen {
+			return fmt.Errorf("query value too long (max %d)", validation.MaxValueLen)
 		}
 
 		params := r.EnsureQueryParams()
@@ -122,14 +126,16 @@ func WithQueryMap(params map[string]any) RequestOption {
 				return fmt.Errorf("invalid key %s: %w", k, err)
 			}
 
-			if v != nil {
-				if valueLen := queryValueLength(v); valueLen > validation.MaxValueLen {
-					return fmt.Errorf("query value too long for key %s (max %d)", k, validation.MaxValueLen)
-				}
+			// Skip nil values (see WithQuery): a nil value emits no parameter
+			// rather than rendering as the literal "<nil>".
+			if v == nil {
+				continue
+			}
+			if valueLen := queryValueLength(v); valueLen > validation.MaxValueLen {
+				return fmt.Errorf("query value too long for key %s (max %d)", k, validation.MaxValueLen)
 			}
 			existing[k] = v
 		}
-		r.SetQueryParams(existing)
 		return nil
 	}
 }
@@ -413,7 +419,13 @@ func setAutoDetectedBody(r *engine.Request, data any) (string, error) {
 		if v == nil {
 			return "", fmt.Errorf("form data cannot be nil")
 		}
-		r.SetBody(encodeFormFields(v))
+		// Reuse the shared validate-then-encode path (applyFormBody) so the
+		// auto-detected form body gets the same field validation as WithForm /
+		// WithBody(BodyForm). Previously this branch called encodeFormFields
+		// directly, skipping control-character and size validation.
+		if err := applyFormBody(r, v); err != nil {
+			return "", err
+		}
 		return "application/x-www-form-urlencoded", nil
 	default:
 		// Default to JSON for all other types
@@ -654,6 +666,11 @@ func WithStreamBody(stream bool) RequestOption {
 
 // WithMaxRedirects sets the maximum number of redirects to follow for this request.
 // Returns an error if maxRedirects is negative or exceeds 50.
+//
+// Note: a value of 0 does NOT disable redirects. The engine treats 0 as the
+// "not explicitly set" sentinel and falls back to the default limit (10), so
+// WithMaxRedirects(0) is equivalent to omitting the option. To disable redirect
+// following entirely, use WithFollowRedirects(false) instead.
 func WithMaxRedirects(maxRedirects int) RequestOption {
 	return func(r *engine.Request) error {
 		if maxRedirects < 0 {

@@ -191,11 +191,15 @@ func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *Downloa
 		return nil, fmt.Errorf("download is not compatible with middleware that wraps ResponseMutator")
 	}
 
-	df := extractDownloadFields(engResp)
-	// Transfer body reader ownership from Response to this function.
-	// Setting nil in extractDownloadFields prevents ReleaseResponse from closing
-	// the reader; we manage its lifetime here.
+	// Register the release defer BEFORE extracting fields: extractDownloadFields
+	// reads several accessors on the pooled *engine.Response, and a panic there
+	// would otherwise leak the response (the safety net above converts the panic
+	// to an error but, without this defer already registered, ReleaseResponse
+	// would never run). extractDownloadFields nils the body reader on the
+	// response, so ReleaseResponse will not close it; the dedicated bodyReader
+	// defer below owns the reader lifetime.
 	defer engine.ReleaseResponse(engResp)
+	df := extractDownloadFields(engResp)
 	if df.bodyReader != nil {
 		defer func() { _ = df.bodyReader.Close() }() // best-effort cleanup
 	}
@@ -456,8 +460,12 @@ func getSystemPaths() []string {
 			"c:\\windows\\", "c:\\system32\\",
 			"c:\\program files\\", "c:\\programdata\\",
 			"c:\\program files (x86)\\",
-			// Env-var patterns: Go os.ExpandEnv does not expand %VAR% syntax, these are handled by isSystemPath via os.Getenv
-			"%systemroot%", "%windir%", "%programfiles%", "%programfiles(x86)%",
+			// Env-var patterns, expanded at check time by isSystemPath via
+			// os.ExpandEnv. Go only expands ${VAR}/$VAR syntax, NOT Windows
+			// %VAR%, so the brace form is required here — a previous %VAR%
+			// form expanded to itself and the branch was dead code. These
+			// catch installs on a non-C drive where the literals above miss.
+			"${SystemRoot}", "${windir}", "${ProgramFiles}", "${ProgramFiles(x86)}",
 		}
 	case "darwin":
 		return []string{
@@ -478,10 +486,10 @@ func getSystemPaths() []string {
 }
 
 // normalizedSystemEntry holds a pre-normalized system path for fast comparison.
-// envPattern is non-empty only on Windows for env-var patterns (e.g., "%systemroot%").
+// envPattern is non-empty only on Windows for env-var patterns (e.g., "${SystemRoot}").
 type normalizedSystemEntry struct {
 	normalized string
-	envPattern string // original "%VAR%" pattern, empty for literal paths
+	envPattern string // original "${VAR}" pattern, empty for literal paths
 }
 
 var (
@@ -496,9 +504,9 @@ func initNormalizedSystemPaths() {
 	raw := getSystemPaths()
 	cachedSystemPaths = make([]normalizedSystemEntry, len(raw))
 	for i, p := range raw {
-		// Windows env-var patterns (e.g., "%systemroot%") are expanded at
+		// Windows env-var patterns (e.g., "${SystemRoot}") are expanded at
 		// check time, so store the original pattern and skip static normalization.
-		if strings.HasPrefix(p, "%") && runtime.GOOS == "windows" {
+		if strings.HasPrefix(p, "${") && runtime.GOOS == "windows" {
 			cachedSystemPaths[i] = normalizedSystemEntry{envPattern: p}
 			continue
 		}

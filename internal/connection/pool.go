@@ -55,7 +55,6 @@ type PoolManager struct {
 	hostCount atomic.Int64
 
 	closed int32
-	mu     sync.RWMutex
 
 	lastEviction int64 // Unix timestamp of last eviction run (atomic)
 }
@@ -478,7 +477,7 @@ func (pm *PoolManager) createTLSConfig() *tls.Config {
 		tlsConfig := pm.config.TLSConfig.Clone()
 		// Add certificate pinning verification if configured
 		if pm.config.certPinner != nil {
-			tlsConfig.VerifyPeerCertificate = pm.createVerifyPeerCertificate(tlsConfig)
+			tlsConfig.VerifyPeerCertificate = pm.createVerifyPeerCertificate()
 		}
 		return tlsConfig
 	}
@@ -507,28 +506,27 @@ func (pm *PoolManager) createTLSConfig() *tls.Config {
 
 	// Add certificate pinning verification if configured
 	if pm.config.certPinner != nil {
-		tlsConfig.VerifyPeerCertificate = pm.createVerifyPeerCertificate(tlsConfig)
+		tlsConfig.VerifyPeerCertificate = pm.createVerifyPeerCertificate()
 	}
 
 	return tlsConfig
 }
 
-// createVerifyPeerCertificate creates a certificate verification function
-// that combines standard verification with certificate pinning
-func (pm *PoolManager) createVerifyPeerCertificate(tlsConfig *tls.Config) func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+// createVerifyPeerCertificate creates a certificate verification callback that
+// enforces certificate pinning on top of Go's standard verification.
+//
+// When InsecureSkipVerify is true, Go skips all chain/hostname validation and
+// invokes this callback with verifiedChains=nil; pinning is then the sole
+// verification gate (rawCerts still carries the server's certificates, so
+// SPKI/hash pinners work). When InsecureSkipVerify is false, Go performs full
+// validation first and this callback adds the pinning check on top. Either way
+// the only failure mode is the pin check, so the callback returns nil after a
+// successful pin.
+func (pm *PoolManager) createVerifyPeerCertificate() func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	return func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-		// First, run the pinner verification
 		if err := pm.config.certPinner.VerifyPeerCertificate(rawCerts, verifiedChains); err != nil {
 			return fmt.Errorf("certificate pinning failed: %w", err)
 		}
-
-		// If InsecureSkipVerify is true, we skip standard verification
-		if tlsConfig.InsecureSkipVerify {
-			return nil
-		}
-
-		// Otherwise, standard TLS verification is performed by Go's TLS implementation
-		// This function only adds the pinning check on top of standard verification
 		return nil
 	}
 }
@@ -684,9 +682,6 @@ func (pm *PoolManager) Close() error {
 	if !atomic.CompareAndSwapInt32(&pm.closed, 0, 1) {
 		return nil
 	}
-
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
 
 	var closeErr error
 

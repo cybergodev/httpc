@@ -61,7 +61,10 @@ func normalizeDomain(domain string) string {
 // NewDomainWhitelist creates a new DomainWhitelist from a list of domains.
 // Domains can be:
 //   - Exact matches: "example.com", "api.example.com"
-//   - Wildcard patterns: "*.example.com" matches any subdomain of example.com
+//   - Wildcard patterns: "*.example.com" matches any strict subdomain of
+//     example.com (e.g. api.example.com), but NOT the bare apex example.com.
+//     To allow both the apex and its subdomains, list both explicitly:
+//     "example.com", "*.example.com".
 //
 // Example:
 //
@@ -141,18 +144,13 @@ func (w *DomainWhitelist) IsAllowed(hostname string) bool {
 
 // matchWildcard checks if a hostname matches a wildcard pattern.
 // pattern includes the "." prefix (e.g., ".example.com") for zero-alloc matching.
+// The wildcard matches strict subdomains only: "*.example.com" matches
+// "api.example.com" but not the bare apex "example.com". The leading "." in
+// pattern guarantees the suffix aligns to a label boundary, so "notexample.com"
+// cannot match ".example.com".
 func (w *DomainWhitelist) matchWildcard(hostname, pattern string) bool {
-	// Exact match with wildcard domain (pattern[1:] strips the leading ".")
-	if hostname == pattern[1:] {
-		return true
-	}
-
-	// Subdomain match: hostname ends with .pattern
-	if strings.HasSuffix(hostname, pattern) {
-		return true
-	}
-
-	return false
+	// Subdomain match: hostname ends with .pattern (e.g. "api.example.com" / ".example.com")
+	return strings.HasSuffix(hostname, pattern)
 }
 
 // Add adds a domain to the whitelist.
