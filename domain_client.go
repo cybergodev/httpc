@@ -15,7 +15,7 @@ import (
 // For better flexibility, use the DomainClienter interface instead of the concrete type:
 //
 //	var dc httpc.DomainClienter
-//	dc, err := httpc.NewDomain("https://api.example.com")
+//	dc, err := httpc.NewDomain("https://api.example.com", httpc.DefaultConfig())
 type DomainClient struct {
 	client    Client
 	baseURL   string
@@ -26,8 +26,8 @@ type DomainClient struct {
 
 // NewDomain creates a new DomainClient scoped to the specified base URL.
 // The client automatically manages cookies and headers across requests.
-// If no configuration is provided or nil is passed, DefaultConfig() is used.
-// Note: Cookies are automatically enabled for DomainClient.
+// Pass DefaultConfig() for defaults, or use NewDomainDefault(baseURL) as a
+// zero-argument shortcut. Cookies are automatically enabled for DomainClient.
 //
 // Returns a DomainClienter interface for flexibility and testability.
 // Type-assert to *DomainClient if access to the concrete type is needed.
@@ -35,7 +35,7 @@ type DomainClient struct {
 // Examples:
 //
 //	// Use default configuration
-//	dc, err := httpc.NewDomain("https://api.example.com")
+//	dc, err := httpc.NewDomain("https://api.example.com", httpc.DefaultConfig())
 //
 //	// Use custom configuration
 //	cfg := httpc.DefaultConfig()
@@ -47,7 +47,7 @@ type DomainClient struct {
 //
 //	// Make requests relative to base URL
 //	result, err := dc.Get("/users")
-func NewDomain(baseURL string, config ...*Config) (DomainClienter, error) {
+func NewDomain(baseURL string, cfg Config) (DomainClienter, error) {
 	parsedURL, err := url.Parse(baseURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid base URL: %w", err)
@@ -57,26 +57,20 @@ func NewDomain(baseURL string, config ...*Config) (DomainClienter, error) {
 		return nil, fmt.Errorf("base URL must include scheme and host")
 	}
 
-	// Create config with cookies enabled.
-	// prepareConfig validates, deep-copies (fully isolating the caller's config),
-	// parses SSRF exempt CIDRs, and fills nil sub-configs — shared with New.
-	var in *Config
-	if len(config) > 0 {
-		in = config[0]
+	if err := ValidateConfig(&cfg); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
-	cfg, err := prepareConfig(in)
-	if err != nil {
-		return nil, err
+	cfg = copyConfig(cfg)
+	if err := cfg.parseSSRFExemptCIDRs(); err != nil {
+		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
-	// mergeNilSubConfigs (invoked by prepareConfig) guarantees cfg.Connection is
-	// non-nil, so we can enable cookies on it directly.
 	cfg.Connection.EnableCookies = true
-	client, err := newFromPreparedConfig(cfg)
+	client, err := newFromConfig(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create domain client: %w", err)
 	}
 
-	session, err := NewSessionManager()
+	session, err := NewSessionManager(DefaultSessionConfig())
 	if err != nil {
 		_ = client.Close() // best-effort cleanup
 		return nil, fmt.Errorf("failed to create session: %w", err)
@@ -89,6 +83,18 @@ func NewDomain(baseURL string, config ...*Config) (DomainClienter, error) {
 		domain:         parsedURL.Hostname(),
 		SessionManager: session,
 	}, nil
+}
+
+// NewDomainDefault creates a DomainClient scoped to baseURL using DefaultConfig().
+// It is a convenience shortcut for NewDomain(baseURL, DefaultConfig()), mirroring
+// NewDefault() for the main client.
+//
+// Example:
+//
+//	dc, err := httpc.NewDomainDefault("https://api.example.com")
+//	defer func() { _ = dc.Close() }()
+func NewDomainDefault(baseURL string) (DomainClienter, error) {
+	return NewDomain(baseURL, DefaultConfig())
 }
 
 // Get makes a GET request to the specified path relative to the base URL.
@@ -241,7 +247,7 @@ func (dc *DomainClient) checkInit() error {
 		return fmt.Errorf("domain client is nil")
 	}
 	if dc.SessionManager == nil || dc.client == nil {
-		return fmt.Errorf("domain client is not properly initialized; use httpc.NewDomain()")
+		return fmt.Errorf("domain client is not properly initialized; use httpc.NewDomain(baseURL, cfg)")
 	}
 	return nil
 }

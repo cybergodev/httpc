@@ -36,7 +36,7 @@ func demonstrateDefaultConfig() {
 	fmt.Println("--- Example 1: Default Configuration ---")
 
 	// Create client with default settings
-	client, err := httpc.New(httpc.DefaultConfig())
+	client, err := httpc.NewDefault()
 	if err != nil {
 		fmt.Println(err)
 		return
@@ -135,12 +135,12 @@ func demonstrateCustomConfig() {
 	config.Retry.MaxRetries = 5
 	config.Connection.MaxIdleConns = 200
 	config.Connection.MaxConnsPerHost = 50
-	config.Middleware.UserAgent = "MyApp/1.0"
-	config.Middleware.FollowRedirects = true
+	config.Defaults.UserAgent = "MyApp/1.0"
+	config.Defaults.FollowRedirects = true
 	config.Connection.EnableCookies = true
 
 	// Validate configuration before use
-	if err := httpc.ValidateConfig(config); err != nil {
+	if err := httpc.ValidateConfig(&config); err != nil {
 		fmt.Printf("Invalid config: %v\n", err)
 		return
 	}
@@ -228,7 +228,7 @@ func demonstrateConfigComparison() {
 
 	// Scenario 8: Minimal configuration
 	fmt.Println("Scenario 8: Minimal Configuration")
-	_ = httpc.MinimalConfig() // demonstrates factory; use with httpc.New() to create client
+	_ = httpc.MinimalConfig() // demonstrates factory; use with httpc.New(httpc.MinimalConfig()) to create client
 	fmt.Println("  No retries, short timeouts, minimal features")
 	fmt.Println("  Use case: Simple scripts, CLI tools, one-shot requests\n ")
 }

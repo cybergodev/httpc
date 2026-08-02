@@ -47,8 +47,10 @@ func demonstrateLoggingMiddleware() {
 
 	// Create client with logging middleware
 	config := httpc.DefaultConfig()
+	logCfg := httpc.DefaultLoggingConfig()
+	logCfg.LogFunc = log.Printf
 	config.Middleware.Middlewares = []httpc.MiddlewareFunc{
-		httpc.LoggingMiddleware(log.Printf),
+		httpc.LoggingMiddleware(logCfg),
 	}
 
 	client, err := httpc.New(config)
@@ -77,7 +79,7 @@ func demonstrateRequestIDMiddleware() {
 	// Create client with request ID middleware
 	config := httpc.DefaultConfig()
 	config.Middleware.Middlewares = []httpc.MiddlewareFunc{
-		httpc.RequestIDMiddleware("X-Request-ID", nil),
+		httpc.RequestIDMiddleware(&httpc.RequestIDConfig{HeaderName: "X-Request-ID"}),
 	}
 
 	client, err := httpc.New(config)
@@ -117,20 +119,22 @@ func demonstrateMetricsMiddleware() {
 
 	// Create client with metrics middleware
 	config := httpc.DefaultConfig()
+	metricsCfg := httpc.DefaultMetricsConfig()
+	metricsCfg.OnMetrics = func(method, url string, statusCode int, duration time.Duration, err error) {
+		mu.Lock()
+		key := fmt.Sprintf("%s %s", method, url)
+		if _, exists := metrics[key]; !exists {
+			metrics[key] = &metricData{reqCount: 0, totalDur: 0, errCount: 0}
+		}
+		metrics[key].reqCount++
+		metrics[key].totalDur += duration
+		if err != nil {
+			metrics[key].errCount++
+		}
+		mu.Unlock()
+	}
 	config.Middleware.Middlewares = []httpc.MiddlewareFunc{
-		httpc.MetricsMiddleware(func(method, url string, statusCode int, duration time.Duration, err error) {
-			mu.Lock()
-			key := fmt.Sprintf("%s %s", method, url)
-			if _, exists := metrics[key]; !exists {
-				metrics[key] = &metricData{reqCount: 0, totalDur: 0, errCount: 0}
-			}
-			metrics[key].reqCount++
-			metrics[key].totalDur += duration
-			if err != nil {
-				metrics[key].errCount++
-			}
-			mu.Unlock()
-		}),
+		httpc.MetricsMiddleware(metricsCfg),
 	}
 
 	client, err := httpc.New(config)
@@ -162,9 +166,11 @@ func demonstrateRecoveryMiddleware() {
 
 	// Create client with recovery middleware
 	config := httpc.DefaultConfig()
+	recoveryLogCfg := httpc.DefaultLoggingConfig()
+	recoveryLogCfg.LogFunc = log.Printf
 	config.Middleware.Middlewares = []httpc.MiddlewareFunc{
 		httpc.RecoveryMiddleware(),
-		httpc.LoggingMiddleware(log.Printf),
+		httpc.LoggingMiddleware(recoveryLogCfg),
 	}
 
 	client, err := httpc.New(config)
@@ -191,12 +197,14 @@ func demonstrateAuditMiddleware() {
 
 	// Create client with audit middleware
 	config := httpc.DefaultConfig()
+	auditCfg := httpc.DefaultAuditConfig()
+	auditCfg.OnAudit = func(event httpc.AuditEvent) {
+		log.Printf("[AUDIT] %s %s -> %d (%v) attempts=%d user=%s ip=%s",
+			event.Method, event.URL, event.StatusCode, event.Duration, event.Attempts,
+			event.UserID, event.SourceIP)
+	}
 	config.Middleware.Middlewares = []httpc.MiddlewareFunc{
-		httpc.AuditMiddleware(func(event httpc.AuditEvent) {
-			log.Printf("[AUDIT] %s %s -> %d (%v) attempts=%d user=%s ip=%s",
-				event.Method, event.URL, event.StatusCode, event.Duration, event.Attempts,
-				event.UserID, event.SourceIP)
-		}),
+		httpc.AuditMiddleware(auditCfg),
 	}
 
 	client, err := httpc.New(config)
@@ -225,9 +233,11 @@ func demonstrateHeaderMiddleware() {
 	// Create client with header middleware for default headers on every request
 	config := httpc.DefaultConfig()
 	config.Middleware.Middlewares = []httpc.MiddlewareFunc{
-		httpc.HeaderMiddleware(map[string]string{
-			"X-App-Version": "1.0.0",
-			"X-Client-ID":   "my-client",
+		httpc.HeaderMiddleware(&httpc.HeaderConfig{
+			Headers: map[string]string{
+				"X-App-Version": "1.0.0",
+				"X-Client-ID":   "my-client",
+			},
 		}),
 	}
 
@@ -254,11 +264,13 @@ func demonstrateMiddlewareChain() {
 
 	// Approach 1: Configure via slice (order preserved)
 	config := httpc.DefaultConfig()
+	chainLogCfg := httpc.DefaultLoggingConfig()
+	chainLogCfg.LogFunc = log.Printf
 	config.Middleware.Middlewares = []httpc.MiddlewareFunc{
-		httpc.RequestIDMiddleware("X-Correlation-ID", nil),
+		httpc.RequestIDMiddleware(&httpc.RequestIDConfig{HeaderName: "X-Correlation-ID"}),
 		httpc.RecoveryMiddleware(),
-		httpc.LoggingMiddleware(log.Printf),
-		httpc.TimeoutMiddleware(30 * time.Second),
+		httpc.LoggingMiddleware(chainLogCfg),
+		httpc.TimeoutMiddleware(&httpc.TimeoutMiddlewareConfig{Duration: 30 * time.Second}),
 	}
 
 	client, err := httpc.New(config)
@@ -280,10 +292,12 @@ func demonstrateMiddlewareChain() {
 
 	// Approach 2: Using httpc.Chain() to compose middlewares into one
 	// This is useful when you want to pass a single MiddlewareFunc
+	composedLogCfg := httpc.DefaultLoggingConfig()
+	composedLogCfg.LogFunc = log.Printf
 	chain := httpc.Chain(
-		httpc.RequestIDMiddleware("X-Request-ID", nil),
+		httpc.RequestIDMiddleware(nil), // nil = defaults (X-Request-ID, crypto/rand)
 		httpc.RecoveryMiddleware(),
-		httpc.LoggingMiddleware(log.Printf),
+		httpc.LoggingMiddleware(composedLogCfg),
 	)
 
 	config2 := httpc.DefaultConfig()

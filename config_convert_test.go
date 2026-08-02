@@ -73,7 +73,7 @@ func TestCalculateMaxRetries(t *testing.T) {
 			cfg.Connection.ProxyPool = tt.proxyPool
 			cfg.Connection.ProxyRotateOnStatus = tt.rotateOnStatus
 
-			got := calculateMaxRetries(cfg)
+			got := calculateMaxRetries(&cfg)
 			if got != tt.expectedRetries {
 				t.Errorf("calculateMaxRetries() = %d, want %d", got, tt.expectedRetries)
 			}

@@ -40,7 +40,7 @@ func main() {
 func demonstrateCallbacks() {
 	fmt.Println("--- Example 1: Request/Response Callbacks ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -87,7 +87,7 @@ func demonstrateCallbacks() {
 func demonstrateResultPool() {
 	fmt.Println("--- Example 2: Result Pool Optimization ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -114,7 +114,7 @@ func demonstrateResultPool() {
 func demonstrateStreamBody() {
 	fmt.Println("--- Example 3: Save Response to File ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return

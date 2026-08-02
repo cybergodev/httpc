@@ -37,7 +37,7 @@ func example1AutoFollow() {
 	fmt.Println("----------------------------------------")
 
 	// Default client follows redirects automatically
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -62,7 +62,7 @@ func example2NoFollow() {
 
 	// Configure client to not follow redirects
 	config := httpc.DefaultConfig()
-	config.Middleware.FollowRedirects = false
+	config.Defaults.FollowRedirects = false
 	client, err := httpc.New(config)
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
@@ -89,8 +89,8 @@ func example3MaxRedirects() {
 
 	// Configure client with redirect limit
 	config := httpc.DefaultConfig()
-	config.Middleware.FollowRedirects = true
-	config.Middleware.MaxRedirects = 2 // Only follow up to 2 redirects
+	config.Defaults.FollowRedirects = true
+	config.Defaults.MaxRedirects = 2 // Only follow up to 2 redirects
 	client, err := httpc.New(config)
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
@@ -121,7 +121,7 @@ func example4PerRequestControl() {
 	fmt.Println("----------------------------------------")
 
 	// Client configured to follow redirects
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -165,7 +165,7 @@ func example5RedirectChain() {
 	fmt.Println("Example 5: Track Redirect Chain")
 	fmt.Println("--------------------------------")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -195,7 +195,7 @@ func example6ManualHandling() {
 
 	// Disable automatic redirects
 	config := httpc.DefaultConfig()
-	config.Middleware.FollowRedirects = false
+	config.Defaults.FollowRedirects = false
 	client, err := httpc.New(config)
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)

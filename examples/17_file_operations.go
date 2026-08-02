@@ -43,7 +43,7 @@ func main() {
 		log.Printf("Warning: Failed to create downloads directory: %v\n", err)
 	}
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Fatal(err)
 	}

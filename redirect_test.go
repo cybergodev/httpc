@@ -30,8 +30,8 @@ func TestRedirect_AutoFollow(t *testing.T) {
 	defer redirectServer.Close()
 
 	config := testConfig()
-	config.Middleware.FollowRedirects = true
-	config.Middleware.MaxRedirects = 10
+	config.Defaults.FollowRedirects = true
+	config.Defaults.MaxRedirects = 10
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -75,7 +75,7 @@ func TestRedirect_NoFollow(t *testing.T) {
 	defer redirectServer.Close()
 
 	config := testConfig()
-	config.Middleware.FollowRedirects = false
+	config.Defaults.FollowRedirects = false
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -115,8 +115,8 @@ func TestRedirect_MaxRedirectsLimit(t *testing.T) {
 	defer redirectServer.Close()
 
 	config := testConfig()
-	config.Middleware.FollowRedirects = true
-	config.Middleware.MaxRedirects = 3
+	config.Defaults.FollowRedirects = true
+	config.Defaults.MaxRedirects = 3
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -145,7 +145,7 @@ func TestRedirect_PerRequestOverride(t *testing.T) {
 
 	// Client configured to follow redirects
 	config := testConfig()
-	config.Middleware.FollowRedirects = true
+	config.Defaults.FollowRedirects = true
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -179,8 +179,8 @@ func TestRedirect_MaxRedirectsPerRequest(t *testing.T) {
 	defer redirectServer.Close()
 
 	config := testConfig()
-	config.Middleware.FollowRedirects = true
-	config.Middleware.MaxRedirects = 10
+	config.Defaults.FollowRedirects = true
+	config.Defaults.MaxRedirects = 10
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -228,7 +228,7 @@ func TestRedirect_DifferentStatusCodes(t *testing.T) {
 			defer redirectServer.Close()
 
 			config := testConfig()
-			config.Middleware.FollowRedirects = true
+			config.Defaults.FollowRedirects = true
 			client, err := New(config)
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
@@ -271,7 +271,7 @@ func TestRedirect_ChainTracking(t *testing.T) {
 	defer server1.Close()
 
 	config := testConfig()
-	config.Middleware.FollowRedirects = true
+	config.Defaults.FollowRedirects = true
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -319,8 +319,8 @@ func TestRedirect_ConfigValidation(t *testing.T) {
 	for _, tt := range maxRedirectValidationCases {
 		t.Run(tt.name, func(t *testing.T) {
 			config := DefaultConfig()
-			config.Middleware.MaxRedirects = tt.maxRedirect
-			err := ValidateConfig(config)
+			config.Defaults.MaxRedirects = tt.maxRedirect
+			err := ValidateConfig(&config)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -362,8 +362,8 @@ func TestRedirect_LoopDetection(t *testing.T) {
 	defer serverB.Close()
 
 	config := testConfig()
-	config.Middleware.FollowRedirects = true
-	config.Middleware.MaxRedirects = 10
+	config.Defaults.FollowRedirects = true
+	config.Defaults.MaxRedirects = 10
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -392,7 +392,7 @@ func TestRedirect_QueryParameterPreservation(t *testing.T) {
 	defer redirectServer.Close()
 
 	config := testConfig()
-	config.Middleware.FollowRedirects = true
+	config.Defaults.FollowRedirects = true
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -429,7 +429,7 @@ func TestRedirect_BoundaryStatusCodes(t *testing.T) {
 			defer source.Close()
 
 			cfg := testConfig()
-			cfg.Middleware.FollowRedirects = true
+			cfg.Defaults.FollowRedirects = true
 
 			client, err := New(cfg)
 			if err != nil {
@@ -458,8 +458,8 @@ func TestRedirect_FollowWithZeroMaxRedirects(t *testing.T) {
 	defer redirectServer.Close()
 
 	config := testConfig()
-	config.Middleware.FollowRedirects = true
-	config.Middleware.MaxRedirects = 0
+	config.Defaults.FollowRedirects = true
+	config.Defaults.MaxRedirects = 0
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
@@ -504,7 +504,7 @@ func TestRedirect_MixedStatusCodes(t *testing.T) {
 	defer server1.Close()
 
 	config := testConfig()
-	config.Middleware.FollowRedirects = true
+	config.Defaults.FollowRedirects = true
 	client, err := New(config)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)

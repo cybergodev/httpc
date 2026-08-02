@@ -25,9 +25,6 @@ import (
 func TestConfig_Defaults(t *testing.T) {
 	config := DefaultConfig()
 
-	if config == nil {
-		t.Fatal("DefaultConfig should not return nil")
-	}
 	if config.Timeouts.Request <= 0 {
 		t.Error("Default timeout should be positive")
 	}
@@ -37,7 +34,7 @@ func TestConfig_Defaults(t *testing.T) {
 	if config.Connection.MaxIdleConns <= 0 {
 		t.Error("Default max idle connections should be positive")
 	}
-	if config.Middleware.UserAgent == "" {
+	if config.Defaults.UserAgent == "" {
 		t.Error("Default user agent should not be empty")
 	}
 }
@@ -71,7 +68,7 @@ func TestConfig_Presets(t *testing.T) {
 		if config.Retry.MaxRetries != 1 {
 			t.Errorf("Expected MaxRetries=1, got %d", config.Retry.MaxRetries)
 		}
-		if config.Middleware.FollowRedirects {
+		if config.Defaults.FollowRedirects {
 			t.Error("Expected FollowRedirects=false")
 		}
 	})
@@ -108,7 +105,7 @@ func TestConfig_Presets(t *testing.T) {
 		if config.Retry.MaxRetries != 0 {
 			t.Error("Minimal config should have no retries")
 		}
-		if config.Middleware.FollowRedirects {
+		if config.Defaults.FollowRedirects {
 			t.Error("Minimal config should not follow redirects")
 		}
 	})
@@ -129,8 +126,8 @@ func TestConfig_Presets(t *testing.T) {
 		if config.Retry.MaxRetries != 1 {
 			t.Errorf("Expected MaxRetries=1, got %d", config.Retry.MaxRetries)
 		}
-		if config.Middleware.UserAgent != "httpc-test/1.0" {
-			t.Errorf("Expected UserAgent='httpc-test/1.0', got %q", config.Middleware.UserAgent)
+		if config.Defaults.UserAgent != "httpc-test/1.0" {
+			t.Errorf("Expected UserAgent='httpc-test/1.0', got %q", config.Defaults.UserAgent)
 		}
 	})
 }
@@ -230,7 +227,7 @@ func TestConfig_Validation(t *testing.T) {
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {
 				config := DefaultConfig()
-				config.Middleware.UserAgent = tt.userAgent
+				config.Defaults.UserAgent = tt.userAgent
 				client, err := New(config)
 				if (err != nil) != tt.wantErr {
 					t.Errorf("New() error = %v, wantErr %v", err, tt.wantErr)
@@ -416,8 +413,8 @@ func TestConfig_AdvancedFields(t *testing.T) {
 		config.Retry.MaxRetries = 5
 		config.Connection.ProxyURL = "http://proxy:8080"
 		config.Security.AllowPrivateIPs = true
-		config.Middleware.UserAgent = "my-app/1.0"
-		config.Middleware.FollowRedirects = false
+		config.Defaults.UserAgent = "my-app/1.0"
+		config.Defaults.FollowRedirects = false
 
 		// Use flat fields for advanced settings
 		config.Timeouts.Dial = 5 * time.Second
@@ -485,25 +482,25 @@ func TestConfig_String(t *testing.T) {
 
 	t.Run("Config with all fields", func(t *testing.T) {
 		config := &Config{
-			Timeouts: &TimeoutConfig{
+			Timeouts: TimeoutConfig{
 				Request:      30 * time.Second,
 				Dial:         5 * time.Second,
 				TLSHandshake: 5 * time.Second,
 			},
-			Connection: &ConnectionConfig{
+			Connection: ConnectionConfig{
 				MaxIdleConns:    100,
 				MaxConnsPerHost: 20,
 				ProxyURL:        "http://proxy:8080",
 			},
-			Security: &SecurityConfig{
+			Security: SecurityConfig{
 				InsecureSkipVerify: true,
 				AllowPrivateIPs:    true,
 			},
-			Retry: &RetryConfig{
+			Retry: RetryConfig{
 				MaxRetries:    3,
 				BackoffFactor: 1.5,
 			},
-			Middleware: &MiddlewareConfig{
+			Defaults: RequestDefaults{
 				UserAgent:       "test-agent",
 				FollowRedirects: false,
 			},
@@ -587,12 +584,12 @@ func TestMaskProxyURL(t *testing.T) {
 
 func TestConfig_String_UserAgentTruncation(t *testing.T) {
 	config := DefaultConfig()
-	config.Middleware.UserAgent = strings.Repeat("x", 60)
+	config.Defaults.UserAgent = strings.Repeat("x", 60)
 	result := config.String()
 	if !strings.Contains(result, "x...") {
 		t.Error("Long UserAgent should be truncated with '...'")
 	}
-	config.Middleware.UserAgent = "short-agent"
+	config.Defaults.UserAgent = "short-agent"
 	result = config.String()
 	if !strings.Contains(result, "short-agent") {
 		t.Error("Short UserAgent should appear in full")
@@ -647,7 +644,7 @@ func TestValidateConfig_AdditionalBoundaries(t *testing.T) {
 		{"negative max conns per host", func(c *Config) { c.Connection.MaxConnsPerHost = -1 }, true},
 		{"negative max response body size", func(c *Config) { c.Security.MaxResponseBodySize = -1 }, true},
 		{"negative retry delay", func(c *Config) { c.Retry.Delay = -1 * time.Second }, true},
-		{"invalid middleware headers", func(c *Config) { c.Middleware.Headers = map[string]string{"X-Bad": "value\r\nevil"} }, true},
+		{"invalid middleware headers", func(c *Config) { c.Defaults.Headers = map[string]string{"X-Bad": "value\r\nevil"} }, true},
 		{"retry delay zero", func(c *Config) { c.Retry.Delay = 0 }, false},
 		{"backoff factor zero", func(c *Config) { c.Retry.BackoffFactor = 0 }, true},
 		{"negative backoff factor", func(c *Config) { c.Retry.BackoffFactor = -1 }, true},
@@ -675,8 +672,8 @@ func TestValidateConfig_AdditionalBoundaries(t *testing.T) {
 				return
 			}
 			cfg := DefaultConfig()
-			tt.mutate(cfg)
-			if err := ValidateConfig(cfg); (err != nil) != tt.wantErr {
+			tt.mutate(&cfg)
+			if err := ValidateConfig(&cfg); (err != nil) != tt.wantErr {
 				t.Errorf("ValidateConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
@@ -708,7 +705,7 @@ func TestParseExemptCIDRs_TableDriven(t *testing.T) {
 
 			// ValidateConfig only checks CIDR format; parseSSRFExemptCIDRs
 			// does the actual parsing and fills parsedCIDRs.
-			err := ValidateConfig(cfg)
+			err := ValidateConfig(&cfg)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateConfig with CIDRs %v error = %v, wantErr %v", tt.cidrs, err, tt.wantErr)
 				return
@@ -767,7 +764,7 @@ func TestCalculateMaxRetryDelay_TableDriven(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := &Config{Retry: &RetryConfig{}}
+			cfg := &Config{Retry: RetryConfig{}}
 			cfg.Retry.MaxRetryDelay = tt.maxRetryDelay
 			got := calculateMaxRetryDelay(cfg)
 			if got < tt.wantMin || got > tt.wantMax {
@@ -780,9 +777,10 @@ func TestCalculateMaxRetryDelay_TableDriven(t *testing.T) {
 func TestConvertToEngineConfig_NilConfig(t *testing.T) {
 	// convertToEngineConfig requires non-nil config (New() always provides one).
 	// Verify DefaultConfig() converts correctly.
-	engCfg, err := convertToEngineConfig(DefaultConfig())
+	cfg := DefaultConfig()
+	engCfg, err := convertToEngineConfig(&cfg)
 	if err != nil {
-		t.Fatalf("convertToEngineConfig(DefaultConfig()) error: %v", err)
+		t.Fatalf("convertToEngineConfig(&cfg) error: %v", err)
 	}
 	if engCfg == nil {
 		t.Fatal("expected non-nil engine config")
@@ -863,21 +861,17 @@ func TestConvertToEngineConfig_PropagatesAllFields(t *testing.T) {
 	cfg.Retry.EnableJitter = false
 	cfg.Retry.CustomPolicy = driftTestRetryPolicy{}
 
-	cfg.Middleware.UserAgent = "sentinel-ua/9.9"
-	cfg.Middleware.Headers = map[string]string{"X-Sentinel": "v1", "X-Other": "v2"}
-	cfg.Middleware.FollowRedirects = false
-	cfg.Middleware.MaxRedirects = 4
+	cfg.Defaults.UserAgent = "sentinel-ua/9.9"
+	cfg.Defaults.Headers = map[string]string{"X-Sentinel": "v1", "X-Other": "v2"}
+	cfg.Defaults.FollowRedirects = false
+	cfg.Defaults.MaxRedirects = 4
 
 	// SSRFExemptCIDRs must be parsed into parsedCIDRs before conversion.
 	if err := cfg.parseSSRFExemptCIDRs(); err != nil {
 		t.Fatalf("parseSSRFExemptCIDRs: %v", err)
 	}
 
-	// reconcileDefaults is called by prepareConfig in production; replicate
-	// it here so the conversion sees the reconciled Defaults values.
-	reconcileDefaults(cfg)
-
-	engCfg, err := convertToEngineConfig(cfg)
+	engCfg, err := convertToEngineConfig(&cfg)
 	if err != nil {
 		t.Fatalf("convertToEngineConfig error: %v", err)
 	}
@@ -921,9 +915,9 @@ func TestConvertToEngineConfig_PropagatesAllFields(t *testing.T) {
 		{"Retry.BackoffFactor", engCfg.BackoffFactor, cfg.Retry.BackoffFactor},
 		{"Retry.EnableJitter -> Jitter", engCfg.Jitter, cfg.Retry.EnableJitter},
 
-		{"Middleware.UserAgent", engCfg.UserAgent, cfg.Middleware.UserAgent},
-		{"Middleware.FollowRedirects", engCfg.FollowRedirects, cfg.Middleware.FollowRedirects},
-		{"Middleware.MaxRedirects", engCfg.MaxRedirects, cfg.Middleware.MaxRedirects},
+		{"Middleware.UserAgent", engCfg.UserAgent, cfg.Defaults.UserAgent},
+		{"Middleware.FollowRedirects", engCfg.FollowRedirects, cfg.Defaults.FollowRedirects},
+		{"Middleware.MaxRedirects", engCfg.MaxRedirects, cfg.Defaults.MaxRedirects},
 	}
 	for _, a := range assertions {
 		if a.got != a.want {
@@ -971,7 +965,7 @@ func TestConvertToEngineConfig_DerivedDefaults(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Security.MinTLSVersion = 0
 		cfg.Security.MaxTLSVersion = 0
-		engCfg, err := convertToEngineConfig(cfg)
+		engCfg, err := convertToEngineConfig(&cfg)
 		if err != nil {
 			t.Fatalf("convertToEngineConfig: %v", err)
 		}
@@ -983,7 +977,7 @@ func TestConvertToEngineConfig_DerivedDefaults(t *testing.T) {
 	t.Run("MaxRetryDelay defaults to 30s", func(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Retry.MaxRetryDelay = 0
-		engCfg, err := convertToEngineConfig(cfg)
+		engCfg, err := convertToEngineConfig(&cfg)
 		if err != nil {
 			t.Fatalf("convertToEngineConfig: %v", err)
 		}
@@ -994,7 +988,7 @@ func TestConvertToEngineConfig_DerivedDefaults(t *testing.T) {
 
 	t.Run("CookieJar nil when cookies disabled", func(t *testing.T) {
 		cfg := DefaultConfig()
-		engCfg, err := convertToEngineConfig(cfg)
+		engCfg, err := convertToEngineConfig(&cfg)
 		if err != nil {
 			t.Fatalf("convertToEngineConfig: %v", err)
 		}

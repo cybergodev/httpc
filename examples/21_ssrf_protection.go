@@ -67,7 +67,7 @@ func demonstrateDefaultBlock() {
 	fmt.Println("  target: http://127.0.0.1:9/  (loopback, nothing listening)")
 
 	// DefaultConfig() ships with AllowPrivateIPs=false, so 127.0.0.1 is blocked.
-	client, err := httpc.New(httpc.DefaultConfig())
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -86,7 +86,7 @@ func demonstratePerRequestOverride() {
 	fmt.Println("--- Example 2: Per-Request Override (WithAllowPrivateIPs) ---")
 	fmt.Println("  target: http://127.0.0.1:9/  + WithAllowPrivateIPs(true)")
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return

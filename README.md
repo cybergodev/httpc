@@ -126,8 +126,8 @@ import (
 )
 
 func main() {
-    // Create a reusable client (New() uses DefaultConfig() when no config provided)
-    client, err := httpc.New()
+    // Create a reusable client with default configuration
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }
@@ -644,8 +644,8 @@ sm.SetCookieSecurity(httpc.StrictCookieSecurityConfig())
 ### Preset Configurations
 
 ```go
-// Recommended defaults (same as httpc.New() with no arguments)
-client, _ := httpc.New(httpc.DefaultConfig())
+// Recommended defaults
+client, _ := httpc.NewDefault()
 
 // Maximum security (SSRF protection enabled)
 client, _ := httpc.New(httpc.SecureConfig())
@@ -663,9 +663,9 @@ client, _ := httpc.New(httpc.TestingConfig())
 ### Custom Configuration
 
 ```go
-config := &httpc.Config{
+config := httpc.Config{
     // Timeouts
-    Timeouts: &httpc.TimeoutConfig{
+    Timeouts: httpc.TimeoutConfig{
         Request:        30 * time.Second,
         Dial:           10 * time.Second,
         TLSHandshake:   10 * time.Second,
@@ -674,7 +674,7 @@ config := &httpc.Config{
     },
 
     // Connection
-    Connection: &httpc.ConnectionConfig{
+    Connection: httpc.ConnectionConfig{
         MaxIdleConns:    100,
         MaxConnsPerHost: 20,
         EnableHTTP2:     true,
@@ -682,7 +682,7 @@ config := &httpc.Config{
     },
 
     // Security
-    Security: &httpc.SecurityConfig{
+    Security: httpc.SecurityConfig{
         MinTLSVersion:       tls.VersionTLS12,
         MaxTLSVersion:       tls.VersionTLS13,
         MaxResponseBodySize: 50 * 1024 * 1024, // 50 MB
@@ -690,15 +690,15 @@ config := &httpc.Config{
     },
 
     // Retry
-    Retry: &httpc.RetryConfig{
+    Retry: httpc.RetryConfig{
         MaxRetries:    3,
         Delay:         1 * time.Second,
         BackoffFactor: 2.0,
         EnableJitter:  true,
     },
 
-    // Middleware
-    Middleware: &httpc.MiddlewareConfig{
+    // Defaults (per-request defaults: User-Agent, headers, redirect policy)
+    Defaults: httpc.RequestDefaults{
         UserAgent:       "MyApp/1.0",
         FollowRedirects: true,
         MaxRedirects:    10,
@@ -706,7 +706,7 @@ config := &httpc.Config{
 }
 
 // Validate configuration before creating client (New() also validates internally)
-if err := httpc.ValidateConfig(config); err != nil {
+if err := httpc.ValidateConfig(&config); err != nil {
     log.Fatal(err)
 }
 
@@ -730,13 +730,13 @@ fmt.Println(config.String())
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| **Timeouts** (nested: `Timeouts: &httpc.TimeoutConfig{...}`) ||||
+| **Timeouts** (`Timeouts: httpc.TimeoutConfig{...}`) ||||
 | `Timeouts.Request` | `time.Duration` | `180s` | Overall request timeout |
 | `Timeouts.Dial` | `time.Duration` | `10s` | TCP connection timeout |
 | `Timeouts.TLSHandshake` | `time.Duration` | `10s` | TLS handshake timeout |
 | `Timeouts.ResponseHeader` | `time.Duration` | `0` | Response header timeout (0 = disabled, uses context timeout) |
 | `Timeouts.IdleConn` | `time.Duration` | `90s` | Idle connection timeout |
-| **Connection** (nested: `Connection: &httpc.ConnectionConfig{...}`) ||||
+| **Connection** (`Connection: httpc.ConnectionConfig{...}`) ||||
 | `Connection.MaxIdleConns` | `int` | `50` | Max idle connections |
 | `Connection.MaxConnsPerHost` | `int` | `10` | Max connections per host |
 | `Connection.ProxyURL` | `string` | `""` | Proxy URL (http/https) |
@@ -746,7 +746,7 @@ fmt.Println(config.String())
 | `Connection.EnableDoH` | `bool` | `false` | Enable DNS-over-HTTPS |
 | `Connection.DoHCacheTTL` | `time.Duration` | `5m` | DoH cache duration |
 | `Connection.MaxResponseHeaderBytes` | `int64` | `0` | Max response header size (0 = Go stdlib default 10MB) |
-| **Security** (nested: `Security: &httpc.SecurityConfig{...}`) ||||
+| **Security** (`Security: httpc.SecurityConfig{...}`) ||||
 | `Security.TLSConfig` | `*tls.Config` | `nil` | Custom TLS config |
 | `Security.MinTLSVersion` | `uint16` | `TLS 1.2` | Minimum TLS version |
 | `Security.MaxTLSVersion` | `uint16` | `TLS 1.3` | Maximum TLS version |
@@ -762,61 +762,69 @@ fmt.Println(config.String())
 | `Security.MaxDecompressedBodySize` | `int64` | `100MB` | Max decompressed body size (zip bomb protection) |
 | `Security.SSRFExemptCIDRs` | `[]string` | `nil` | CIDR ranges exempted from SSRF blocking |
 | `Security.CookieSecurity` | `*CookieSecurityConfig` | `nil` | Cookie security validation rules |
-| **Retry** (nested: `Retry: &httpc.RetryConfig{...}`) ||||
+| **Retry** (`Retry: httpc.RetryConfig{...}`) ||||
 | `Retry.MaxRetries` | `int` | `3` | Max retry attempts |
 | `Retry.Delay` | `time.Duration` | `1s` | Initial retry delay |
 | `Retry.BackoffFactor` | `float64` | `2.0` | Backoff multiplier |
 | `Retry.EnableJitter` | `bool` | `true` | Add jitter to retries |
 | `Retry.MaxRetryDelay` | `time.Duration` | `30s` | Cap on maximum retry delay |
 | `Retry.CustomPolicy` | `RetryPolicy` | `nil` | Custom retry logic |
-| **Middleware** (nested: `Middleware: &httpc.MiddlewareConfig{...}`) ||||
+| **Middleware** (`Middleware: httpc.MiddlewareConfig{...}`) ||||
 | `Middleware.Middlewares` | `[]MiddlewareFunc` | `nil` | Middleware chain |
-| `Middleware.UserAgent` | `string` | `"httpc/1.0"` | Default User-Agent |
-| `Middleware.Headers` | `map[string]string` | `{}` | Default headers |
-| `Middleware.FollowRedirects` | `bool` | `true` | Follow redirects |
-| `Middleware.MaxRedirects` | `int` | `10` | Max redirect count |
+| **Defaults** (`Defaults: httpc.RequestDefaults{...}`) ||||
+| `Defaults.UserAgent` | `string` | `"httpc/1.0"` | Default User-Agent |
+| `Defaults.Headers` | `map[string]string` | `{}` | Default headers |
+| `Defaults.FollowRedirects` | `bool` | `true` | Follow redirects |
+| `Defaults.MaxRedirects` | `int` | `10` | Max redirect count |
 
 ---
 
 ## Middleware
 
+Every configurable middleware follows the same pattern: a `XxxConfig` struct,
+a `DefaultXxxConfig()` constructor, and a `XxxMiddleware(cfg)` factory.
+Pass `nil` to accept defaults.
+
 ### Built-in Middleware
 
 ```go
 // Request logging
-httpc.LoggingMiddleware(log.Printf)
+httpc.LoggingMiddleware(&httpc.LoggingConfig{LogFunc: log.Printf})
 
-// Panic recovery
+// Panic recovery (no config needed)
 httpc.RecoveryMiddleware()
 
-// Request ID
-httpc.RequestIDMiddleware("X-Request-ID", nil)
+// Request ID (nil config = defaults: "X-Request-ID" header, crypto/rand generator)
+httpc.RequestIDMiddleware(&httpc.RequestIDConfig{HeaderName: "X-Request-ID"})
 
 // Timeout enforcement
-httpc.TimeoutMiddleware(30*time.Second)
+httpc.TimeoutMiddleware(&httpc.TimeoutMiddlewareConfig{Duration: 30 * time.Second})
 
 // Static headers
-httpc.HeaderMiddleware(map[string]string{
-    "X-App-Version": "1.0.0",
+httpc.HeaderMiddleware(&httpc.HeaderConfig{
+    Headers: map[string]string{"X-App-Version": "1.0.0"},
 })
 
 // Metrics collection
-httpc.MetricsMiddleware(func(method, url string, statusCode int, duration time.Duration, err error) {
-    metrics.Record(method, url, statusCode, duration)
+httpc.MetricsMiddleware(&httpc.MetricsConfig{
+    OnMetrics: func(method, url string, statusCode int, duration time.Duration, err error) {
+        metrics.Record(method, url, statusCode, duration)
+    },
 })
 
 // Security audit
-httpc.AuditMiddleware(func(a httpc.AuditEvent) {
+auditCfg := httpc.DefaultAuditConfig()
+auditCfg.OnAudit = func(a httpc.AuditEvent) {
     log.Printf("[AUDIT] %s %s -> %d (%v)", a.Method, a.URL, a.StatusCode, a.Duration)
-})
+}
+httpc.AuditMiddleware(auditCfg)
 
-// Audit with custom config
-auditCfg := httpc.DefaultAuditMiddlewareConfig()
-auditCfg.IncludeHeaders = true
-auditCfg.Format = "json"
-httpc.AuditMiddlewareWithConfig(func(a httpc.AuditEvent) {
-    log.Printf("[AUDIT] %v", a)
-}, auditCfg)
+// Audit with custom config (JSON format, include headers)
+auditCfgJSON := httpc.DefaultAuditConfig()
+auditCfgJSON.OnAudit = func(a httpc.AuditEvent) { log.Printf("[AUDIT] %v", a) }
+auditCfgJSON.IncludeHeaders = true
+auditCfgJSON.Format = "json"
+httpc.AuditMiddleware(auditCfgJSON)
 ```
 
 ### AuditEvent Fields
@@ -843,9 +851,9 @@ httpc.AuditMiddlewareWithConfig(func(a httpc.AuditEvent) {
 ```go
 chainedMiddleware := httpc.Chain(
     httpc.RecoveryMiddleware(),
-    httpc.LoggingMiddleware(log.Printf),
-    httpc.RequestIDMiddleware("X-Request-ID", nil),
-    httpc.HeaderMiddleware(map[string]string{"X-App": "v1"}),
+    httpc.LoggingMiddleware(&httpc.LoggingConfig{LogFunc: log.Printf}),
+    httpc.RequestIDMiddleware(nil),
+    httpc.HeaderMiddleware(&httpc.HeaderConfig{Headers: map[string]string{"X-App": "v1"}}),
 )
 config.Middleware.Middlewares = []httpc.MiddlewareFunc{chainedMiddleware}
 ```
@@ -1101,7 +1109,7 @@ if errors.As(err, &clientErr) {
 HTTPC is designed to be goroutine-safe:
 
 ```go
-client, _ := httpc.New() // Uses DefaultConfig() internally
+client, _ := httpc.NewDefault() // Default configuration
 defer client.Close()
 
 var wg sync.WaitGroup

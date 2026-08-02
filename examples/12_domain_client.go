@@ -32,7 +32,7 @@ func demonstrateBasicUsage() {
 	fmt.Println("--- Basic DomainClient Usage ---")
 
 	// Create domain-specific client
-	client, err := httpc.NewDomain("https://httpbin.org")
+	client, err := httpc.NewDomainDefault("https://httpbin.org")
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -82,7 +82,7 @@ func demonstrateBasicUsage() {
 func demonstrateStateManagement() {
 	fmt.Println("--- State Management ---")
 
-	client, err := httpc.NewDomain("https://httpbin.org")
+	client, err := httpc.NewDomainDefault("https://httpbin.org")
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -145,7 +145,7 @@ func demonstrateStateManagement() {
 func demonstrateRelativePaths() {
 	fmt.Println("--- Relative Path Usage ---")
 
-	client, err := httpc.NewDomain("https://httpbin.org")
+	client, err := httpc.NewDomainDefault("https://httpbin.org")
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return

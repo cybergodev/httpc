@@ -38,7 +38,7 @@ func main() {
 func demonstrateRequestCookies() {
 	fmt.Println("--- Request Cookies ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -118,7 +118,7 @@ func demonstrateRequestCookies() {
 func demonstrateResponseCookies() {
 	fmt.Println("--- Response Cookies ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -191,7 +191,7 @@ func demonstrateCookieJar() {
 func demonstrateCookieString() {
 	fmt.Println("--- Cookie String Parsing ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -225,7 +225,7 @@ func demonstrateCookieString() {
 func demonstrateAdvancedScenarios() {
 	fmt.Println("--- Advanced Cookie Scenarios ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
