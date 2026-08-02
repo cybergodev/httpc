@@ -250,6 +250,11 @@ type requestCallback func(req *Request) error
 type responseCallback func(resp *Response) error
 
 // Request represents an HTTP request with method, URL, headers, body, and options.
+//
+// The exported accessor and mutator methods below implement the
+// types.RequestMutator interface (which embeds both read and write methods).
+// They are trivial field pass-throughs and intentionally lack per-method godoc;
+// refer to the interface definition for their contract.
 type Request struct {
 	method      string
 	url         string
@@ -332,6 +337,11 @@ func (r *Request) SetOnResponse(cb responseCallback) { r.onResponse = cb }
 
 // Response represents an HTTP response.
 // Response objects are safe to read from multiple goroutines after they are returned.
+//
+// The exported accessor and mutator methods below implement the
+// types.ResponseMutator interface (which embeds ResponseReader and write
+// methods). They are trivial field pass-throughs and intentionally lack
+// per-method godoc; refer to the interface definition for their contract.
 type Response struct {
 	statusCode     int
 	status         string
@@ -547,6 +557,10 @@ func NewClient(config *Config, opts ...clientOption) (*Client, error) {
 // ErrClientClosed is returned when attempting to use a closed client.
 var ErrClientClosed = errors.New("client is closed")
 
+// Request executes an HTTP request with the given method, URL, and options.
+// It acquires a pooled Request, applies the options, processes it through the
+// transport layer with retry support, and returns the resulting Response.
+// Returns ErrClientClosed if the client has been closed.
 func (c *Client) Request(ctx context.Context, method, url string, options ...RequestOption) (*Response, error) {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return nil, ErrClientClosed
@@ -820,7 +834,12 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 				shouldRetry := policy.ShouldRetry(resp, nil, attempt)
 				fmt.Fprintf(os.Stderr, "[httpc] attempt=%d status=%d shouldRetry=%v attemptLtMax=%v proxyIdx=%d\n",
 					attempt, resp.StatusCode(), shouldRetry, attempt < maxRetries,
-					func() int { if useProxyRotation { return baseProxyIdx + attempt }; return -1 }())
+					func() int {
+						if useProxyRotation {
+							return baseProxyIdx + attempt
+						}
+						return -1
+					}())
 			}
 		}
 
@@ -958,6 +977,11 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 // non-nil and is recycled by the deferred putHTTPHeader as before. Consuming one
 // pooled map per success-path request is safe: sync.Pool simply allocates a fresh
 // map on the next get when the pool is empty — no leak, no double-recycle.
+//
+// Uses direct map lookups with pre-canonicalized keys ("Content-Length" and
+// "Host" are already canonical) to avoid the textproto.CanonicalMIMEHeaderKey
+// overhead of h.Get, and batches both value slices into a single backing array
+// to reduce N []string{value} allocations to 1.
 func captureRequestHeaders(httpReq *http.Request) http.Header {
 	if httpReq == nil {
 		return nil
@@ -967,12 +991,20 @@ func captureRequestHeaders(httpReq *http.Request) http.Header {
 	if h == nil {
 		h = make(http.Header, 4)
 	}
-	if httpReq.ContentLength > 0 && h.Get("Content-Length") == "" {
-		var buf [20]byte
-		h.Set("Content-Length", string(strconv.AppendInt(buf[:0], httpReq.ContentLength, 10)))
+	// Batch the header value slices into one backing allocation. Each entry is a
+	// cap-1 window so the two values never alias each other, matching Set's
+	// single-value semantics.
+	headerVals := make([]string, 0, 2)
+	if httpReq.ContentLength > 0 && headerValueIsEmpty(h, hdrContentLength) {
+		var numBuf [20]byte
+		idx := len(headerVals)
+		headerVals = append(headerVals, string(strconv.AppendInt(numBuf[:0], httpReq.ContentLength, 10)))
+		h[hdrContentLength] = headerVals[idx : idx+1 : idx+1]
 	}
-	if httpReq.Host != "" && h.Get("Host") == "" {
-		h.Set("Host", httpReq.Host)
+	if httpReq.Host != "" && headerValueIsEmpty(h, hdrHost) {
+		idx := len(headerVals)
+		headerVals = append(headerVals, httpReq.Host)
+		h[hdrHost] = headerVals[idx : idx+1 : idx+1]
 	}
 	return h
 }
@@ -1226,6 +1258,9 @@ func (c *Client) IsClosed() bool {
 	return atomic.LoadInt32(&c.closed) == 1
 }
 
+// Close releases the client's resources, including the connection pool and
+// transport. It is safe to call multiple times; subsequent calls are no-ops.
+// Returns any error encountered while closing sub-components.
 func (c *Client) Close() error {
 	var closeErr error
 

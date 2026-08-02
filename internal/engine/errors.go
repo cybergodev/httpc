@@ -88,6 +88,11 @@ type ClientError struct {
 	Attempts   int
 	StatusCode int    // HTTP status code if applicable
 	Host       string // Host for circuit breaker errors
+	// urlSanitized indicates that URL has already been passed through
+	// validation.SanitizeURL (e.g., by classifyErrorWithSanitizedURL) and
+	// needs no further redaction in Error(). User-constructed ClientError
+	// values leave this false so Error() still sanitizes raw URLs.
+	urlSanitized bool
 }
 
 // errorBuilderPool reduces allocations for strings.Builder in ClientError.Error()
@@ -98,6 +103,9 @@ var errorBuilderPool = sync.Pool{
 	},
 }
 
+// Error implements the error interface. It formats the error as
+// "METHOD url: message" (with credentials redacted from the URL) followed by
+// the cause and attempt count when present.
 func (e *ClientError) Error() string {
 	// Estimate capacity: method (~8) + URL (~64) + message (~64) + cause (~64) + overhead
 	b, _ := errorBuilderPool.Get().(*strings.Builder)
@@ -110,10 +118,17 @@ func (e *ClientError) Error() string {
 	var numBuf [12]byte
 
 	if e.URL != "" && e.Method != "" {
-		sanitizedURL := validation.SanitizeURL(e.URL)
+		// Skip SanitizeURL when the URL was already sanitized by
+		// classifyErrorWithSanitizedURL. This avoids a redundant url.Parse +
+		// redact cycle (and its allocations) for every Error() call on errors
+		// produced by the engine's classification path.
+		urlForMsg := e.URL
+		if !e.urlSanitized {
+			urlForMsg = validation.SanitizeURL(e.URL)
+		}
 		b.WriteString(e.Method)
 		b.WriteByte(' ')
-		b.WriteString(sanitizedURL)
+		b.WriteString(urlForMsg)
 		b.WriteString(": ")
 		b.WriteString(e.Message)
 	} else {
@@ -138,6 +153,7 @@ func (e *ClientError) Error() string {
 	return result
 }
 
+// Unwrap returns the underlying cause error, supporting errors.Is and errors.As.
 func (e *ClientError) Unwrap() error {
 	return e.Cause
 }
@@ -369,6 +385,7 @@ func classifyErrorWithSanitizedURL(err error, sanitizedURL, method string, attem
 		cp := &ClientError{}
 		*cp = *existingErr
 		cp.URL = sanitizedURL
+		cp.urlSanitized = true
 		cp.Method = method
 		if attempts > 0 {
 			cp.Attempts = attempts
@@ -379,6 +396,7 @@ func classifyErrorWithSanitizedURL(err error, sanitizedURL, method string, attem
 	clientErr := &ClientError{}
 	clientErr.Cause = err
 	clientErr.URL = sanitizedURL
+	clientErr.urlSanitized = true
 	clientErr.Method = method
 	clientErr.Attempts = attempts
 

@@ -526,7 +526,7 @@ result, _ := httpc.Download(ctx, url, opts,
 For multiple requests to the same domain with automatic cookie and header management:
 
 ```go
-client, _ := httpc.NewDomain("https://api.example.com")
+client, _ := httpc.NewDomainDefault("https://api.example.com")
 defer client.Close()
 
 // Login - server sets cookies
@@ -607,7 +607,7 @@ The `SessionManager` provides thread-safe cookie and header management, used int
 
 ```go
 // Create session manager
-sm, _ := httpc.NewSessionManager()
+sm, _ := httpc.NewSessionManagerDefault()
 
 // Or with cookie security validation
 cfg := httpc.DefaultSessionConfig()
@@ -739,8 +739,13 @@ fmt.Println(config.String())
 | **Connection** (`Connection: httpc.ConnectionConfig{...}`) ||||
 | `Connection.MaxIdleConns` | `int` | `50` | Max idle connections |
 | `Connection.MaxConnsPerHost` | `int` | `10` | Max connections per host |
-| `Connection.ProxyURL` | `string` | `""` | Proxy URL (http/https) |
+| `Connection.ProxyURL` | `string` | `""` | Proxy URL (http/https/socks5/socks5h) |
 | `Connection.EnableSystemProxy` | `bool` | `false` | Auto-detect system proxy |
+| `Connection.ProxyPool` | `[]string` | `nil` | Proxy URLs for rotation (see [Proxy Configuration](#proxy-configuration)) |
+| `Connection.ProxyPoolStrategy` | `ProxyStrategy` | `ProxyStrategyRoundRobin` | Proxy selection algorithm (`ProxyStrategyRoundRobin` or `ProxyStrategyRandom`) |
+| `Connection.ProxyFailureThreshold` | `int` | `3` | Consecutive connection failures before circuit-breaking a proxy |
+| `Connection.ProxyCooldown` | `time.Duration` | `30s` | How long a circuit-broken proxy stays out of rotation |
+| `Connection.ProxyRotateOnStatus` | `[]int` | `nil` | HTTP status codes that trigger proxy rotation (e.g., `[]int{403}`) |
 | `Connection.EnableHTTP2` | `bool` | `true` | Enable HTTP/2 |
 | `Connection.EnableCookies` | `bool` | `false` | Enable cookie jar |
 | `Connection.EnableDoH` | `bool` | `false` | Enable DNS-over-HTTPS |

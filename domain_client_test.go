@@ -1441,4 +1441,31 @@ func TestDomainClient_NilReceiver(t *testing.T) {
 			t.Errorf("nil Close() = %v, want nil", err)
 		}
 	})
+
+	t.Run("Request returns error", func(t *testing.T) {
+		_, err := dc.Request(context.Background(), "GET", "/test")
+		if err == nil {
+			t.Error("nil Request() should return error")
+		}
+	})
+
+	t.Run("Download returns error", func(t *testing.T) {
+		_, err := dc.Download(context.Background(), "/test", &httpc.DownloadConfig{FilePath: "test"})
+		if err == nil {
+			t.Error("nil Download() should return error")
+		}
+	})
+}
+
+// TestDomainClient_UninitializedFields verifies that a DomainClient with nil
+// internal fields (but non-nil pointer) is rejected by checkInit.
+func TestDomainClient_UninitializedFields(t *testing.T) {
+	// Construct a DomainClient with nil client and SessionManager.
+	// Only possible via zero-value struct literal since SessionManager is exported.
+	dc := &httpc.DomainClient{}
+
+	_, err := dc.Request(context.Background(), "GET", "/test")
+	if err == nil {
+		t.Error("expected error for uninitialized DomainClient Request")
+	}
 }

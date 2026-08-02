@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -1228,5 +1229,118 @@ func TestWriteDownloadBody_ProgressCallback(t *testing.T) {
 	}
 	if res.BytesWritten != 5 {
 		t.Errorf("expected 5 bytes written, got %d", res.BytesWritten)
+	}
+}
+
+// errorAfterReader returns the first n bytes of data successfully, then
+// returns err on the next Read — simulating a mid-stream network failure.
+type errorAfterReader struct {
+	data []byte
+	pos  int
+	n    int
+	err  error
+}
+
+func (r *errorAfterReader) Read(p []byte) (int, error) {
+	if r.pos >= r.n {
+		return 0, r.err
+	}
+	end := r.pos + len(p)
+	if end > r.n {
+		end = r.n
+	}
+	copied := copy(p, r.data[r.pos:end])
+	r.pos += copied
+	if r.pos >= r.n {
+		return copied, r.err
+	}
+	return copied, nil
+}
+
+// TestWriteDownloadBody_WriteFailureRemovesFile exercises the io.Copy error
+// path for a non-resumed download: the partial file must be removed and the
+// error must contain the underlying cause.
+func TestWriteDownloadBody_WriteFailureRemovesFile(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "partial.bin")
+	opts := &DownloadConfig{FilePath: dest, ChecksumAlgorithm: ChecksumSHA256}
+
+	body := &errorAfterReader{
+		data: []byte("hello world"),
+		n:    5, // succeed for 5 bytes, then fail
+		err:  errors.New("simulated network error"),
+	}
+
+	_, err := writeDownloadBody(body, dest, opts, false, 0, 200, 11, time.Now(), nil)
+	if err == nil || !strings.Contains(err.Error(), "failed to write file") {
+		t.Fatalf("expected 'failed to write file' error, got %v", err)
+	}
+	// Non-resumed download must clean up the partial file.
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Errorf("partial file must be removed after write failure; statErr=%v", statErr)
+	}
+}
+
+// TestWriteDownloadBody_ResumeWriteFailurePreservesFile exercises the io.Copy
+// error path for a resumed download: the pre-existing file must NOT be removed
+// so the next resume attempt can retry.
+func TestWriteDownloadBody_ResumeWriteFailurePreservesFile(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "resume.bin")
+	// Pre-create the file with existing resume data.
+	if writeErr := os.WriteFile(dest, []byte("existing"), 0o644); writeErr != nil {
+		t.Fatalf("setup WriteFile: %v", writeErr)
+	}
+
+	opts := &DownloadConfig{FilePath: dest, ChecksumAlgorithm: ChecksumSHA256}
+
+	body := &errorAfterReader{
+		data: []byte("new data appended"),
+		n:    3,
+		err:  errors.New("simulated write error"),
+	}
+
+	_, err := writeDownloadBody(body, dest, opts, true, int64(len("existing")), 206, 15, time.Now(), nil)
+	if err == nil || !strings.Contains(err.Error(), "failed to write file") {
+		t.Fatalf("expected 'failed to write file' error, got %v", err)
+	}
+	// Resumed download must PRESERVE the existing file for the next retry.
+	got, statErr := os.ReadFile(dest)
+	if statErr != nil {
+		t.Fatalf("file must be preserved after resume failure; statErr=%v", statErr)
+	}
+	if !bytes.Contains(got, []byte("existing")) {
+		t.Errorf("original data must be preserved, got %q", got)
+	}
+}
+
+// TestWriteDownloadBody_ResumeWithProgressCallback exercises the resume + progress
+// callback branch where totalSize is adjusted by resumeOffset.
+func TestWriteDownloadBody_ResumeWithProgressCallback(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "resume_progress.bin")
+
+	// Pre-create the file so that O_APPEND mode has something to append to.
+	if writeErr := os.WriteFile(dest, []byte("existing"), 0o644); writeErr != nil {
+		t.Fatalf("setup WriteFile: %v", writeErr)
+	}
+
+	var observedTotal int64
+	opts := &DownloadConfig{
+		FilePath: dest,
+		ProgressCallback: func(downloaded, total int64, speed float64) {
+			observedTotal = total
+		},
+		ChecksumAlgorithm: ChecksumSHA256,
+	}
+
+	// resumed=true, resumeOffset=8 (len("existing")), contentLength=5.
+	// The progress callback's total should be 8 + 5 = 13.
+	res, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, true, int64(len("existing")), 206, 5, time.Now(), nil)
+	if err != nil {
+		t.Fatalf("expected success, got %v", err)
+	}
+	if res.BytesWritten != 5 {
+		t.Errorf("expected 5 new bytes written, got %d", res.BytesWritten)
+	}
+	if observedTotal != 13 {
+		t.Errorf("progress total = %d, want 13 (resumeOffset 8 + contentLength 5)", observedTotal)
 	}
 }

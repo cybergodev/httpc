@@ -306,7 +306,8 @@ var formBuilderPool = sync.Pool{
 
 // encodeFormFields encodes a map[string]string to url-encoded form string.
 // Uses a pooled strings.Builder to avoid the intermediate url.Values map allocation.
-// Optimized to use engine.queryEscape for consistent, pooled URL encoding.
+// Writes escaped keys/values straight into the builder via AppendQueryEscape,
+// avoiding the intermediate string allocations that QueryEscape would incur.
 func encodeFormFields(data map[string]string) string {
 	if len(data) == 0 {
 		return ""
@@ -324,9 +325,9 @@ func encodeFormFields(data map[string]string) string {
 			sb.WriteByte('&')
 		}
 		first = false
-		sb.WriteString(engine.QueryEscape(k))
+		engine.AppendQueryEscape(sb, k)
 		sb.WriteByte('=')
-		sb.WriteString(engine.QueryEscape(v))
+		engine.AppendQueryEscape(sb, v)
 	}
 
 	result := sb.String()

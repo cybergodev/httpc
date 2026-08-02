@@ -228,7 +228,18 @@ func demonstrateConfigComparison() {
 
 	// Scenario 8: Minimal configuration
 	fmt.Println("Scenario 8: Minimal Configuration")
-	_ = httpc.MinimalConfig() // demonstrates factory; use with httpc.New(httpc.MinimalConfig()) to create client
+	minimalClient, err := httpc.New(httpc.MinimalConfig())
+	if err != nil {
+		fmt.Printf("  Error: %v\n", err)
+		return
+	}
+	resp, err := minimalClient.Get("https://httpbin.org/get")
+	if err != nil {
+		fmt.Printf("  Error: %v\n", err)
+	} else {
+		fmt.Printf("  Status: %d\n", resp.StatusCode())
+	}
+	minimalClient.Close()
 	fmt.Println("  No retries, short timeouts, minimal features")
 	fmt.Println("  Use case: Simple scripts, CLI tools, one-shot requests\n ")
 }

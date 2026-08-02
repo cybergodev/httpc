@@ -627,16 +627,39 @@ var (
 	hdrContentType    = http.CanonicalHeaderKey("Content-Type")
 	hdrAcceptEncoding = http.CanonicalHeaderKey("Accept-Encoding")
 	hdrUserAgent      = http.CanonicalHeaderKey("User-Agent")
+	hdrCookie         = http.CanonicalHeaderKey("Cookie")
+	hdrContentLength  = http.CanonicalHeaderKey("Content-Length")
+	hdrHost           = http.CanonicalHeaderKey("Host")
 )
 
 type requestProcessor struct {
-	config *Config
+	config           *Config
+	canonicalHeaders map[string]string // config.Headers with pre-canonicalized keys
 }
 
 func newRequestProcessor(config *Config) *requestProcessor {
-	return &requestProcessor{
-		config: config,
+	rp := &requestProcessor{config: config}
+	// Pre-canonicalize config header keys once at construction time.
+	// This eliminates per-request http.CanonicalHeaderKey calls for every
+	// config header, plus the http.Header.Get overhead (which internally
+	// re-canonicalizes on every lookup).
+	if len(config.Headers) > 0 {
+		rp.canonicalHeaders = make(map[string]string, len(config.Headers))
+		for k, v := range config.Headers {
+			rp.canonicalHeaders[http.CanonicalHeaderKey(k)] = v
+		}
 	}
+	return rp
+}
+
+// headerValueIsEmpty reports whether key is absent from h or its first value
+// is the empty string. It replaces http.Header.Get(key) == "" on the hot path:
+// Get always calls textproto.CanonicalMIMEHeaderKey internally, even when the
+// key is already canonical. A direct map read skips that entirely. The key
+// MUST already be in canonical (http.CanonicalHeaderKey) form.
+func headerValueIsEmpty(h http.Header, key string) bool {
+	vals := h[key]
+	return len(vals) == 0 || vals[0] == ""
 }
 
 func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
@@ -805,23 +828,23 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 	// setHeader stores a single-value header. canonKey must already be in
 	// http.CanonicalHeaderKey form. The fixed keys set on every request
 	// (Content-Type / Accept-Encoding / User-Agent) use the pre-canonicalized
-	// package vars above, and config headers canonicalize once per request, so
-	// neither pays the per-call http.CanonicalHeaderKey allocation on the hot
-	// path. Only per-request user headers (req.Headers) still canonicalize,
-	// since their keys are caller-supplied and unbounded.
+	// package vars above, and config headers are pre-canonicalized at processor
+	// construction time (canonicalHeaders), so neither pays the per-call
+	// http.CanonicalHeaderKey allocation on the hot path. Only per-request user
+	// headers (req.Headers) still canonicalize, since their keys are
+	// caller-supplied and unbounded.
 	setHeader := func(canonKey, value string) {
 		idx := len(headerVals)
 		headerVals = append(headerVals, value)
 		httpReq.Header[canonKey] = headerVals[idx : idx+1 : idx+1]
 	}
 
-	if contentType != "" && httpReq.Header.Get(hdrContentType) == "" {
+	if contentType != "" && headerValueIsEmpty(httpReq.Header, hdrContentType) {
 		setHeader(hdrContentType, contentType)
 	}
 
-	for key, value := range p.config.Headers {
-		canonKey := http.CanonicalHeaderKey(key)
-		if httpReq.Header.Get(canonKey) == "" {
+	for canonKey, value := range p.canonicalHeaders {
+		if headerValueIsEmpty(httpReq.Header, canonKey) {
 			setHeader(canonKey, value)
 		}
 	}
@@ -832,24 +855,101 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 
 	// Add Accept-Encoding automatically since DisableCompression is true
 	// and we handle decompression manually. Allows user override via WithHeader.
-	if httpReq.Header.Get(hdrAcceptEncoding) == "" {
+	if headerValueIsEmpty(httpReq.Header, hdrAcceptEncoding) {
 		setHeader(hdrAcceptEncoding, "gzip, deflate")
 	}
 
-	if httpReq.Header.Get(hdrUserAgent) == "" && p.config.UserAgent != "" {
+	if p.config.UserAgent != "" && headerValueIsEmpty(httpReq.Header, hdrUserAgent) {
 		setHeader(hdrUserAgent, p.config.UserAgent)
 	}
 
-	// Add cookies to the request
+	// Add cookies to the request by building a single Cookie header string.
+	// This replaces per-cookie http.Request.AddCookie calls, which each
+	// allocate via fmt.Sprintf + Header.Get + Header.Set. For N cookies the
+	// old path allocated ~3N objects; this path allocates 1 (the header string).
 	// Note: If EnableCookies is true and a CookieJar is configured,
 	// the cookies will be managed by the jar automatically.
 	// We still add them here for immediate use in this request.
 	cookies := req.Cookies()
-	for i := range cookies {
-		httpReq.AddCookie(&cookies[i])
+	if len(cookies) > 0 {
+		setHeader(hdrCookie, buildCookieHeader(cookies))
 	}
 
 	return httpReq, nil
+}
+
+// buildCookieHeader constructs a "name=value; name2=value2" string from cookies,
+// applying the same sanitization rules as net/http.AddCookie. It uses a pooled
+// strings.Builder and a fast-path scan so that already-valid values (the common
+// case after ValidateCookie) incur zero intermediate allocations.
+func buildCookieHeader(cookies []http.Cookie) string {
+	sb := getQueryBuilder()
+	// Pre-grow to the estimated size so the builder's backing array is allocated
+	// once instead of growing incrementally. strings.Builder.Reset() nils the
+	// internal buffer, so pooled builders always start empty.
+	sb.Grow(len(cookies) * 32)
+	for i := range cookies {
+		if sb.Len() > 0 {
+			sb.WriteString("; ")
+		}
+		sb.WriteString(sanitizeCookieName(cookies[i].Name))
+		sb.WriteByte('=')
+		sb.WriteString(sanitizeCookieValue(cookies[i].Value))
+	}
+	result := sb.String()
+	putQueryBuilder(sb)
+	return result
+}
+
+// sanitizeCookieName removes CR and LF from a cookie name, matching the
+// behavior of net/http.sanitizeCookieName to prevent header injection.
+// Fast path: returns the original string when no escaping is needed.
+func sanitizeCookieName(name string) string {
+	for i := 0; i < len(name); i++ {
+		if name[i] == '\n' || name[i] == '\r' {
+			return strings.NewReplacer("\n", "", "\r", "").Replace(name)
+		}
+	}
+	return name
+}
+
+// sanitizeCookieValue escapes bytes that are invalid in a Cookie request-header
+// value, matching net/http.sanitizeCookieValue. Valid bytes (printable ASCII
+// except '"', ';', '\\') are passed through; invalid bytes are octal-escaped.
+// Fast path: returns the original string when no escaping is needed.
+func sanitizeCookieValue(v string) string {
+	for i := 0; i < len(v); i++ {
+		if !validCookieValueByte(v[i]) {
+			return sanitizeCookieValueSlow(v, i)
+		}
+	}
+	return v
+}
+
+func sanitizeCookieValueSlow(v string, start int) string {
+	var b strings.Builder
+	b.Grow(len(v))
+	b.WriteString(v[:start])
+	const octalDigits = "01234567"
+	for i := start; i < len(v); i++ {
+		c := v[i]
+		if validCookieValueByte(c) {
+			b.WriteByte(c)
+		} else {
+			// Octal escape: \ooo (3 digits), matching net/http behavior.
+			b.WriteByte('\\')
+			b.WriteByte(octalDigits[c>>6])
+			b.WriteByte(octalDigits[(c>>3)&7])
+			b.WriteByte(octalDigits[c&7])
+		}
+	}
+	return b.String()
+}
+
+// validCookieValueByte reports whether b is a valid byte in a Cookie
+// request-header value, matching net/http.validCookieValueByte.
+func validCookieValueByte(b byte) bool {
+	return 0x20 <= b && b < 0x7f && b != '"' && b != ';' && b != '\\'
 }
 
 // setContentLength sets Content-Length on the http.Request for known body types.

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"testing"
@@ -226,4 +227,73 @@ func BenchmarkHasSensitiveContent_WithCredentials(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		_ = hasSensitiveContent(url)
 	}
+}
+
+// BenchmarkBuildCookieHeader measures the batch cookie header builder.
+// Replaces the per-cookie http.Request.AddCookie loop (~3 allocs per cookie).
+func BenchmarkBuildCookieHeader(b *testing.B) {
+	cookies := []http.Cookie{
+		{Name: "session_id", Value: "abc123def456"},
+		{Name: "csrf_token", Value: "xyz789"},
+		{Name: "user_pref", Value: "dark_mode"},
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = buildCookieHeader(cookies)
+	}
+}
+
+// BenchmarkAddCookie_Stdlib measures the OLD approach (http.Request.AddCookie
+// per cookie) for comparison with BenchmarkBuildCookieHeader.
+func BenchmarkAddCookie_Stdlib(b *testing.B) {
+	cookies := []http.Cookie{
+		{Name: "session_id", Value: "abc123def456"},
+		{Name: "csrf_token", Value: "xyz789"},
+		{Name: "user_pref", Value: "dark_mode"},
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		req := &http.Request{Header: make(http.Header, 4)}
+		for j := range cookies {
+			req.AddCookie(&cookies[j])
+		}
+	}
+}
+
+// BenchmarkRequestProcessor_Build_WithConfigHeaders isolates the header-setting
+// path when the client has default config headers (exercises pre-canonicalization).
+func BenchmarkRequestProcessor_Build_WithConfigHeaders(b *testing.B) {
+	cfg := &Config{
+		Headers: map[string]string{
+			"X-Custom-Header-1": "value1",
+			"X-Custom-Header-2": "value2",
+			"Accept":            "application/json",
+		},
+		UserAgent: "httpc-bench/1.0",
+	}
+	rp := newRequestProcessor(cfg)
+	req := AcquireRequest()
+	req.SetMethod("GET")
+	req.SetURL("https://api.example.com/v1/data")
+	req.SetContext(context.Background())
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		httpReq, err := rp.Build(req)
+		if err != nil {
+			b.Fatal(err)
+		}
+		// Release the pooled header to keep pool warm
+		putHTTPHeader(httpReq.Header)
+	}
+
+	ReleaseRequest(req)
 }

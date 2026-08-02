@@ -13,7 +13,10 @@ This guide covers all available request options in HTTPC for customizing HTTP re
 - [Request Body](#request-body)
 - [Timeout & Context](#timeout--context)
 - [Retry Options](#retry-options)
+- [SSRF Override](#ssrf-override)
 - [Cookies](#cookies)
+- [Request Callbacks](#request-callbacks)
+- [Advanced Body Options](#advanced-body-options)
 - [Complete Reference](#complete-reference)
 
 ## Overview
@@ -350,8 +353,8 @@ configuration is unchanged:
 |--------------------|------------------------|
 | `WithTimeout(d)` | `Config.Timeouts.Request` |
 | `WithMaxRetries(n)` | `Config.Retry.MaxRetries` |
-| `WithFollowRedirects(b)` | `Config.Middleware.FollowRedirects` |
-| `WithMaxRedirects(n)` | `Config.Middleware.MaxRedirects` |
+| `WithFollowRedirects(b)` | `Config.Defaults.FollowRedirects` |
+| `WithMaxRedirects(n)` | `Config.Defaults.MaxRedirects` |
 | `WithContext(ctx)` | the client's default background context |
 
 All other options (headers, body, query, auth, cookies, callbacks) are request-only
@@ -382,6 +385,28 @@ resp, err := client.Get(url,
 ```
 
 **Note:** Retry behavior is also configured at the client level. Request-level options override client configuration.
+
+## SSRF Override
+
+### Allow Private IPs (Per-Request)
+
+By default, HTTPC blocks connections to private/reserved IP ranges (SSRF protection).
+Use `WithAllowPrivateIPs` to override this for a single request — for example, to reach
+a localhost development server or internal service without relaxing the entire client:
+
+```go
+// Client uses secure defaults (AllowPrivateIPs=false)
+client, err := httpc.NewDefault()
+
+// Override for one request to reach localhost
+result, err := client.Get("http://localhost:8080/health",
+    httpc.WithAllowPrivateIPs(true),
+)
+```
+
+> **SECURITY:** Only enable this on requests whose URL is trusted and not derived
+> from untrusted user input. For whole-client access to internal services, prefer
+> setting `Security.AllowPrivateIPs = true` on the `Config`.
 
 ## Cookies
 
@@ -507,21 +532,21 @@ result, err := client.Get(url,
 Use `WithBody` for automatic body type detection:
 
 ```go
-// Auto-detect body type
+// Auto-detect body type (default — same as omitting the kind argument)
 result, err := client.Post(url,
     httpc.WithBody(data),  // Auto-detects based on type
 )
 
-// Explicit body type
-result, err := client.Post(url,
-    httpc.WithBody(data, httpc.BodyAuto),      // Auto-detect (default)
-    httpc.WithBody(data, httpc.BodyJSON),       // Force JSON
-    httpc.WithBody(data, httpc.BodyXML),        // Force XML
-    httpc.WithBody(data, httpc.BodyForm),       // Force form
-    httpc.WithBody(data, httpc.BodyBinary),     // Force binary
-    httpc.WithBody(data, httpc.BodyMultipart),  // Force multipart
-)
+// Explicit body type — pass exactly one kind to override auto-detection
+result, err := client.Post(url, httpc.WithBody(data, httpc.BodyJSON))
+result, err = client.Post(url, httpc.WithBody(data, httpc.BodyXML))
+result, err = client.Post(url, httpc.WithBody(data, httpc.BodyForm))
+result, err = client.Post(url, httpc.WithBody(data, httpc.BodyBinary))
+result, err = client.Post(url, httpc.WithBody(data, httpc.BodyMultipart))
 ```
+
+> **Note:** Only one `WithBody` (or body-setting option like `WithJSON`/`WithXML`)
+> should be used per request. If multiple are passed, the last one wins.
 
 **Auto-detection rules:**
 - `string` → text/plain; charset=utf-8
@@ -561,9 +586,17 @@ result, err := client.Post(url,
 | `WithSecureCookie(cfg)`          | Cookie security      | `WithSecureCookie(httpc.StrictCookieSecurityConfig())` |
 | `WithFollowRedirects(follow)`    | Redirect policy      | `WithFollowRedirects(false)`            |
 | `WithMaxRedirects(n)`            | Max redirects        | `WithMaxRedirects(5)`                   |
-| `WithStreamBody(stream)`         | Stream response body | `WithStreamBody(true)`                  |
+| `WithAllowPrivateIPs(allow)`     | Per-request SSRF override | `WithAllowPrivateIPs(true)`        |
+| `WithStreamBody(stream)`         | Stream response body (Download only — see note below) | `WithStreamBody(true)`                  |
 | `WithOnRequest(callback)`        | Pre-request callback | `WithOnRequest(func(req) error { ... })` |
 | `WithOnResponse(callback)`       | Post-response callback | `WithOnResponse(func(resp) error { ... })` |
+
+> **`WithStreamBody` limitation:** Streaming is only effective through `Download`.
+> When used with standard request methods (Get, Post, Put, Patch, Delete, Head,
+> Options, or Request), the response body is fully read during result conversion
+> and the underlying stream is then closed. The returned `Result` therefore has
+> an **empty body**, and the stream cannot be consumed by the caller. To actually
+> stream a large body without buffering, use `Download`.
 
 ## Best Practices
 

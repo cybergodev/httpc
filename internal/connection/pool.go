@@ -712,6 +712,7 @@ func (pm *PoolManager) evictStaleHosts() {
 	})
 }
 
+// GetTransport returns the shared *http.Transport used for pooled connections.
 func (pm *PoolManager) GetTransport() *http.Transport {
 	return pm.transport
 }
@@ -739,6 +740,9 @@ func (pm *PoolManager) NextProxyIndex() (int, bool) {
 	return pm.proxyPool.NextIndex(), true
 }
 
+// GetMetrics returns a snapshot of current connection pool statistics,
+// including active, total, and rejected connection counts and the connection
+// hit rate.
 func (pm *PoolManager) GetMetrics() metrics {
 	total := atomic.LoadInt64(&pm.totalConns)
 	rejected := atomic.LoadInt64(&pm.rejectedConns)
@@ -757,6 +761,9 @@ func (pm *PoolManager) GetMetrics() metrics {
 	}
 }
 
+// Close releases the PoolManager's resources, including the DoH resolver and
+// the shared transport. It is safe to call multiple times; subsequent calls
+// are no-ops. Returns any error encountered while closing sub-components.
 func (pm *PoolManager) Close() error {
 	if !atomic.CompareAndSwapInt32(&pm.closed, 0, 1) {
 		return nil

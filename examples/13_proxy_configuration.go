@@ -209,6 +209,11 @@ func demonstrateProxyPool() {
 	fmt.Println("Each request rotates to the next proxy IP.")
 	fmt.Println("Dead proxies are auto-removed after 3 consecutive failures (circuit breaking).")
 	fmt.Println("Customize with ProxyFailureThreshold and ProxyCooldown.\n ")
+
+	// Alternative: random strategy for less predictable distribution
+	fmt.Println("To use random selection instead, set ProxyPoolStrategy:")
+	fmt.Println(`  config.Connection.ProxyPoolStrategy = httpc.ProxyStrategyRandom`)
+	fmt.Println("  Random picks a healthy proxy uniformly — spreads load unpredictably.\n ")
 }
 
 // demonstrateStatusRotation shows proxy rotation triggered by HTTP status codes.

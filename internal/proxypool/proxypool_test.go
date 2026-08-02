@@ -315,6 +315,37 @@ func TestSelect_Random(t *testing.T) {
 	}
 }
 
+func TestSelect_Random_AllOpenReturnsClosestToRecovery(t *testing.T) {
+	proxies := []string{
+		"http://proxy1.example.com:8080",
+		"http://proxy2.example.com:8080",
+	}
+	pool, err := New(Config{
+		Proxies:          proxies,
+		Strategy:         StrategyRandom,
+		FailureThreshold: 1,
+		Cooldown:         10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	// Open both circuits — proxy1 first (earlier open = closest to recovery).
+	pool.ReportFailure("proxy1.example.com:8080")
+	time.Sleep(5 * time.Millisecond)
+	pool.ReportFailure("proxy2.example.com:8080")
+
+	// With all circuits open, selectRandom falls back to the entry closest
+	// to recovery (proxy1, whose openUntil is smaller).
+	got, err := pool.Select(nil)
+	if err != nil {
+		t.Fatalf("Select() error: %v", err)
+	}
+	if got.Host != "proxy1.example.com:8080" {
+		t.Errorf("Select() with all open: got %s, want proxy1 (earliest open)", got.Host)
+	}
+}
+
 func TestHosts(t *testing.T) {
 	proxies := []string{
 		"http://proxy1.example.com:8080",

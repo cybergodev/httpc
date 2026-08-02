@@ -29,6 +29,9 @@ type DomainClient struct {
 // Pass DefaultConfig() for defaults, or use NewDomainDefault(baseURL) as a
 // zero-argument shortcut. Cookies are automatically enabled for DomainClient.
 //
+// Returns an error if baseURL does not include a scheme and host, or if the
+// configuration fails validation. See New for configuration error conditions.
+//
 // Returns a DomainClienter interface for flexibility and testability.
 // Type-assert to *DomainClient if access to the concrete type is needed.
 //

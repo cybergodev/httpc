@@ -102,6 +102,10 @@ type clientImpl struct {
 // New creates a new HTTP client with the given configuration.
 // Pass DefaultConfig() for sensible defaults, or use a preset like SecureConfig().
 //
+// Returns an error if the configuration fails validation (e.g., invalid
+// Security.SSRFExemptCIDRs, mutually exclusive security settings) or if the
+// underlying engine client cannot be created.
+//
 // Examples:
 //
 //	// Use default configuration (or call NewDefault() for the same result)
@@ -126,7 +130,9 @@ func New(cfg Config) (Client, error) {
 }
 
 // NewDefault creates a new HTTP client with default configuration.
-// It is a convenience shortcut for New(DefaultConfig()).
+// It is a convenience shortcut for New(DefaultConfig()); see New for possible
+// error conditions (default configuration is always valid, so this effectively
+// never returns an error in practice).
 //
 // Example:
 //
@@ -693,13 +699,14 @@ func extractRequestCookies(headers http.Header) []*http.Cookie {
 		return nil
 	}
 
-	// Fast path: avoid map lookup when no Cookie header exists
-	cookieHeader := headers.Get("Cookie")
-	if cookieHeader == "" {
+	// Direct map lookup with the pre-canonicalized key "Cookie" avoids the
+	// textproto.CanonicalMIMEHeaderKey overhead of headers.Get on every request.
+	cookieVals := headers["Cookie"]
+	if len(cookieVals) == 0 || cookieVals[0] == "" {
 		return nil
 	}
 
-	return parseCookieHeader(cookieHeader)
+	return parseCookieHeader(cookieVals[0])
 }
 
 // cloneHeaders returns a deep copy of http.Header. Delegates to the engine's

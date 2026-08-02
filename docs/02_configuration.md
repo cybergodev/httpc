@@ -17,7 +17,7 @@ This guide covers all configuration options for HTTPC clients.
 The library provides secure and optimized defaults that work for most use cases:
 
 ```go
-client, err := httpc.New()
+client, err := httpc.NewDefault()
 if err != nil {
     log.Fatal(err)
 }
@@ -54,11 +54,12 @@ Retry:
 - Retry.Delay: 1 second
 - Retry.BackoffFactor: 2.0
 - Retry.EnableJitter: true
+- Retry.MaxRetryDelay: 30 seconds
 
-Middleware:
-- Middleware.UserAgent: "httpc/1.0"
-- Middleware.FollowRedirects: true
-- Middleware.MaxRedirects: 10
+Defaults (Request Defaults):
+- Defaults.UserAgent: "httpc/1.0"
+- Defaults.FollowRedirects: true
+- Defaults.MaxRedirects: 10
 
 ## Security Presets
 
@@ -87,6 +88,7 @@ defer client.Close()
 - Retry.Delay: 100 milliseconds
 - Retry.BackoffFactor: 2.0 (inherited)
 - Retry.EnableJitter: false
+- Retry.MaxRetryDelay: 30 seconds (inherited)
 - Connection.MaxIdleConns: 10
 - Connection.MaxConnsPerHost: 5
 - Security.MaxResponseBodySize: 10 MB
@@ -96,7 +98,7 @@ defer client.Close()
 - Security.MaxDecompressedBodySize: 100 MB
 - Connection.EnableHTTP2: false
 - Connection.EnableCookies: true
-- Middleware.UserAgent: "httpc-test/1.0"
+- Defaults.UserAgent: "httpc-test/1.0"
 
 **Use Cases:**
 - Development environments
@@ -111,9 +113,9 @@ defer client.Close()
 For most applications:
 
 ```go
+client, err := httpc.NewDefault()  // Uses balanced defaults
+// Or explicitly:
 client, err := httpc.New(httpc.DefaultConfig())
-// Or simply:
-client, err := httpc.New()  // Uses balanced by default
 ```
 
 **Settings:**
@@ -127,8 +129,8 @@ client, err := httpc.New()  // Uses balanced by default
 - Security.MaxResponseBodySize: 10 MB
 - Security.AllowPrivateIPs: false
 - Connection.EnableHTTP2: true
-- Middleware.FollowRedirects: true
-- Middleware.MaxRedirects: 10
+- Defaults.FollowRedirects: true
+- Defaults.MaxRedirects: 10
 - Connection.EnableCookies: false
 
 **Use Cases:**
@@ -169,6 +171,7 @@ defer client.Close()
 - Retry.Delay: 500 milliseconds
 - Retry.BackoffFactor: 1.5
 - Retry.EnableJitter: true
+- Retry.MaxRetryDelay: 30 seconds (inherited)
 
 **Use Cases:**
 - High-throughput API clients
@@ -190,6 +193,7 @@ defer client.Close()
 
 **Settings:**
 - TLS: 1.2-1.3 (modern security)
+- Timeouts.Request: 180 seconds (inherited from default)
 - Timeouts.Dial: 5 seconds
 - Timeouts.TLSHandshake: 5 seconds
 - Timeouts.ResponseHeader: 0 (disabled, uses context-level timeout)
@@ -203,7 +207,7 @@ defer client.Close()
 - Retry.Delay: 0
 - Retry.BackoffFactor: 1.0
 - Retry.EnableJitter: false
-- Middleware.FollowRedirects: false
+- Defaults.FollowRedirects: false
 
 **Use Cases:**
 - Simple one-off HTTP requests
@@ -234,6 +238,7 @@ defer client.Close()
 - Retry.Delay: 2 seconds
 - Retry.BackoffFactor: 2.0 (inherited)
 - Retry.EnableJitter: true
+- Retry.MaxRetryDelay: 30 seconds (inherited)
 - Connection.MaxIdleConns: 20
 - Connection.MaxConnsPerHost: 5
 - Security.MaxResponseBodySize: 5 MB
@@ -241,7 +246,7 @@ defer client.Close()
 - Security.ValidateURL: true
 - Security.ValidateHeaders: true
 - Connection.EnableHTTP2: true
-- Middleware.FollowRedirects: false
+- Defaults.FollowRedirects: false
 - Connection.EnableCookies: false
 
 **Use Cases:**
@@ -258,12 +263,12 @@ defer client.Close()
 For fine-grained control, create a custom configuration:
 
 ```go
-config := &httpc.Config{
+config := httpc.Config{
     // Network settings
-    Timeouts: &httpc.TimeoutConfig{
+    Timeouts: httpc.TimeoutConfig{
         Request: 30 * time.Second,
     },
-    Connection: &httpc.ConnectionConfig{
+    Connection: httpc.ConnectionConfig{
         MaxIdleConns:    100,
         MaxConnsPerHost: 20,
         EnableHTTP2:     true,
@@ -271,7 +276,7 @@ config := &httpc.Config{
     },
 
     // Security settings
-    Security: &httpc.SecurityConfig{
+    Security: httpc.SecurityConfig{
         MinTLSVersion:       tls.VersionTLS12,
         MaxTLSVersion:       tls.VersionTLS13,
         InsecureSkipVerify:  false,
@@ -281,14 +286,14 @@ config := &httpc.Config{
     },
 
     // Retry settings
-    Retry: &httpc.RetryConfig{
+    Retry: httpc.RetryConfig{
         MaxRetries:    3,
         Delay:         1 * time.Second,
         BackoffFactor: 2.0,
     },
 
-    // Headers and features
-    Middleware: &httpc.MiddlewareConfig{
+    // Request defaults
+    Defaults: httpc.RequestDefaults{
         UserAgent:       "MyApp/1.0",
         FollowRedirects: true,
         Headers: map[string]string{
@@ -312,7 +317,7 @@ Start with a preset and customize:
 config := httpc.DefaultConfig()
 config.Timeouts.Request = 30 * time.Second
 config.Retry.MaxRetries = 3
-config.Middleware.UserAgent = "MyApp/1.0"
+config.Defaults.UserAgent = "MyApp/1.0"
 
 client, err := httpc.New(config)
 ```
@@ -413,6 +418,11 @@ client, err := httpc.New(config)
 | `Connection.MaxConnsPerHost`       | `int`           | 10      | Max connections per host                     |
 | `Connection.ProxyURL`              | `string`        | ""      | Proxy server URL                             |
 | `Connection.EnableSystemProxy`     | `bool`          | false   | Use system proxy settings                    |
+| `Connection.ProxyPool`             | `[]string`      | nil     | Proxy server URLs for rotation (lower priority than ProxyURL) |
+| `Connection.ProxyPoolStrategy`     | `ProxyStrategy` | RoundRobin | Strategy for selecting proxies from pool |
+| `Connection.ProxyFailureThreshold` | `int`           | 0 (defaults to 3) | Consecutive connection failures before circuit-breaking a proxy |
+| `Connection.ProxyCooldown`         | `time.Duration` | 0 (defaults to 30s) | How long a circuit-broken proxy stays out of rotation |
+| `Connection.ProxyRotateOnStatus`   | `[]int`         | nil     | HTTP status codes that trigger proxy rotation |
 | `Connection.EnableHTTP2`           | `bool`          | true    | Enable HTTP/2                                |
 | `Connection.EnableCookies`         | `bool`          | false   | Enable automatic cookie jar                  |
 | `Connection.EnableDoH`             | `bool`          | false   | Enable DNS-over-HTTPS resolution             |
@@ -435,8 +445,9 @@ client, err := httpc.New(config)
 | `Security.TLSConfig`            | `*tls.Config` | nil     | Custom TLS configuration           |
 | `Security.ValidateURL`          | `bool`        | true    | Enable URL validation              |
 | `Security.ValidateHeaders`      | `bool`        | true    | Enable header validation (CRLF prevention) |
-| `Security.CookieSecurity`       | `*validation.CookieSecurityConfig` | nil | Cookie security attribute validation |
+| `Security.CookieSecurity`       | `*CookieSecurityConfig` | nil | Cookie security attribute validation (use `httpc.DefaultCookieSecurityConfig()` or `httpc.StrictCookieSecurityConfig()`) |
 | `Security.RedirectWhitelist`    | `[]string`    | nil     | Allowed domains for redirects      |
+| `Security.CertificatePinner`    | `CertificatePinner` | nil | Certificate pinning for MITM defense (see `NewSPKIHashPinner`, `NewPublicKeyPinner`) |
 
 **Note:** URL and header validation are enabled by default for security.
 
@@ -455,19 +466,21 @@ client, err := httpc.New(config)
 
 ### Middleware
 
-> **Naming note:** `MiddlewareConfig` groups two related concerns applied to every
-> outgoing request — the middleware chain (`Middlewares`) and the per-request
-> defaults (User-Agent, default headers, redirect policy). Only `Middlewares` is
-> strictly "middleware"; the other fields are request defaults colocated here for
-> historical reasons.
-
 | Field                        | Type                | Default     | Description                      |
 |------------------------------|---------------------|-------------|----------------------------------|
 | `Middleware.Middlewares`     | `[]MiddlewareFunc`  | nil         | Middleware chain for request/response interception |
-| `Middleware.UserAgent`       | `string`            | "httpc/1.0" | User-Agent header                |
-| `Middleware.FollowRedirects` | `bool`              | true        | Follow HTTP redirects            |
-| `Middleware.MaxRedirects`    | `int`               | 10          | Maximum redirects to follow      |
-| `Middleware.Headers`         | `map[string]string` | nil         | Default headers for all requests |
+
+### Defaults (Request Defaults)
+
+Per-request defaults applied to every outgoing request: User-Agent, default
+headers, and redirect policy.
+
+| Field                        | Type                | Default     | Description                      |
+|------------------------------|---------------------|-------------|----------------------------------|
+| `Defaults.UserAgent`         | `string`            | "httpc/1.0" | User-Agent header                |
+| `Defaults.FollowRedirects`   | `bool`              | true        | Follow HTTP redirects            |
+| `Defaults.MaxRedirects`      | `int`               | 10          | Maximum redirects to follow      |
+| `Defaults.Headers`           | `map[string]string` | nil         | Default headers for all requests |
 
 ## Best Practices
 

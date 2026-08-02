@@ -8,11 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -591,71 +591,63 @@ func TestClearResponsePools(t *testing.T) {
 	putBuffer(buf)
 }
 
-// TestGetPutMultipartBuffer validates multipart buffer pool get/put lifecycle.
-func TestGetPutMultipartBuffer(t *testing.T) {
-	t.Run("Get and put", func(t *testing.T) {
-		buf := getMultipartBuffer()
+// testBufferPoolLifecycle exercises the get/write/put/nil/oversize cycle for
+// a *bytes.Buffer-based sync.Pool. Collapses the identical three-subtest
+// pattern previously duplicated across multipart and JSON buffer pools.
+func testBufferPoolLifecycle(t *testing.T, get func() *bytes.Buffer, put func(*bytes.Buffer), maxSize int) {
+	t.Helper()
+
+	t.Run("get and put", func(t *testing.T) {
+		buf := get()
 		if buf == nil {
-			t.Fatal("getMultipartBuffer returned nil")
+			t.Fatal("get returned nil")
 		}
 		buf.WriteString("test data")
-		putMultipartBuffer(buf)
+		put(buf)
 	})
 
-	t.Run("Put nil", func(t *testing.T) {
-		putMultipartBuffer(nil) // should not panic
+	t.Run("put nil", func(t *testing.T) {
+		put(nil) // should not panic
 	})
 
-	t.Run("Oversize buffer discarded", func(t *testing.T) {
-		buf := getMultipartBuffer()
-		buf.Grow(maxMultipartBufferSize + 1)
-		putMultipartBuffer(buf) // should be discarded, not pooled
-	})
-}
-
-// TestGetPutJSONBuffer validates JSON buffer pool get/put lifecycle.
-func TestGetPutJSONBuffer(t *testing.T) {
-	t.Run("Get and put", func(t *testing.T) {
-		buf := getJSONBuffer()
-		if buf == nil {
-			t.Fatal("getJSONBuffer returned nil")
-		}
-		buf.WriteString(`{"key":"value"}`)
-		putJSONBuffer(buf)
-	})
-
-	t.Run("Put nil", func(t *testing.T) {
-		putJSONBuffer(nil) // should not panic
-	})
-
-	t.Run("Oversize buffer discarded", func(t *testing.T) {
-		buf := getJSONBuffer()
-		buf.Grow(maxJSONBufferSize + 1)
-		putJSONBuffer(buf) // should be discarded, not pooled
+	t.Run("oversize discarded", func(t *testing.T) {
+		buf := get()
+		buf.Grow(maxSize + 1)
+		put(buf) // should be discarded, not pooled
 	})
 }
 
-// TestGetPutMIMEHeader validates MIME header pool get/put lifecycle.
-func TestGetPutMIMEHeader(t *testing.T) {
-	t.Run("Get and put", func(t *testing.T) {
-		h := getMIMEHeader()
-		if h == nil {
-			t.Fatal("getMIMEHeader returned nil")
-		}
-		h.Set("Content-Disposition", `form-data; name="field"`)
-		putMIMEHeader(h)
+// TestPoolLifecycle validates get/put/nil/oversize behavior for all internal
+// pools via a single table-driven entry point, replacing three previously
+// duplicated test functions.
+func TestPoolLifecycle(t *testing.T) {
+	t.Run("MultipartBuffer", func(t *testing.T) {
+		testBufferPoolLifecycle(t, getMultipartBuffer, putMultipartBuffer, maxMultipartBufferSize)
 	})
-
-	t.Run("Put nil", func(t *testing.T) {
-		putMIMEHeader(nil) // should not panic
+	t.Run("JSONBuffer", func(t *testing.T) {
+		testBufferPoolLifecycle(t, getJSONBuffer, putJSONBuffer, maxJSONBufferSize)
 	})
+	t.Run("MIMEHeader", func(t *testing.T) {
+		t.Run("get and put", func(t *testing.T) {
+			h := getMIMEHeader()
+			if h == nil {
+				t.Fatal("getMIMEHeader returned nil")
+			}
+			h.Set("Content-Disposition", `form-data; name="field"`)
+			putMIMEHeader(h)
+		})
 
-	t.Run("Oversize header discarded", func(t *testing.T) {
-		h := getMIMEHeader()
-		for i := 0; i < 17; i++ {
-			h.Set("X-"+string(rune('A'+i)), "value")
-		}
-		putMIMEHeader(h) // should be discarded (len > 16)
+		t.Run("put nil", func(t *testing.T) {
+			putMIMEHeader(nil) // should not panic
+		})
+
+		t.Run("oversize discarded", func(t *testing.T) {
+			h := getMIMEHeader()
+			for i := 0; i < 17; i++ {
+				h.Set("X-"+string(rune('A'+i)), "value")
+			}
+			putMIMEHeader(h) // len > 16 → discarded
+		})
 	})
 }
 
@@ -1240,7 +1232,7 @@ func TestClient_RedirectFollowing(t *testing.T) {
 		t.Errorf("Expected 'final destination', got %q", resp.Body())
 	}
 	if resp.RedirectCount() != 1 {
-		t.Logf("Redirect count: %d", resp.RedirectCount())
+		t.Errorf("Redirect count = %d, want 1", resp.RedirectCount())
 	}
 }
 
@@ -1410,9 +1402,14 @@ func TestBuild_MultipartSpecialChars(t *testing.T) {
 func TestClient_WithCookieJar(t *testing.T) {
 	jar := newTestCookieJar()
 
-	var receivedCookies []*http.Cookie
+	var mu sync.Mutex            // protects receivedCookies (written in handler goroutine)
+	var receivedCookies []string // cookie names seen by the server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedCookies = r.Cookies()
+		mu.Lock()
+		for _, c := range r.Cookies() {
+			receivedCookies = append(receivedCookies, c.Name)
+		}
+		mu.Unlock()
 		// Set a cookie on every response
 		http.SetCookie(w, &http.Cookie{
 			Name:  "server-cookie",
@@ -1439,7 +1436,7 @@ func TestClient_WithCookieJar(t *testing.T) {
 	}
 	defer client.Close()
 
-	// Send request with manual cookies - this triggers the RoundTrip cookie merge path
+	// First request: send a manual cookie, server sets server-cookie via jar.
 	cookieOption := func(req *Request) error {
 		req.SetCookies([]http.Cookie{
 			{Name: "manual-cookie", Value: "manual-value"},
@@ -1455,7 +1452,42 @@ func TestClient_WithCookieJar(t *testing.T) {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode())
 	}
 
-	t.Logf("Received cookies on server: %d", len(receivedCookies))
+	// Second request: jar should replay server-cookie from the first response.
+	resp2, err := client.Request(backgroundCtx, "GET", server.URL)
+	if err != nil {
+		t.Fatalf("Second request failed: %v", err)
+	}
+	if resp2.StatusCode() != 200 {
+		t.Errorf("Expected status 200 on second request, got %d", resp2.StatusCode())
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// The manual cookie from the first request must have been received.
+	foundManual := false
+	for _, name := range receivedCookies {
+		if name == "manual-cookie" {
+			foundManual = true
+		}
+	}
+	if !foundManual {
+		t.Error("server never received manual-cookie from first request")
+	}
+
+	// The server-cookie set on the first response must be replayed by the jar
+	// on the second request (proves cookie jar persistence).
+	serverCookieCount := 0
+	for _, name := range receivedCookies {
+		if name == "server-cookie" {
+			serverCookieCount++
+		}
+	}
+	// First request: manual-cookie sent. Second request: server-cookie replayed.
+	// So server-cookie should appear at least once (on the second request).
+	if serverCookieCount == 0 {
+		t.Error("cookie jar did not replay server-cookie on second request")
+	}
 }
 
 // testCookieJar is a minimal in-memory cookie jar for testing.
@@ -2074,6 +2106,7 @@ func TestClient_SSRSRedirectBlocked(t *testing.T) {
 func TestClient_MockTransportRetry(t *testing.T) {
 	t.Run("Error then success", func(t *testing.T) {
 		mock := newMockTransport(200, "OK")
+		mock.failFirst = 1 // first attempt fails, second succeeds
 		config := &Config{
 			Timeout:         30 * time.Second,
 			AllowPrivateIPs: true,
@@ -2091,23 +2124,15 @@ func TestClient_MockTransportRetry(t *testing.T) {
 		}
 		defer client.Close()
 
-		// First call fails, second succeeds
-		mock.SetError(fmt.Errorf("connection refused"))
-		ctx := context.Background()
-
-		// Start a goroutine to clear the error after a short delay
-		go func() {
-			time.Sleep(20 * time.Millisecond)
-			mock.SetError(nil)
-		}()
-
-		resp, err := client.Request(ctx, "GET", "https://example.com")
-		// May or may not succeed depending on timing
+		resp, err := client.Request(context.Background(), "GET", "https://example.com")
 		if err != nil {
-			t.Logf("Error (acceptable): %v", err)
+			t.Fatalf("expected success after retry, got: %v", err)
 		}
-		if resp != nil {
-			t.Logf("Response status: %d, attempts: %d", resp.StatusCode(), resp.Attempts())
+		if resp.StatusCode() != 200 {
+			t.Errorf("status = %d, want 200", resp.StatusCode())
+		}
+		if resp.Attempts() != 2 {
+			t.Errorf("attempts = %d, want 2 (1 failure + 1 success)", resp.Attempts())
 		}
 	})
 
@@ -2308,80 +2333,6 @@ func TestIsRetryableDNSError_NonDNSCause(t *testing.T) {
 	}
 	if err.IsRetryable() {
 		t.Error("Expected non-retryable for non-DNSError cause in DNS type")
-	}
-}
-
-// ============================================================================
-// Task 1d: isRetryableOpError additional cases (75% -> higher)
-// ============================================================================
-
-func TestIsRetryableOpError_TimeoutTrue(t *testing.T) {
-	err := &ClientError{
-		Type: ErrorTypeNetwork,
-		Cause: &net.OpError{
-			Op:  "dial",
-			Net: "tcp",
-			Err: &mockNetError{timeout: true, msg: "i/o timeout"},
-		},
-	}
-	if !err.IsRetryable() {
-		t.Error("Expected retryable for OpError with Timeout()=true")
-	}
-}
-
-func TestIsRetryableOpError_WithSyscallErrno(t *testing.T) {
-	err := &ClientError{
-		Type: ErrorTypeNetwork,
-		Cause: &net.OpError{
-			Op:  "dial",
-			Net: "tcp",
-			Err: syscall.ECONNREFUSED,
-		},
-	}
-	if !err.IsRetryable() {
-		t.Error("Expected retryable for OpError with ECONNREFUSED errno")
-	}
-}
-
-func TestIsRetryableOpError_WithNonRetryableErrno(t *testing.T) {
-	err := &ClientError{
-		Type: ErrorTypeNetwork,
-		Cause: &net.OpError{
-			Op:  "dial",
-			Net: "tcp",
-			Err: syscall.EINVAL,
-		},
-	}
-	if err.IsRetryable() {
-		t.Error("Expected non-retryable for OpError with non-retryable errno")
-	}
-}
-
-func TestIsRetryableOpError_WithRetryableMessage(t *testing.T) {
-	err := &ClientError{
-		Type: ErrorTypeNetwork,
-		Cause: &net.OpError{
-			Op:  "read",
-			Net: "tcp",
-			Err: errors.New("connection reset by peer"),
-		},
-	}
-	if !err.IsRetryable() {
-		t.Error("Expected retryable for OpError with retryable message")
-	}
-}
-
-func TestIsRetryableOpError_ContextDeadlineExceeded(t *testing.T) {
-	err := &ClientError{
-		Type: ErrorTypeNetwork,
-		Cause: &net.OpError{
-			Op:  "dial",
-			Net: "tcp",
-			Err: context.DeadlineExceeded,
-		},
-	}
-	if err.IsRetryable() {
-		t.Error("Expected non-retryable for OpError with context.DeadlineExceeded")
 	}
 }
 
@@ -2597,36 +2548,6 @@ func TestPooledReaders_Close(t *testing.T) {
 // Task 4: createDecompressor edge cases (68.8% -> higher)
 // ============================================================================
 
-func TestCreateDecompressor_GzipResetFailure(t *testing.T) {
-	// Clear pools so we get fresh readers
-	clearResponsePools()
-
-	config := &Config{Timeout: 30 * time.Second}
-	processor := newResponseProcessor(config)
-
-	// Force gzip pool to have a reader that will fail on Reset.
-	// We do this by getting a reader from the pool, putting it in a state
-	// where Reset will fail, then returning it to pool.
-	pooled, ok := gzipReaderPool.Get().(*gzip.Reader)
-	if ok && pooled != nil {
-		// Reset with nil to put reader in a bad state, then return to pool
-		_ = pooled.Reset(bytes.NewReader(nil))
-		// Now try reading to put reader in EOF state, then return to pool
-		gzipReaderPool.Put(pooled)
-	}
-
-	// Now when createDecompressor gets a pooled reader, Reset may succeed
-	// but we test the fallback path by using an error reader
-	errorReader := &errorReader{err: fmt.Errorf("reset failure simulation")}
-	decompressor, err := processor.createDecompressor(errorReader, "gzip")
-	if err != nil {
-		// Reset failed fallback creates a new reader which may also fail
-		t.Logf("Error from gzip decompressor (acceptable): %v", err)
-	} else {
-		_ = decompressor.Close()
-	}
-}
-
 func TestCreateDecompressor_FlateNonResetter(t *testing.T) {
 	// Clear pools to ensure clean state
 	clearResponsePools()
@@ -2690,11 +2611,43 @@ func TestCreateDecompressor_GzipDirectNewReader(t *testing.T) {
 	_ = decompressor.Close()
 }
 
-// errorReader is a reader that always returns an error.
-type errorReader struct {
-	err error
-}
+// ============================================================================
+// Pool type-assertion fallback tests
+// ============================================================================
 
-func (r *errorReader) Read(p []byte) (n int, err error) {
-	return 0, r.err
+// TestPoolGet_TypeAssertionFallback exercises the defensive fallback branch in
+// each pool's Get wrapper: when sync.Pool returns a value of the wrong type
+// (which can happen if the pool is corrupted), the wrapper must return a fresh
+// zero-value instead of panicking.
+func TestPoolGet_TypeAssertionFallback(t *testing.T) {
+	t.Run("getHeadersMap", func(t *testing.T) {
+		headersMapPool.Put("wrong type") // poison the pool
+		m := getHeadersMap()
+		if m == nil {
+			t.Fatal("expected non-nil map from fallback")
+		}
+		if len(m) != 0 {
+			t.Errorf("expected empty map, got %d entries", len(m))
+		}
+	})
+
+	t.Run("getQueryParamsMap", func(t *testing.T) {
+		queryParamsPool.Put(42) // poison with a different wrong type
+		m := getQueryParamsMap()
+		if m == nil {
+			t.Fatal("expected non-nil map from fallback")
+		}
+		if len(m) != 0 {
+			t.Errorf("expected empty map, got %d entries", len(m))
+		}
+	})
+
+	t.Run("requestPool get", func(t *testing.T) {
+		rp := newRequestPool()
+		rp.pool.Put("not a request") // poison the pool
+		req := rp.get()
+		if req == nil {
+			t.Fatal("expected non-nil Request from fallback")
+		}
+	})
 }

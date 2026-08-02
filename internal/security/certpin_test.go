@@ -56,6 +56,97 @@ func mustnewPublicKeyPinner(t *testing.T, publicKeys ...[]byte) *publicKeyPinner
 	return p
 }
 
+// TestExportedConstructors verifies the exported constructor wrappers
+// (NewSPKIHashPinner, NewPublicKeyPinner, NewCertificatePinnerChain) delegate
+// correctly to their unexported counterparts. These are the public API surface
+// used by the root httpc package.
+func TestExportedConstructors(t *testing.T) {
+	_, cert, _ := generateTestCertificate(t)
+	pubKeyBytes, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
+	if err != nil {
+		t.Fatalf("failed to marshal public key: %v", err)
+	}
+	hash := sha256.Sum256(pubKeyBytes)
+	validHash := base64.StdEncoding.EncodeToString(hash[:])
+
+	t.Run("NewSPKIHashPinner valid", func(t *testing.T) {
+		pinner, err := NewSPKIHashPinner(validHash)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if pinner == nil {
+			t.Fatal("expected non-nil pinner")
+		}
+		if pinner.Pin() == "" {
+			t.Error("expected non-empty Pin() description")
+		}
+	})
+
+	t.Run("NewSPKIHashPinner multiple for rotation", func(t *testing.T) {
+		hash2 := sha256.Sum256([]byte("different"))
+		pinner, err := NewSPKIHashPinner(validHash, base64.StdEncoding.EncodeToString(hash2[:]))
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if pinner == nil {
+			t.Fatal("expected non-nil pinner")
+		}
+	})
+
+	t.Run("NewSPKIHashPinner empty returns error", func(t *testing.T) {
+		_, err := NewSPKIHashPinner()
+		if err == nil {
+			t.Error("expected error for no hashes")
+		}
+	})
+
+	t.Run("NewSPKIHashPinner invalid base64 returns error", func(t *testing.T) {
+		_, err := NewSPKIHashPinner("not-valid-base64!!!")
+		if err == nil {
+			t.Error("expected error for invalid base64")
+		}
+	})
+
+	t.Run("NewPublicKeyPinner valid", func(t *testing.T) {
+		pinner, err := NewPublicKeyPinner(pubKeyBytes)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if pinner == nil {
+			t.Fatal("expected non-nil pinner")
+		}
+		if pinner.Pin() == "" {
+			t.Error("expected non-empty Pin() description")
+		}
+	})
+
+	t.Run("NewPublicKeyPinner empty returns error", func(t *testing.T) {
+		_, err := NewPublicKeyPinner()
+		if err == nil {
+			t.Error("expected error for no public keys")
+		}
+	})
+
+	t.Run("NewCertificatePinnerChain", func(t *testing.T) {
+		a, err := NewSPKIHashPinner(validHash)
+		if err != nil {
+			t.Fatalf("NewSPKIHashPinner: %v", err)
+		}
+		hash2 := sha256.Sum256([]byte("different"))
+		b, err := NewSPKIHashPinner(base64.StdEncoding.EncodeToString(hash2[:]))
+		if err != nil {
+			t.Fatalf("NewSPKIHashPinner: %v", err)
+		}
+		chain := NewCertificatePinnerChain(a, b)
+		if chain == nil {
+			t.Fatal("expected non-nil chain")
+		}
+		if chain.Pin() == "" {
+			t.Error("expected non-empty Pin() description")
+		}
+	})
+}
+
 func TestPublicKeyPinner(t *testing.T) {
 	certDER, cert, _ := generateTestCertificate(t)
 	pubKeyBytes, err := x509.MarshalPKIXPublicKey(cert.PublicKey)

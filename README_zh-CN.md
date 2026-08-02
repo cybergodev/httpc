@@ -525,7 +525,7 @@ result, _ := httpc.Download(ctx, url, opts,
 用于对同一域名发起多次请求，自动管理 Cookie 和请求头：
 
 ```go
-client, _ := httpc.NewDomain("https://api.example.com")
+client, _ := httpc.NewDomainDefault("https://api.example.com")
 defer client.Close()
 
 // 登录 - 服务器设置 Cookie
@@ -606,7 +606,7 @@ result, _ := client.Request(ctx, "PROPFIND", "/resource")
 
 ```go
 // 创建会话管理器
-sm, _ := httpc.NewSessionManager()
+sm, _ := httpc.NewSessionManagerDefault()
 
 // 或带 Cookie 安全验证
 cfg := httpc.DefaultSessionConfig()
@@ -738,8 +738,13 @@ fmt.Println(config.String())
 | **连接设置** (`Connection`) ||||
 | `Connection.MaxIdleConns` | `int` | `50` | 最大空闲连接数 |
 | `Connection.MaxConnsPerHost` | `int` | `10` | 每个主机最大连接数 |
-| `Connection.ProxyURL` | `string` | `""` | 代理 URL (http/https) |
+| `Connection.ProxyURL` | `string` | `""` | 代理 URL (http/https/socks5/socks5h) |
 | `Connection.EnableSystemProxy` | `bool` | `false` | 自动检测系统代理 |
+| `Connection.ProxyPool` | `[]string` | `nil` | 用于轮换的代理 URL（见[代理配置](#代理配置)） |
+| `Connection.ProxyPoolStrategy` | `ProxyStrategy` | `ProxyStrategyRoundRobin` | 代理选择算法（`ProxyStrategyRoundRobin` 或 `ProxyStrategyRandom`） |
+| `Connection.ProxyFailureThreshold` | `int` | `3` | 触发熔断前的连续连接失败次数 |
+| `Connection.ProxyCooldown` | `time.Duration` | `30s` | 被熔断的代理退出轮换的时长 |
+| `Connection.ProxyRotateOnStatus` | `[]int` | `nil` | 触发代理轮换的 HTTP 状态码（如 `[]int{403}`） |
 | `Connection.EnableHTTP2` | `bool` | `true` | 启用 HTTP/2 |
 | `Connection.EnableCookies` | `bool` | `false` | 启用 Cookie Jar |
 | `Connection.EnableDoH` | `bool` | `false` | 启用 DNS-over-HTTPS |

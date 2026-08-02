@@ -203,7 +203,7 @@ import (
 )
 
 func main() {
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }
@@ -294,7 +294,7 @@ func main() {
 | `IsRedirect()` | `bool` | True for 3xx status codes |
 | `IsClientError()` | `bool` | True for 4xx status codes |
 | `IsServerError()` | `bool` | True for 5xx status codes |
-| `Unmarshal(v any)` | `error` | Parse JSON response into struct |
+| `Unmarshal(v any)` | `error` | Parse JSON response into struct (max 50 MB; returns `ErrResponseBodyTooLarge` if exceeded) |
 | `GetCookie(name)` | `*http.Cookie` | Get response cookie by name |
 | `HasCookie(name)` | `bool` | Check if response cookie exists |
 | `GetRequestCookie(name)` | `*http.Cookie` | Get request cookie by name |

@@ -66,6 +66,9 @@ if err := result.Unmarshal(&data); err != nil {
 }
 ```
 
+> **Note:** `Unmarshal` rejects bodies larger than 50 MB with `ErrResponseBodyTooLarge`.
+> For larger responses, read `RawBody()` and decode manually.
+
 ## Response Status Checking
 
 ### Status Helper Methods
@@ -595,7 +598,7 @@ func fetchUser(ctx context.Context, client httpc.Client, userID int) (*User, err
 }
 
 func main() {
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }

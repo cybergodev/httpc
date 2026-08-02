@@ -55,7 +55,7 @@ func main() {
 For reusable clients or when making multiple requests, create a client instance:
 
 ```go
-client, err := httpc.New()
+client, err := httpc.NewDefault()
 if err != nil {
     log.Fatal(err)
 }
@@ -327,7 +327,7 @@ The streaming download implementation is memory-efficient even for large files. 
 ### 1. Always Close the Client
 
 ```go
-client, err := httpc.New()
+client, err := httpc.NewDefault()
 if err != nil {
     log.Fatal(err)
 }

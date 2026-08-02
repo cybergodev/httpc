@@ -302,110 +302,47 @@ func TestCreateTLSConfig_NoCustom(t *testing.T) {
 	}
 }
 
-// TestCreateVerifyPeerCertificate_Success verifies the certificate verification
-// callback succeeds when the cert pinner accepts the certificate.
-func TestCreateVerifyPeerCertificate_Success(t *testing.T) {
-	pinner := &mockCertPinner{shouldFail: false}
-	config := &Config{
-		certPinner: pinner,
-	}
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	tlsConfig := pm.transport.TLSClientConfig
-	verifyFn := tlsConfig.VerifyPeerCertificate
-	if verifyFn == nil {
-		t.Fatal("VerifyPeerCertificate should not be nil")
+// TestCreateVerifyPeerCertificate verifies the certificate verification
+// callback across pinner success, pinner failure, and InsecureSkipVerify paths.
+func TestCreateVerifyPeerCertificate(t *testing.T) {
+	tests := []struct {
+		name               string
+		shouldFail         bool
+		insecureSkipVerify bool
+		wantErr            bool
+	}{
+		{"pinner accepts certificate", false, false, false},
+		{"pinner rejects certificate", true, false, true},
+		{"InsecureSkipVerify with accepting pinner", false, true, false},
 	}
 
-	// Call with empty args — mock pinner succeeds
-	err = verifyFn(nil, nil)
-	if err != nil {
-		t.Errorf("expected no error, got: %v", err)
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{
+				certPinner: &mockCertPinner{shouldFail: tt.shouldFail},
+			}
+			if tt.insecureSkipVerify {
+				config.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+			}
 
-// TestCreateVerifyPeerCertificate_PinnerFailure verifies the certificate verification
-// callback returns an error when the cert pinner rejects the certificate.
-func TestCreateVerifyPeerCertificate_PinnerFailure(t *testing.T) {
-	pinner := &mockCertPinner{shouldFail: true}
-	config := &Config{
-		certPinner: pinner,
-	}
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
+			pm, err := NewPoolManager(config)
+			if err != nil {
+				t.Fatalf("NewPoolManager() error: %v", err)
+			}
+			defer func() { _ = pm.Close() }()
 
-	tlsConfig := pm.transport.TLSClientConfig
-	verifyFn := tlsConfig.VerifyPeerCertificate
-	if verifyFn == nil {
-		t.Fatal("VerifyPeerCertificate should not be nil")
-	}
+			verifyFn := pm.transport.TLSClientConfig.VerifyPeerCertificate
+			if verifyFn == nil {
+				t.Fatal("VerifyPeerCertificate should not be nil")
+			}
 
-	err = verifyFn(nil, nil)
-	if err == nil {
-		t.Error("expected error from pinner failure, got nil")
-	}
-}
-
-// TestCreateVerifyPeerCertificate_InsecureSkipVerify verifies that when
-// InsecureSkipVerify is true, the verify function still runs pinning but
-// returns nil after pinning succeeds.
-func TestCreateVerifyPeerCertificate_InsecureSkipVerify(t *testing.T) {
-	pinner := &mockCertPinner{shouldFail: false}
-	customTLS := &tls.Config{
-		InsecureSkipVerify: true,
-	}
-	config := &Config{
-		TLSConfig:  customTLS,
-		certPinner: pinner,
-	}
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	tlsConfig := pm.transport.TLSClientConfig
-	verifyFn := tlsConfig.VerifyPeerCertificate
-	if verifyFn == nil {
-		t.Fatal("VerifyPeerCertificate should not be nil")
-	}
-
-	// Should succeed — pinner passes and InsecureSkipVerify skips standard verification
-	err = verifyFn(nil, nil)
-	if err != nil {
-		t.Errorf("expected no error with InsecureSkipVerify, got: %v", err)
-	}
-}
-
-// TestCreateDialer_SSRFProtection verifies that the dialer rejects connections
-// to private IP addresses when AllowPrivateIPs is false.
-func TestCreateDialer_SSRFProtection(t *testing.T) {
-	config := &Config{
-		AllowPrivateIPs: false,
-		DialTimeout:     1 * time.Second,
-	}
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	// Get the dialer function from the transport
-	dialFn := pm.createDialer()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Try to dial a private IP — should be blocked by SSRF protection
-	_, err = dialFn(ctx, "tcp", "127.0.0.1:8080")
-	if err == nil {
-		t.Error("expected error when dialing private IP with SSRF protection")
+			err = verifyFn(nil, nil)
+			if tt.wantErr && err == nil {
+				t.Error("expected error, got nil")
+			} else if !tt.wantErr && err != nil {
+				t.Errorf("expected no error, got: %v", err)
+			}
+		})
 	}
 }
 

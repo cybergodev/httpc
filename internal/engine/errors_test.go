@@ -232,6 +232,28 @@ func TestClientError_IsRetryable(t *testing.T) {
 			err:       &ClientError{Type: ErrorTypeNetwork, Cause: context.Canceled},
 			wantRetry: false,
 		},
+		// OpError-specific paths (isRetryableOpError) — syscall errno and
+		// wrapped-message classification inside a *net.OpError.
+		{
+			name:      "OpError with ECONNREFUSED errno is retryable",
+			err:       &ClientError{Type: ErrorTypeNetwork, Cause: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}},
+			wantRetry: true,
+		},
+		{
+			name:      "OpError with non-retryable errno (EINVAL) is not retryable",
+			err:       &ClientError{Type: ErrorTypeNetwork, Cause: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.EINVAL}},
+			wantRetry: false,
+		},
+		{
+			name:      "OpError with connection reset message is retryable",
+			err:       &ClientError{Type: ErrorTypeNetwork, Cause: &net.OpError{Op: "read", Net: "tcp", Err: errors.New("connection reset by peer")}},
+			wantRetry: true,
+		},
+		{
+			name:      "OpError with context.DeadlineExceeded is not retryable",
+			err:       &ClientError{Type: ErrorTypeNetwork, Cause: &net.OpError{Op: "dial", Net: "tcp", Err: context.DeadlineExceeded}},
+			wantRetry: false,
+		},
 	}
 
 	for _, tt := range tests {

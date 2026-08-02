@@ -17,7 +17,7 @@ HTTPC is designed to be safe for concurrent use across multiple goroutines. This
 The `Client` type is safe for concurrent use. Multiple goroutines can call methods on the same client instance simultaneously:
 
 ```go
-client, err := httpc.New()
+client, err := httpc.NewDefault()
 if err != nil {
     log.Fatal(err)
 }
@@ -95,7 +95,7 @@ go func() {
 The `DomainClient` is also safe for concurrent use:
 
 ```go
-dc, err := httpc.NewDomain("https://api.example.com")
+dc, err := httpc.NewDomainDefault("https://api.example.com")
 if err != nil {
     log.Fatal(err)
 }
@@ -129,7 +129,7 @@ var globalClient httpc.Client
 
 func init() {
     var err error
-    globalClient, err = httpc.New()
+    globalClient, err = httpc.NewDefault()
     if err != nil {
         log.Fatalf("failed to initialize HTTP client: %v", err)
     }
@@ -145,7 +145,7 @@ func makeRequest(url string) (*httpc.Result, error) {
 ```go
 // ❌ WRONG: Creating client per request
 func makeRequest(url string) (*httpc.Result, error) {
-    client, _ := httpc.New()  // Inefficient!
+    client, _ := httpc.NewDefault()  // Inefficient!
     defer client.Close()
     return client.Get(url)
 }
@@ -155,7 +155,7 @@ var sharedClient httpc.Client
 
 func init() {
     var err error
-    sharedClient, err = httpc.New()
+    sharedClient, err = httpc.NewDefault()
     if err != nil {
         log.Fatalf("failed to create shared client: %v", err)
     }
@@ -210,7 +210,7 @@ Always close the client when you're finished to release resources:
 
 ```go
 func main() {
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }
@@ -284,7 +284,7 @@ go func() {
 
 ```go
 // ❌ WRONG
-client, _ := httpc.New()
+client, _ := httpc.NewDefault()
 go func() {
     time.Sleep(100 * time.Millisecond)
     client.Close()  // May close while other goroutines are using it

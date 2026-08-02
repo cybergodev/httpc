@@ -30,6 +30,9 @@ func main() {
 
 	// Example 6: Manual redirect handling
 	example6ManualHandling()
+
+	// Example 7: Redirect whitelist (security)
+	example7RedirectWhitelist()
 }
 
 func example1AutoFollow() {
@@ -257,4 +260,40 @@ func example6ManualHandling() {
 	if redirectCount >= maxRedirects {
 		fmt.Printf("Stopped after %d redirects (limit reached)\n\n", maxRedirects)
 	}
+}
+
+// example7RedirectWhitelist shows how to restrict redirects to trusted domains.
+// RedirectWhitelist is a security measure: even when following redirects, the
+// client only follows to domains on the whitelist, blocking open-redirect and
+// redirect-based SSRF attacks.
+func example7RedirectWhitelist() {
+	fmt.Println("Example 7: Redirect Whitelist (Security)")
+	fmt.Println("-----------------------------------------")
+
+	// Only allow redirects to httpbin.org — redirects to any other domain
+	// are blocked even when FollowRedirects is true.
+	config := httpc.DefaultConfig()
+	config.Defaults.FollowRedirects = true
+	config.Security.RedirectWhitelist = []string{"httpbin.org"}
+
+	client, err := httpc.New(config)
+	if err != nil {
+		log.Printf("Failed to create client: %v\n", err)
+		return
+	}
+	defer client.Close()
+
+	// Same-domain redirect: allowed (httpbin.org → httpbin.org)
+	resp, err := client.Get("https://httpbin.org/redirect/1")
+	if err != nil {
+		log.Printf("Same-domain redirect error: %v\n", err)
+	} else {
+		fmt.Printf("Same-domain redirect: allowed (Status %d, %d redirects)\n",
+			resp.StatusCode(), resp.Meta.RedirectCount)
+	}
+
+	fmt.Println("\nRedirectWhitelist:")
+	fmt.Println("  - Only listed domains may receive redirected requests")
+	fmt.Println("  - Blocks open-redirect and redirect-based SSRF attacks")
+	fmt.Println("  - Combine with SecureConfig() for defense-in-depth\n ")
 }
