@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"syscall"
 	"testing"
 	"time"
 
@@ -854,5 +855,71 @@ func TestErrorHandling_TimeoutScenarios(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestIsRetryableSyscallError_WSAErrno verifies that Windows WSA error codes
+// (returned by real networking functions) are recognized as retryable.
+//
+// On Go 1.25+ Windows, POSIX-style syscall.E* constants (e.g. ECONNREFUSED)
+// use an APPLICATION_ERROR (1<<29) base offset that does not match the raw
+// WSA* codes returned by Windows networking. This test ensures the raw WSA
+// values are caught by the platform-specific retryableSyscallErrorsExt check.
+func TestIsRetryableSyscallError_WSAErrno(t *testing.T) {
+	// These raw WSA error codes are what Windows networking functions return.
+	// They do not match syscall.ECONNREFUSED etc. on Go 1.25+ Windows.
+	wsaErrnos := []struct {
+		name  string
+		errno uintptr // raw WSA code value
+	}{
+		{"WSAECONNRESET", 10054},
+		{"WSAETIMEDOUT", 10060},
+		{"WSAECONNREFUSED", 10061},
+		{"WSAENETUNREACH", 10051},
+		{"WSAEHOSTUNREACH", 10065},
+	}
+	for _, tt := range wsaErrnos {
+		t.Run(tt.name, func(t *testing.T) {
+			errno := syscall.Errno(tt.errno)
+			if !isRetryableSyscallError(errno) {
+				t.Errorf("isRetryableSyscallError(Errno(%d)) = false, want true (WSA code %s)", tt.errno, tt.name)
+			}
+		})
+	}
+}
+
+// TestProxyConnectionRefused_RealDial dials a dead port to produce a real
+// connection-refused error, then verifies the full error chain (url.Error →
+// proxyconnect OpError → "proxy connection failed" → dial OpError → syscall)
+// is classified as retryable. This is the exact error path triggered when a
+// proxy in a ProxyPool is unreachable.
+func TestProxyConnectionRefused_RealDial(t *testing.T) {
+	dialer := &net.Dialer{}
+	_, err := dialer.DialContext(context.Background(), "tcp", "127.0.0.1:1")
+	if err == nil {
+		t.Skip("port 1 is open, cannot test connection-refused")
+	}
+
+	// Replicate the error wrapping chain from pool.go createDialer +
+	// Go's http.Transport + http.Client:
+	//   1. dialer wraps: fmt.Errorf("proxy connection failed: %w", dialErr)
+	//   2. transport wraps: &net.OpError{Op: "proxyconnect", Err: wrapped}
+	//   3. client wraps: &url.Error{Op: "Get", Err: proxyErr}
+	wrapped := fmt.Errorf("proxy connection failed: %w", err)
+	proxyErr := &net.OpError{Op: "proxyconnect", Net: "tcp", Err: wrapped}
+	urlErr := &url.Error{Op: "Get", URL: "https://example.com", Err: proxyErr}
+
+	clientErr := classifyError(urlErr, "", "", 0)
+	if clientErr.Type != ErrorTypeNetwork {
+		t.Fatalf("expected ErrorTypeNetwork, got %v", clientErr.Type)
+	}
+	if !clientErr.IsRetryable() {
+		t.Fatal("proxy connection-refused should be retryable (enables proxy rotation on retry)")
+	}
+
+	// Also verify the retryEngine path used by executeWithRetry
+	re := newRetryEngine(&Config{MaxRetries: 3})
+	if !re.ShouldRetry(nil, urlErr, 0) {
+		t.Fatal("retryEngine.ShouldRetry should return true for proxy connection-refused")
 	}
 }

@@ -11,12 +11,14 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cybergodev/httpc/internal/connection"
+	"github.com/cybergodev/httpc/internal/proxypool"
 	"github.com/cybergodev/httpc/internal/security"
 	"github.com/cybergodev/httpc/internal/types"
 	"github.com/cybergodev/httpc/internal/validation"
@@ -187,6 +189,12 @@ type Config struct {
 	// System proxy configuration
 	EnableSystemProxy bool // Automatically detect and use system proxy settings
 
+	// Proxy pool configuration
+	ProxyPool             []string
+	ProxyPoolStrategy     proxypool.Strategy
+	ProxyFailureThreshold int
+	ProxyCooldown         time.Duration
+
 	TLSConfig               *tls.Config
 	MinTLSVersion           uint16
 	MaxTLSVersion           uint16
@@ -205,6 +213,11 @@ type Config struct {
 	MaxRetryDelay time.Duration
 	BackoffFactor float64
 	Jitter        bool
+
+	// ExtraRetryableStatusCodes are HTTP status codes beyond the built-in set
+	// (408/429/500/502/503/504) that should trigger a retry. Seeded from
+	// Connection.ProxyRotateOnStatus to rotate proxies on WAF/CF blocks.
+	ExtraRetryableStatusCodes []int
 
 	// CustomRetryPolicy allows providing a custom retry policy implementation.
 	// If set, it overrides the built-in retry logic.
@@ -487,6 +500,10 @@ func NewClient(config *Config, opts ...clientOption) (*Client, error) {
 		connConfig.EnableHTTP2 = config.EnableHTTP2
 		connConfig.ProxyURL = config.ProxyURL
 		connConfig.EnableSystemProxy = config.EnableSystemProxy
+		connConfig.ProxyPool = config.ProxyPool
+		connConfig.ProxyPoolStrategy = config.ProxyPoolStrategy
+		connConfig.ProxyFailureThreshold = config.ProxyFailureThreshold
+		connConfig.ProxyCooldown = config.ProxyCooldown
 		connConfig.CookieJar = config.CookieJar
 		connConfig.AllowPrivateIPs = config.AllowPrivateIPs
 		connConfig.ExemptNets = config.ExemptNets
@@ -769,8 +786,43 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 		}
 	}
 
+	// Deterministic proxy rotation: when a proxy pool is configured with
+	// status-based rotation (ExtraRetryableStatusCodes), reserve a unique base
+	// proxy index per request via NextProxyIndex. Each retry attempt then uses
+	// baseProxyIdx + attempt as the SelectIndex argument, guaranteeing:
+	//   - Inter-request rotation: different requests get different base indices.
+	//   - Intra-request rotation: retry N lands on a different proxy than N-1.
+	//   - Redirect-safe: all Proxy calls within one attempt share the same index,
+	//     so redirect-following cannot desynchronize the rotation.
+	retryBaseCtx := req.Context()
+	baseProxyIdx := 0
+	useProxyRotation := len(c.config.ExtraRetryableStatusCodes) > 0
+	if useProxyRotation && c.connectionPool != nil {
+		var ok bool
+		baseProxyIdx, ok = c.connectionPool.NextProxyIndex()
+		useProxyRotation = ok // false if pool wasn't actually created
+	}
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if useProxyRotation {
+			req.SetContext(connection.WithProxyAttempt(retryBaseCtx, baseProxyIdx+attempt))
+		} else {
+			req.SetContext(retryBaseCtx)
+		}
+
 		resp, err := c.executeRequest(req, false)
+
+		if os.Getenv("HTTPC_DEBUG") != "" {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[httpc] attempt=%d ERROR: %v (retryable=%v)\n",
+					attempt, err, classifyError(err, "", "", 0).IsRetryable())
+			} else if resp != nil {
+				shouldRetry := policy.ShouldRetry(resp, nil, attempt)
+				fmt.Fprintf(os.Stderr, "[httpc] attempt=%d status=%d shouldRetry=%v attemptLtMax=%v proxyIdx=%d\n",
+					attempt, resp.StatusCode(), shouldRetry, attempt < maxRetries,
+					func() int { if useProxyRotation { return baseProxyIdx + attempt }; return -1 }())
+			}
+		}
 
 		if err != nil {
 			clientErr := classifyErrorWithSanitizedURL(err, sanitizedURL, reqMethod, attempt+1)
@@ -792,6 +844,13 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 
 			// Calculate delay and sleep
 			delay := policy.GetDelay(attempt)
+
+			// Close idle connections to force Proxy() re-evaluation on retry
+			// (see comment in the response-path retry block below).
+			if useProxyRotation && c.connectionPool != nil {
+				c.connectionPool.CloseIdleConnections()
+			}
+
 			if sleepErr := c.sleepWithContext(req.Context(), delay); sleepErr != nil {
 				releaseLastResp(&lastResp)
 				return nil, classifyError(sleepErr, req.URL(), req.Method(), attempt+1)
@@ -817,6 +876,10 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 					delay = policy.GetDelay(attempt)
 				}
 
+				if os.Getenv("HTTPC_DEBUG") != "" {
+					fmt.Fprintf(os.Stderr, "[httpc] attempt=%d retrying after %v delay\n", attempt, delay)
+				}
+
 				// Release this discarded response now rather than carrying it as
 				// lastResp across the backoff sleep and the next attempt. For a
 				// streaming response the body reader pins a connection until
@@ -824,6 +887,15 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 				// that slot for the full delay instead of holding it idle.
 				ReleaseResponse(resp)
 				lastResp = nil
+
+				// Close idle connections so the next attempt's transport
+				// MUST call Proxy() again to select a (different) proxy.
+				// Without this, HTTP/2 connection reuse through a CONNECT
+				// tunnel silently reuses the failed attempt's tunnel,
+				// bypassing Proxy() and defeating proxy rotation.
+				if useProxyRotation && c.connectionPool != nil {
+					c.connectionPool.CloseIdleConnections()
+				}
 
 				if sleepErr := c.sleepWithContext(req.Context(), delay); sleepErr != nil {
 					return nil, classifyErrorWithSanitizedURL(sleepErr, sanitizedURL, reqMethod, attempt+1)

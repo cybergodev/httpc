@@ -883,6 +883,34 @@ config := httpc.DefaultConfig()
 config.Connection.EnableSystemProxy = true  // 从环境变量和系统设置读取
 ```
 
+### 代理池（轮换 + 熔断）
+
+在多个代理之间分发请求，支持自动故障转移和基于状态码的轮换：
+
+```go
+config := httpc.DefaultConfig()
+config.Connection.ProxyPool = []string{
+    "http://proxy1.example.com:7070",
+    "http://proxy2.example.com:8080",
+    "socks5://proxy3.example.com:1080",
+}
+// 策略：ProxyStrategyRoundRobin（默认）或 ProxyStrategyRandom
+config.Connection.ProxyPoolStrategy = httpc.ProxyStrategyRoundRobin
+
+// 熔断：连续 5 次连接失败后跳过该代理 60 秒，然后重试（半开探测）。
+// 默认值：阈值=3，冷却=30s。
+config.Connection.ProxyFailureThreshold = 5
+config.Connection.ProxyCooldown = 60 * time.Second
+
+// 遇到 403 时轮换代理（Cloudflare/WAF IP 封锁）。请求会通过不同的代理 IP 重试。
+// 需要 Retry.MaxRetries > 0。
+// 与连接失败不同，基于状态码的轮换不会触发熔断——封锁通常是目标相关的。
+config.Connection.ProxyRotateOnStatus = []int{403}
+config.Retry.MaxRetries = 3
+```
+
+**优先级：** `ProxyURL` > `ProxyPool` > `EnableSystemProxy` > 直连。
+
 ---
 
 ## 安全特性

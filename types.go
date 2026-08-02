@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/cybergodev/httpc/internal/engine"
+	"github.com/cybergodev/httpc/internal/proxypool"
 	"github.com/cybergodev/httpc/internal/types"
 	"github.com/cybergodev/httpc/internal/validation"
 )
@@ -65,6 +66,19 @@ type TimeoutConfig struct {
 	IdleConn time.Duration
 }
 
+// ProxyStrategy selects the algorithm for choosing a proxy from a proxy pool.
+// Alias for proxypool.Strategy to avoid importing the internal package.
+type ProxyStrategy = proxypool.Strategy
+
+const (
+	// ProxyStrategyRoundRobin cycles through proxies in order (default).
+	// Each selection advances to the next proxy, so a retry naturally lands on
+	// a different IP without any extra wiring.
+	ProxyStrategyRoundRobin = proxypool.StrategyRoundRobin
+	// ProxyStrategyRandom picks a healthy proxy uniformly at random.
+	ProxyStrategyRandom = proxypool.StrategyRandom
+)
+
 // ConnectionConfig configures connection pooling and proxy behavior.
 type ConnectionConfig struct {
 	// MaxIdleConns is the maximum number of idle connections across all hosts.
@@ -82,6 +96,43 @@ type ConnectionConfig struct {
 	// EnableSystemProxy enables automatic detection of system proxy settings.
 	// Default: false.
 	EnableSystemProxy bool
+
+	// ProxyPool specifies a list of proxy servers for rotation. When set,
+	// requests are distributed across the proxies using ProxyPoolStrategy.
+	// Connection failures (dial/TLS) to a proxy trigger passive circuit
+	// breaking: after ProxyFailureThreshold consecutive failures the proxy is
+	// temporarily removed from rotation and restored after ProxyCooldown.
+	//
+	// Priority: lower than ProxyURL, higher than EnableSystemProxy. If both
+	// ProxyURL and ProxyPool are set, ProxyURL wins (single-proxy mode).
+	// Default: nil (no proxy pool).
+	ProxyPool []string
+
+	// ProxyPoolStrategy selects how proxies are chosen from ProxyPool.
+	// Default: ProxyStrategyRoundRobin.
+	ProxyPoolStrategy ProxyStrategy
+
+	// ProxyFailureThreshold is the number of consecutive connection failures
+	// (dial/TLS) to a proxy before it is temporarily removed from rotation.
+	// Zero defaults to 3. HTTP status codes do NOT trigger this — use
+	// ProxyRotateOnStatus for status-based rotation.
+	ProxyFailureThreshold int
+
+	// ProxyCooldown is how long a circuit-broken proxy stays out of rotation
+	// before being retried (half-open probe). Zero defaults to 30s.
+	ProxyCooldown time.Duration
+
+	// ProxyRotateOnStatus specifies HTTP status codes that trigger a retry with
+	// a different proxy. When a response returns one of these codes and
+	// Retry.MaxRetries > 0, the request is retried; under round-robin or random
+	// strategy the retry naturally selects a different proxy IP.
+	//
+	// Typical use: []int{403} for CF/WAF IP-based blocking. Unlike
+	// connection failures, status-based rotation does NOT circuit-break the
+	// proxy — blocks are often target-specific (a proxy blocked on one site may
+	// work fine on another). Requires Retry.MaxRetries > 0 to take effect.
+	// Default: nil.
+	ProxyRotateOnStatus []int
 
 	// EnableHTTP2 enables HTTP/2 protocol support.
 	// Default: true.
@@ -466,6 +517,24 @@ func ValidateConfig(cfg *Config) error {
 				return fmt.Errorf("%w: Connection.ProxyURL: %w", ErrInvalidConnection, err)
 			}
 		}
+		// Validate proxy pool entries — each must pass the same validator as
+		// ProxyURL so the public Config layer and internal pool cannot drift.
+		for _, proxyURL := range cfg.Connection.ProxyPool {
+			if _, err := validation.ValidateProxyURL(proxyURL); err != nil {
+				return fmt.Errorf("%w: Connection.ProxyPool entry %q: %w", ErrInvalidConnection, proxyURL, err)
+			}
+		}
+		if cfg.Connection.ProxyFailureThreshold < 0 {
+			return fmt.Errorf("%w: Connection.ProxyFailureThreshold cannot be negative, got %d", ErrInvalidConnection, cfg.Connection.ProxyFailureThreshold)
+		}
+		if cfg.Connection.ProxyCooldown < 0 || cfg.Connection.ProxyCooldown > maxTimeout {
+			return fmt.Errorf("%w: Connection.ProxyCooldown must be 0-%v, got %v", ErrInvalidConnection, maxTimeout, cfg.Connection.ProxyCooldown)
+		}
+		for _, code := range cfg.Connection.ProxyRotateOnStatus {
+			if code < 100 || code > 599 {
+				return fmt.Errorf("%w: Connection.ProxyRotateOnStatus contains invalid HTTP status code %d (must be 100-599)", ErrInvalidConnection, code)
+			}
+		}
 		if cfg.Connection.DoHCacheTTL < 0 {
 			return fmt.Errorf("%w: Connection.DoHCacheTTL cannot be negative, got %v", ErrInvalidConnection, cfg.Connection.DoHCacheTTL)
 		}
@@ -591,6 +660,8 @@ func (c *Config) String() string {
 		b.Write(strconv.AppendInt(numBuf[:0], int64(c.Connection.MaxConnsPerHost), 10))
 		b.WriteString(", ProxyURL: ")
 		b.WriteString(maskProxyURL(c.Connection.ProxyURL))
+		b.WriteString(", ProxyPool: ")
+		b.Write(strconv.AppendInt(numBuf[:0], int64(len(c.Connection.ProxyPool)), 10))
 	} else {
 		b.WriteString("<nil>")
 	}

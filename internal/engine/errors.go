@@ -268,9 +268,10 @@ func isRetryableSyscallError(errno syscall.Errno) bool {
 	case syscall.ECONNREFUSED, syscall.ECONNRESET, syscall.EPIPE,
 		syscall.ETIMEDOUT, syscall.ENETUNREACH, syscall.EHOSTUNREACH:
 		return true
-	default:
-		return false
 	}
+	// Check platform-specific error codes (Windows WSA errors) that are not
+	// covered by the POSIX-style constants above.
+	return retryableSyscallErrorsExt(errno)
 }
 
 // isRetryableNetworkMessage checks if an error message indicates a retryable network condition.

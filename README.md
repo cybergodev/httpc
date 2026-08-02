@@ -884,6 +884,35 @@ config := httpc.DefaultConfig()
 config.Connection.EnableSystemProxy = true // Reads from environment and system settings
 ```
 
+### Proxy Pool (Rotation + Circuit Breaking)
+
+Distribute requests across multiple proxies with automatic failover and status-based rotation:
+
+```go
+config := httpc.DefaultConfig()
+config.Connection.ProxyPool = []string{
+    "http://proxy1.example.com:7070",
+    "http://proxy2.example.com:8080",
+    "socks5://proxy3.example.com:1080",
+}
+// Strategy: ProxyStrategyRoundRobin (default) or ProxyStrategyRandom
+config.Connection.ProxyPoolStrategy = httpc.ProxyStrategyRoundRobin
+
+// Circuit breaking: after 5 consecutive connection failures, skip the proxy
+// for 60s, then retry it (half-open probe). Defaults: threshold=3, cooldown=30s.
+config.Connection.ProxyFailureThreshold = 5
+config.Connection.ProxyCooldown = 60 * time.Second
+
+// Rotate proxy on 403 (CF/WAF IP blocking). The request is retried
+// through a different proxy IP. Requires Retry.MaxRetries > 0.
+// Unlike connection failures, status-based rotation does NOT circuit-break
+// the proxy — blocks are often target-specific.
+config.Connection.ProxyRotateOnStatus = []int{403}
+config.Retry.MaxRetries = 3
+```
+
+**Priority:** `ProxyURL` > `ProxyPool` > `EnableSystemProxy` > direct.
+
 ---
 
 ## Security Features

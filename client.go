@@ -235,6 +235,18 @@ func deepCopyConfig(src *Config) *Config {
 		copy(dst.Security.RedirectWhitelist, src.Security.RedirectWhitelist)
 	}
 
+	// Deep copy proxy pool entries
+	if src.Connection != nil && len(src.Connection.ProxyPool) > 0 {
+		dst.Connection.ProxyPool = make([]string, len(src.Connection.ProxyPool))
+		copy(dst.Connection.ProxyPool, src.Connection.ProxyPool)
+	}
+
+	// Deep copy proxy rotation status codes
+	if src.Connection != nil && len(src.Connection.ProxyRotateOnStatus) > 0 {
+		dst.Connection.ProxyRotateOnStatus = make([]int, len(src.Connection.ProxyRotateOnStatus))
+		copy(dst.Connection.ProxyRotateOnStatus, src.Connection.ProxyRotateOnStatus)
+	}
+
 	// Clone TLS config if present
 	if src.Security != nil && src.Security.TLSConfig != nil {
 		dst.Security.TLSConfig = src.Security.TLSConfig.Clone()

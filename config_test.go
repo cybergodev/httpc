@@ -655,6 +655,15 @@ func TestValidateConfig_AdditionalBoundaries(t *testing.T) {
 		{"backoff factor at minimum", func(c *Config) { c.Retry.BackoffFactor = 1.0 }, false},
 		{"backoff factor at maximum", func(c *Config) { c.Retry.BackoffFactor = 10.0 }, false},
 		{"backoff factor over maximum", func(c *Config) { c.Retry.BackoffFactor = 11.0 }, true},
+		{"invalid proxy pool entry", func(c *Config) { c.Connection.ProxyPool = []string{"ftp://bad.example.com:8080"} }, true},
+		{"negative proxy failure threshold", func(c *Config) { c.Connection.ProxyFailureThreshold = -1 }, true},
+		{"negative proxy cooldown", func(c *Config) { c.Connection.ProxyCooldown = -1 * time.Second }, true},
+		{"invalid rotate status code low", func(c *Config) { c.Connection.ProxyRotateOnStatus = []int{99} }, true},
+		{"invalid rotate status code high", func(c *Config) { c.Connection.ProxyRotateOnStatus = []int{600} }, true},
+		{"valid proxy pool", func(c *Config) { c.Connection.ProxyPool = []string{"http://proxy:8080", "socks5://proxy2:1080"} }, false},
+		{"valid rotate status code", func(c *Config) { c.Connection.ProxyRotateOnStatus = []int{403, 429} }, false},
+		{"zero proxy failure threshold", func(c *Config) { c.Connection.ProxyFailureThreshold = 0 }, false},
+		{"zero proxy cooldown", func(c *Config) { c.Connection.ProxyCooldown = 0 }, false},
 	}
 
 	for _, tt := range tests {

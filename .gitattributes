@@ -1,0 +1,3 @@
+# Normalize line endings: always check out text files with LF,
+# regardless of platform autocrlf settings.
+* text=auto eol=lf

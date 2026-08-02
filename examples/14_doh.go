@@ -29,7 +29,7 @@ func main() {
 func demonstrateBasicDoH() {
 	fmt.Println("--- Example 1: Basic DoH ---")
 
-	// Enable DoH - uses Cloudflare, Google, and Ali DNS providers by default
+	// Enable DoH - uses CF, Google, and Ali DNS providers by default
 	config := httpc.DefaultConfig()
 	config.Connection.EnableDoH = true
 

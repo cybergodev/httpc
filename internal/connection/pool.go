@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/cybergodev/httpc/internal/dns"
 	"github.com/cybergodev/httpc/internal/proxy"
+	"github.com/cybergodev/httpc/internal/proxypool"
 	"github.com/cybergodev/httpc/internal/validation"
 )
 
@@ -42,6 +44,7 @@ type PoolManager struct {
 	transport   *http.Transport
 	dohResolver *dns.DoHResolver
 	proxyAddrs  []string
+	proxyPool   *proxypool.Pool
 
 	activeConns   int64
 	totalConns    int64
@@ -89,6 +92,14 @@ type Config struct {
 
 	// System proxy configuration
 	EnableSystemProxy bool // Automatically detect and use system proxy settings
+
+	// Proxy pool configuration. When set, requests are distributed across the
+	// listed proxies with passive circuit breaking. Lower priority than
+	// ProxyURL, higher than EnableSystemProxy.
+	ProxyPool             []string
+	ProxyPoolStrategy     proxypool.Strategy
+	ProxyFailureThreshold int
+	ProxyCooldown         time.Duration
 
 	AllowPrivateIPs bool
 
@@ -206,8 +217,9 @@ func NewPoolManager(config *Config) (*PoolManager, error) {
 
 	// Configure proxy settings with priority:
 	// 1. Manual proxy URL (highest priority)
-	// 2. System proxy detection (if enabled)
-	// 3. Direct connection (no proxy)
+	// 2. Proxy pool (rotating, with circuit breaking)
+	// 3. System proxy detection (if enabled)
+	// 4. Direct connection (no proxy)
 	if config.ProxyURL != "" {
 		// Shared validator (same one ValidateConfig uses): accepts http/https and
 		// socks5/socks5h, and checks the host. Routing through it here — instead of
@@ -223,6 +235,44 @@ func NewPoolManager(config *Config) (*PoolManager, error) {
 		// connecting directly, so blocking proxy hosts adds no meaningful security.
 		pm.proxyAddrs = append(pm.proxyAddrs, proxyURL.Host)
 		transport.Proxy = http.ProxyURL(proxyURL)
+	} else if len(config.ProxyPool) > 0 {
+		// Proxy pool: distribute requests across multiple proxies with passive
+		// circuit breaking. transport.Proxy delegates to pool.Select, which
+		// skips circuit-open proxies; the dialer reports connection failures
+		// and successes back to the pool so dead proxies are temporarily
+		// removed from rotation.
+		pool, err := proxypool.New(proxypool.Config{
+			Proxies:          config.ProxyPool,
+			Strategy:         config.ProxyPoolStrategy,
+			FailureThreshold: config.ProxyFailureThreshold,
+			Cooldown:         config.ProxyCooldown,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("proxy pool: %w", err)
+		}
+		pm.proxyPool = pool
+		// Seed all proxy hosts so isProxyAddr recognizes them and the dialer
+		// bypasses SSRF validation for developer-configured proxy infrastructure.
+		pm.proxyAddrs = append(pm.proxyAddrs, pool.Hosts()...)
+		// Wrap pool.Select so that when the retry engine sets a proxy-attempt
+		// index on the request context (WithProxyAttempt), we use deterministic
+		// SelectIndex instead of advancing the round-robin counter. This ensures
+		// each retry attempt lands on a different proxy even when redirect-
+		// following within a single attempt consumes extra Proxy calls.
+		transport.Proxy = func(req *http.Request) (*url.URL, error) {
+			if attempt, ok := ProxyAttemptFromContext(req.Context()); ok {
+				u := pool.SelectIndex(attempt)
+				if os.Getenv("HTTPC_DEBUG") != "" {
+					fmt.Fprintf(os.Stderr, "[httpc] proxy SelectIndex(%d) → %s\n", attempt, u.Host)
+				}
+				return u, nil
+			}
+			u, err := pool.Select(req)
+			if os.Getenv("HTTPC_DEBUG") != "" && err == nil {
+				fmt.Fprintf(os.Stderr, "[httpc] proxy Select(round-robin) → %s\n", u.Host)
+			}
+			return u, err
+		}
 	} else if config.EnableSystemProxy {
 		// No manual proxy, but system proxy detection is enabled.
 		// Automatically detect system proxy settings (reads from Windows registry,
@@ -289,6 +339,9 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 			stats := pm.updateConnectionMetrics(address, err == nil)
 
 			if err != nil {
+				if pm.proxyPool != nil {
+					pm.proxyPool.ReportFailure(address)
+				}
 				atomic.AddInt64(&pm.rejectedConns, 1)
 				if pm.config.MaxTotalConns > 0 {
 					atomic.AddInt64(&pm.totalConns, -1)
@@ -296,6 +349,9 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 				return nil, fmt.Errorf("proxy connection failed: %w", err)
 			}
 
+			if pm.proxyPool != nil {
+				pm.proxyPool.ReportSuccess(address)
+			}
 			atomic.AddInt64(&pm.activeConns, 1)
 			return &trackedConn{
 				Conn:  conn,
@@ -658,6 +714,29 @@ func (pm *PoolManager) evictStaleHosts() {
 
 func (pm *PoolManager) GetTransport() *http.Transport {
 	return pm.transport
+}
+
+// CloseIdleConnections closes all idle connections in the underlying transport.
+// Used by the retry layer to force the transport to re-evaluate transport.Proxy
+// on the next request — without this, HTTP/2 connection reuse through a CONNECT
+// tunnel can bypass Proxy() and reuse the connection from a previous attempt,
+// defeating proxy rotation.
+func (pm *PoolManager) CloseIdleConnections() {
+	if pm.transport != nil {
+		pm.transport.CloseIdleConnections()
+	}
+}
+
+// NextProxyIndex advances the proxy pool's round-robin cursor once and returns
+// the resulting base index. The caller (retry engine) combines this with the
+// attempt number (base + attempt) to deterministically select a different proxy
+// per retry, while still rotating across sequential requests.
+// Returns (0, false) when no proxy pool is configured.
+func (pm *PoolManager) NextProxyIndex() (int, bool) {
+	if pm.proxyPool == nil {
+		return 0, false
+	}
+	return pm.proxyPool.NextIndex(), true
 }
 
 func (pm *PoolManager) GetMetrics() metrics {
