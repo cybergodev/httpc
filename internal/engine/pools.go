@@ -214,13 +214,13 @@ func QueryEscape(s string) string {
 	return result
 }
 
-// appendQueryEscape appends the URL-query-escaped form of s directly to b.
+// AppendQueryEscape appends the URL-query-escaped form of s directly to b.
 // Writing straight into the builder avoids the intermediate escaped string
 // allocation that b.WriteString(QueryEscape(s)) would incur whenever s
 // contains characters that need escaping. Inputs with no escapable bytes are
 // written verbatim after a single scan. Mirrors QueryEscape's semantics
 // (RFC 3986 unreserved set) and large-input safety fallback.
-func appendQueryEscape(b *strings.Builder, s string) {
+func AppendQueryEscape(b *strings.Builder, s string) {
 	// SECURITY: delegate very large inputs to the standard library to avoid the
 	// per-byte loop cost and keep parity with QueryEscape's overflow guard.
 	if len(s) > maxQueryEscapeSize {
@@ -286,7 +286,7 @@ func appendQueryParams(existingQuery string, params map[string]any) string {
 		} else {
 			sb.WriteByte('&')
 		}
-		appendQueryEscape(sb, key)
+		AppendQueryEscape(sb, key)
 		sb.WriteByte('=')
 
 		writeQueryParamValue(sb, value, numBuf[:0])
@@ -310,7 +310,7 @@ func writeQueryParamValue(sb *strings.Builder, value any, numBuf []byte) {
 	switch v := value.(type) {
 	case string:
 		if v != "" {
-			appendQueryEscape(sb, v)
+			AppendQueryEscape(sb, v)
 		}
 	case int:
 		sb.Write(strconv.AppendInt(numBuf, int64(v), 10))
@@ -337,10 +337,10 @@ func writeQueryParamValue(sb *strings.Builder, value any, numBuf []byte) {
 	default:
 		if s, ok := value.(fmt.Stringer); ok {
 			if strValue := s.String(); strValue != "" {
-				appendQueryEscape(sb, strValue)
+				AppendQueryEscape(sb, strValue)
 			}
 		} else if strValue := fmt.Sprintf("%v", value); strValue != "" {
-			appendQueryEscape(sb, strValue)
+			AppendQueryEscape(sb, strValue)
 		}
 	}
 }

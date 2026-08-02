@@ -47,7 +47,7 @@ import (
 )
 
 func main() {
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }
@@ -273,7 +273,7 @@ For cross-request cookie persistence without a cookie jar, use `SessionManager`:
 
 ```go
 // Create a session manager
-session, err := httpc.NewSessionManager()
+session, err := httpc.NewSessionManagerDefault()
 if err != nil {
     log.Fatal(err)
 }
@@ -320,7 +320,7 @@ session.ClearCookies()
 `DomainClient` provides built-in cookie management through its session:
 
 ```go
-dc, err := httpc.NewDomain("https://api.example.com")
+dc, err := httpc.NewDomainDefault("https://api.example.com")
 if err != nil {
     log.Fatal(err)
 }

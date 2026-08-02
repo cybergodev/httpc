@@ -30,7 +30,7 @@ func TestConcurrentClientRequests(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := httpc.New()
+	client, err := httpc.New(httpc.DefaultConfig())
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestConcurrentDomainClientSession(t *testing.T) {
 	}))
 	defer server.Close()
 
-	dc, err := httpc.NewDomain(server.URL)
+	dc, err := httpc.NewDomainDefault(server.URL)
 	if err != nil {
 		t.Fatalf("Failed to create domain client: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestConcurrentDomainClientSession(t *testing.T) {
 
 // TestConcurrentSessionManager tests SessionManager under concurrent access.
 func TestConcurrentSessionManager(t *testing.T) {
-	sm, err := httpc.NewSessionManager()
+	sm, err := httpc.NewSessionManagerDefault()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestConcurrentSessionManager(t *testing.T) {
 // This test verifies the fix for the TOCTOU race condition where cookieSecurity was accessed outside the lock.
 func TestConcurrentSessionManagerWithCookieSecurity(t *testing.T) {
 	// Create session manager without security first
-	sm, err := httpc.NewSessionManager()
+	sm, err := httpc.NewSessionManagerDefault()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
@@ -442,7 +442,7 @@ func TestConcurrentContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := httpc.New()
+	client, err := httpc.New(httpc.DefaultConfig())
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -496,7 +496,7 @@ func TestRaceConditionMetricsUpdate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := httpc.New()
+	client, err := httpc.New(httpc.DefaultConfig())
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -545,7 +545,7 @@ func TestConcurrentClientClose(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 
-			client, err := httpc.New()
+			client, err := httpc.New(httpc.DefaultConfig())
 			if err != nil {
 				atomic.AddInt64(&closeErrors, 1)
 				return
@@ -589,7 +589,7 @@ func TestConcurrentResultPool(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := httpc.New()
+	client, err := httpc.New(httpc.DefaultConfig())
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -689,7 +689,7 @@ func TestConcurrentRedirectHandling(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := httpc.New()
+	client, err := httpc.New(httpc.DefaultConfig())
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -739,13 +739,17 @@ func TestConcurrentMiddlewareExecution(t *testing.T) {
 
 	cfg := httpc.DefaultConfig()
 	cfg.Security.AllowPrivateIPs = true
+	logCfg := httpc.DefaultLoggingConfig()
+	logCfg.LogFunc = func(format string, args ...any) {
+		atomic.AddInt64(&callCount, 1)
+	}
 	cfg.Middleware.Middlewares = []httpc.MiddlewareFunc{
-		httpc.LoggingMiddleware(func(format string, args ...any) {
-			atomic.AddInt64(&callCount, 1)
-		}),
+		httpc.LoggingMiddleware(logCfg),
 		httpc.RecoveryMiddleware(),
-		httpc.HeaderMiddleware(map[string]string{
-			"X-Custom-Header": "test-value",
+		httpc.HeaderMiddleware(&httpc.HeaderConfig{
+			Headers: map[string]string{
+				"X-Custom-Header": "test-value",
+			},
 		}),
 	}
 

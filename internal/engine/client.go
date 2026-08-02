@@ -11,12 +11,14 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/cybergodev/httpc/internal/connection"
+	"github.com/cybergodev/httpc/internal/proxypool"
 	"github.com/cybergodev/httpc/internal/security"
 	"github.com/cybergodev/httpc/internal/types"
 	"github.com/cybergodev/httpc/internal/validation"
@@ -187,6 +189,12 @@ type Config struct {
 	// System proxy configuration
 	EnableSystemProxy bool // Automatically detect and use system proxy settings
 
+	// Proxy pool configuration
+	ProxyPool             []string
+	ProxyPoolStrategy     proxypool.Strategy
+	ProxyFailureThreshold int
+	ProxyCooldown         time.Duration
+
 	TLSConfig               *tls.Config
 	MinTLSVersion           uint16
 	MaxTLSVersion           uint16
@@ -205,6 +213,11 @@ type Config struct {
 	MaxRetryDelay time.Duration
 	BackoffFactor float64
 	Jitter        bool
+
+	// ExtraRetryableStatusCodes are HTTP status codes beyond the built-in set
+	// (408/429/500/502/503/504) that should trigger a retry. Seeded from
+	// Connection.ProxyRotateOnStatus to rotate proxies on WAF/CF blocks.
+	ExtraRetryableStatusCodes []int
 
 	// CustomRetryPolicy allows providing a custom retry policy implementation.
 	// If set, it overrides the built-in retry logic.
@@ -237,6 +250,11 @@ type requestCallback func(req *Request) error
 type responseCallback func(resp *Response) error
 
 // Request represents an HTTP request with method, URL, headers, body, and options.
+//
+// The exported accessor and mutator methods below implement the
+// types.RequestMutator interface (which embeds both read and write methods).
+// They are trivial field pass-throughs and intentionally lack per-method godoc;
+// refer to the interface definition for their contract.
 type Request struct {
 	method      string
 	url         string
@@ -319,6 +337,11 @@ func (r *Request) SetOnResponse(cb responseCallback) { r.onResponse = cb }
 
 // Response represents an HTTP response.
 // Response objects are safe to read from multiple goroutines after they are returned.
+//
+// The exported accessor and mutator methods below implement the
+// types.ResponseMutator interface (which embeds ResponseReader and write
+// methods). They are trivial field pass-throughs and intentionally lack
+// per-method godoc; refer to the interface definition for their contract.
 type Response struct {
 	statusCode     int
 	status         string
@@ -487,6 +510,10 @@ func NewClient(config *Config, opts ...clientOption) (*Client, error) {
 		connConfig.EnableHTTP2 = config.EnableHTTP2
 		connConfig.ProxyURL = config.ProxyURL
 		connConfig.EnableSystemProxy = config.EnableSystemProxy
+		connConfig.ProxyPool = config.ProxyPool
+		connConfig.ProxyPoolStrategy = config.ProxyPoolStrategy
+		connConfig.ProxyFailureThreshold = config.ProxyFailureThreshold
+		connConfig.ProxyCooldown = config.ProxyCooldown
 		connConfig.CookieJar = config.CookieJar
 		connConfig.AllowPrivateIPs = config.AllowPrivateIPs
 		connConfig.ExemptNets = config.ExemptNets
@@ -530,6 +557,10 @@ func NewClient(config *Config, opts ...clientOption) (*Client, error) {
 // ErrClientClosed is returned when attempting to use a closed client.
 var ErrClientClosed = errors.New("client is closed")
 
+// Request executes an HTTP request with the given method, URL, and options.
+// It acquires a pooled Request, applies the options, processes it through the
+// transport layer with retry support, and returns the resulting Response.
+// Returns ErrClientClosed if the client has been closed.
 func (c *Client) Request(ctx context.Context, method, url string, options ...RequestOption) (*Response, error) {
 	if atomic.LoadInt32(&c.closed) == 1 {
 		return nil, ErrClientClosed
@@ -769,8 +800,48 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 		}
 	}
 
+	// Deterministic proxy rotation: when a proxy pool is configured with
+	// status-based rotation (ExtraRetryableStatusCodes), reserve a unique base
+	// proxy index per request via NextProxyIndex. Each retry attempt then uses
+	// baseProxyIdx + attempt as the SelectIndex argument, guaranteeing:
+	//   - Inter-request rotation: different requests get different base indices.
+	//   - Intra-request rotation: retry N lands on a different proxy than N-1.
+	//   - Redirect-safe: all Proxy calls within one attempt share the same index,
+	//     so redirect-following cannot desynchronize the rotation.
+	retryBaseCtx := req.Context()
+	baseProxyIdx := 0
+	useProxyRotation := len(c.config.ExtraRetryableStatusCodes) > 0
+	if useProxyRotation && c.connectionPool != nil {
+		var ok bool
+		baseProxyIdx, ok = c.connectionPool.NextProxyIndex()
+		useProxyRotation = ok // false if pool wasn't actually created
+	}
+
 	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if useProxyRotation {
+			req.SetContext(connection.WithProxyAttempt(retryBaseCtx, baseProxyIdx+attempt))
+		} else {
+			req.SetContext(retryBaseCtx)
+		}
+
 		resp, err := c.executeRequest(req, false)
+
+		if os.Getenv("HTTPC_DEBUG") != "" {
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[httpc] attempt=%d ERROR: %v (retryable=%v)\n",
+					attempt, err, classifyError(err, "", "", 0).IsRetryable())
+			} else if resp != nil {
+				shouldRetry := policy.ShouldRetry(resp, nil, attempt)
+				fmt.Fprintf(os.Stderr, "[httpc] attempt=%d status=%d shouldRetry=%v attemptLtMax=%v proxyIdx=%d\n",
+					attempt, resp.StatusCode(), shouldRetry, attempt < maxRetries,
+					func() int {
+						if useProxyRotation {
+							return baseProxyIdx + attempt
+						}
+						return -1
+					}())
+			}
+		}
 
 		if err != nil {
 			clientErr := classifyErrorWithSanitizedURL(err, sanitizedURL, reqMethod, attempt+1)
@@ -792,6 +863,13 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 
 			// Calculate delay and sleep
 			delay := policy.GetDelay(attempt)
+
+			// Close idle connections to force Proxy() re-evaluation on retry
+			// (see comment in the response-path retry block below).
+			if useProxyRotation && c.connectionPool != nil {
+				c.connectionPool.CloseIdleConnections()
+			}
+
 			if sleepErr := c.sleepWithContext(req.Context(), delay); sleepErr != nil {
 				releaseLastResp(&lastResp)
 				return nil, classifyError(sleepErr, req.URL(), req.Method(), attempt+1)
@@ -817,6 +895,10 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 					delay = policy.GetDelay(attempt)
 				}
 
+				if os.Getenv("HTTPC_DEBUG") != "" {
+					fmt.Fprintf(os.Stderr, "[httpc] attempt=%d retrying after %v delay\n", attempt, delay)
+				}
+
 				// Release this discarded response now rather than carrying it as
 				// lastResp across the backoff sleep and the next attempt. For a
 				// streaming response the body reader pins a connection until
@@ -824,6 +906,15 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 				// that slot for the full delay instead of holding it idle.
 				ReleaseResponse(resp)
 				lastResp = nil
+
+				// Close idle connections so the next attempt's transport
+				// MUST call Proxy() again to select a (different) proxy.
+				// Without this, HTTP/2 connection reuse through a CONNECT
+				// tunnel silently reuses the failed attempt's tunnel,
+				// bypassing Proxy() and defeating proxy rotation.
+				if useProxyRotation && c.connectionPool != nil {
+					c.connectionPool.CloseIdleConnections()
+				}
 
 				if sleepErr := c.sleepWithContext(req.Context(), delay); sleepErr != nil {
 					return nil, classifyErrorWithSanitizedURL(sleepErr, sanitizedURL, reqMethod, attempt+1)
@@ -886,6 +977,11 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 // non-nil and is recycled by the deferred putHTTPHeader as before. Consuming one
 // pooled map per success-path request is safe: sync.Pool simply allocates a fresh
 // map on the next get when the pool is empty — no leak, no double-recycle.
+//
+// Uses direct map lookups with pre-canonicalized keys ("Content-Length" and
+// "Host" are already canonical) to avoid the textproto.CanonicalMIMEHeaderKey
+// overhead of h.Get, and batches both value slices into a single backing array
+// to reduce N []string{value} allocations to 1.
 func captureRequestHeaders(httpReq *http.Request) http.Header {
 	if httpReq == nil {
 		return nil
@@ -895,12 +991,20 @@ func captureRequestHeaders(httpReq *http.Request) http.Header {
 	if h == nil {
 		h = make(http.Header, 4)
 	}
-	if httpReq.ContentLength > 0 && h.Get("Content-Length") == "" {
-		var buf [20]byte
-		h.Set("Content-Length", string(strconv.AppendInt(buf[:0], httpReq.ContentLength, 10)))
+	// Batch the header value slices into one backing allocation. Each entry is a
+	// cap-1 window so the two values never alias each other, matching Set's
+	// single-value semantics.
+	headerVals := make([]string, 0, 2)
+	if httpReq.ContentLength > 0 && headerValueIsEmpty(h, hdrContentLength) {
+		var numBuf [20]byte
+		idx := len(headerVals)
+		headerVals = append(headerVals, string(strconv.AppendInt(numBuf[:0], httpReq.ContentLength, 10)))
+		h[hdrContentLength] = headerVals[idx : idx+1 : idx+1]
 	}
-	if httpReq.Host != "" && h.Get("Host") == "" {
-		h.Set("Host", httpReq.Host)
+	if httpReq.Host != "" && headerValueIsEmpty(h, hdrHost) {
+		idx := len(headerVals)
+		headerVals = append(headerVals, httpReq.Host)
+		h[hdrHost] = headerVals[idx : idx+1 : idx+1]
 	}
 	return h
 }
@@ -1154,6 +1258,9 @@ func (c *Client) IsClosed() bool {
 	return atomic.LoadInt32(&c.closed) == 1
 }
 
+// Close releases the client's resources, including the connection pool and
+// transport. It is safe to call multiple times; subsequent calls are no-ops.
+// Returns any error encountered while closing sub-components.
 func (c *Client) Close() error {
 	var closeErr error
 

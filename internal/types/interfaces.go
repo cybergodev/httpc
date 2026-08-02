@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// RequestReader provides read-only access to request data for middleware.
-// Use this interface when middleware only needs to inspect request properties
-// without modifying them.
-type RequestReader interface {
+// requestReader provides read-only access to request data for middleware.
+// It is embedded in the exported RequestMutator, so middleware automatically
+// gains full read access to all request properties.
+type requestReader interface {
 	Method() string
 	URL() string
 	Headers() map[string]string
@@ -27,10 +27,10 @@ type RequestReader interface {
 	StreamBody() bool
 }
 
-// RequestWriter provides write-only access to request data for middleware.
-// Use this interface when middleware only needs to modify request properties
-// without reading existing values.
-type RequestWriter interface {
+// requestWriter provides write-only access to request data for middleware.
+// It is embedded in the exported RequestMutator, so middleware automatically
+// gains full write access to all request properties.
+type requestWriter interface {
 	SetMethod(string)
 	SetURL(string)
 	SetHeaders(map[string]string)
@@ -47,11 +47,11 @@ type RequestWriter interface {
 }
 
 // RequestMutator provides read-write access to request data for middleware.
-// It embeds RequestReader and RequestWriter for full access to request properties.
+// It embeds requestReader and requestWriter for full access to request properties.
 // Middleware can inspect and modify request properties before the request is sent.
 type RequestMutator interface {
-	RequestReader
-	RequestWriter
+	requestReader
+	requestWriter
 }
 
 // ResponseReader provides read-only access to response data for middleware.
@@ -75,10 +75,10 @@ type ResponseReader interface {
 	RequestMethod() string
 }
 
-// ResponseWriter provides write-only access to response data for middleware.
-// Use this interface when middleware only needs to modify response properties
-// without reading existing values.
-type ResponseWriter interface {
+// responseWriter provides write-only access to response data for middleware.
+// It is embedded in the exported ResponseMutator, so middleware automatically
+// gains full write access to all response properties.
+type responseWriter interface {
 	SetStatusCode(int)
 	SetStatus(string)
 	SetProto(string)
@@ -98,7 +98,7 @@ type ResponseWriter interface {
 }
 
 // ResponseMutator provides read-write access to response data for middleware.
-// It embeds ResponseReader and ResponseWriter for full access to response properties.
+// It embeds ResponseReader and responseWriter for full access to response properties.
 // Middleware can inspect and modify response properties after the request completes.
 // This is useful for:
 //   - Response caching middleware
@@ -107,7 +107,7 @@ type ResponseWriter interface {
 //   - Response filtering
 type ResponseMutator interface {
 	ResponseReader
-	ResponseWriter
+	responseWriter
 }
 
 // Handler processes an HTTP request and returns a response.

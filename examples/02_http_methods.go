@@ -16,7 +16,7 @@ import (
 func main() {
 	fmt.Println("=== HTTP Methods Examples ===")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return

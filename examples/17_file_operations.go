@@ -14,26 +14,9 @@ import (
 	"github.com/cybergodev/httpc"
 )
 
-// This example demonstrates file upload and download operations
-
-// formatBytes returns a human-readable byte string (local helper for this example).
-func formatBytes(b int64) string {
-	const unit = 1024
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.2f %ciB", float64(b)/float64(div), "KMGTPE"[exp])
-}
-
-// formatSpeed returns a human-readable speed string (local helper for this example).
-func formatSpeed(bps float64) string {
-	return formatBytes(int64(bps)) + "/s"
-}
+// This example demonstrates file upload and download operations.
+// It uses httpc.FormatBytes / httpc.FormatSpeed (exported by the library)
+// instead of reinventing local helpers.
 
 func main() {
 	fmt.Println("=== File Operations Examples ===\n ")
@@ -43,7 +26,7 @@ func main() {
 		log.Printf("Warning: Failed to create downloads directory: %v\n", err)
 	}
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -149,34 +132,36 @@ func demonstrateFileUpload(client httpc.Client) {
 func demonstrateFileDownload(client httpc.Client) {
 	fmt.Println("--- File Download ---")
 
-	// 1. Simple download
+	// 1. Simple download (DefaultDownloadConfig is the documented starting point)
+	simpleOpts := httpc.DefaultDownloadConfig()
+	simpleOpts.FilePath = "downloads/golang-readme.md"
+	simpleOpts.Overwrite = true
 	result, err := client.Download(context.Background(),
 		"https://raw.githubusercontent.com/golang/go/master/README.md",
-		&httpc.DownloadConfig{FilePath: "downloads/golang-readme.md"},
+		simpleOpts,
 	)
 	if err != nil {
 		log.Printf("Simple download error: %v\n", err)
 	} else {
 		fmt.Printf("✓ Simple download: %s (%s, %v)\n",
 			result.FilePath,
-			formatBytes(result.BytesWritten),
+			httpc.FormatBytes(result.BytesWritten),
 			result.Duration)
 	}
 
 	// 2. Download with progress tracking
-	opts := &httpc.DownloadConfig{
-		FilePath:  "downloads/sample-file.bin",
-		Overwrite: true,
-		ProgressCallback: func(downloaded, total int64, speed float64) {
-			if total > 0 {
-				percentage := float64(downloaded) / float64(total) * 100
-				fmt.Printf("\r  Progress: %.1f%% (%s / %s) - %s",
-					percentage,
-					formatBytes(downloaded),
-					formatBytes(total),
-					formatSpeed(speed))
-			}
-		},
+	opts := httpc.DefaultDownloadConfig()
+	opts.FilePath = "downloads/sample-file.bin"
+	opts.Overwrite = true
+	opts.ProgressCallback = func(downloaded, total int64, speed float64) {
+		if total > 0 {
+			percentage := float64(downloaded) / float64(total) * 100
+			fmt.Printf("\r  Progress: %.1f%% (%s / %s) - %s",
+				percentage,
+				httpc.FormatBytes(downloaded),
+				httpc.FormatBytes(total),
+				httpc.FormatSpeed(speed))
+		}
 	}
 
 	result, err = client.Download(context.Background(),
@@ -189,15 +174,14 @@ func demonstrateFileDownload(client httpc.Client) {
 	} else {
 		fmt.Printf("\n✓ Progress download: %s (%s, avg %s)\n",
 			result.FilePath,
-			formatBytes(result.BytesWritten),
-			formatSpeed(result.AverageSpeed))
+			httpc.FormatBytes(result.BytesWritten),
+			httpc.FormatSpeed(result.AverageSpeed))
 	}
 
 	// 3. Download with authentication
-	authOpts := &httpc.DownloadConfig{
-		FilePath:  "downloads/authenticated-file.txt",
-		Overwrite: true,
-	}
+	authOpts := httpc.DefaultDownloadConfig()
+	authOpts.FilePath = "downloads/authenticated-file.txt"
+	authOpts.Overwrite = true
 	result, err = client.Download(context.Background(),
 		"https://httpbin.org/get",
 		authOpts,
@@ -209,7 +193,7 @@ func demonstrateFileDownload(client httpc.Client) {
 	} else {
 		fmt.Printf("✓ Authenticated download: %s (%s)\n",
 			result.FilePath,
-			formatBytes(result.BytesWritten))
+			httpc.FormatBytes(result.BytesWritten))
 	}
 
 	// 4. Save response to file (alternative method)
@@ -223,17 +207,14 @@ func demonstrateFileDownload(client httpc.Client) {
 		} else {
 			fmt.Printf("✓ SaveToFile: %s (%s)\n",
 				filePath,
-				formatBytes(int64(len(resp.RawBody()))))
+				httpc.FormatBytes(int64(len(resp.RawBody()))))
 		}
 	}
 
 	// 5. Resume interrupted download (demonstration)
-	resumeFilePath := "downloads/resume-test.bin"
-	resumeOpts := &httpc.DownloadConfig{
-		FilePath:       resumeFilePath,
-		ResumeDownload: true,
-		Overwrite:      false,
-	}
+	resumeOpts := httpc.DefaultDownloadConfig()
+	resumeOpts.FilePath = "downloads/resume-test.bin"
+	resumeOpts.ResumeDownload = true
 	result, err = client.Download(context.Background(),
 		"https://raw.githubusercontent.com/golang/go/master/README.md",
 		resumeOpts,
@@ -258,10 +239,9 @@ func demonstrateContextDownload(client httpc.Client) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	opts := &httpc.DownloadConfig{
-		FilePath:  "downloads/context-download.txt",
-		Overwrite: true,
-	}
+	opts := httpc.DefaultDownloadConfig()
+	opts.FilePath = "downloads/context-download.txt"
+	opts.Overwrite = true
 
 	result, err := client.Download(ctx,
 		"https://httpbin.org/get",
@@ -279,7 +259,7 @@ func demonstrateContextDownload(client httpc.Client) {
 
 	fmt.Printf("✓ Downloaded: %s (%s)\n",
 		result.FilePath,
-		formatBytes(result.BytesWritten))
+		httpc.FormatBytes(result.BytesWritten))
 	fmt.Println("\nPass a context to Download for:")
 	fmt.Println("  - Download timeouts independent of client config")
 	fmt.Println("  - User-initiated cancellation")
@@ -294,15 +274,16 @@ func demonstrateChecksumDownload() {
 	url := "https://raw.githubusercontent.com/golang/go/master/LICENSE"
 
 	// Step 1: Download the file once (no verification).
-	first, err := httpc.Download(ctx, url,
-		&httpc.DownloadConfig{FilePath: "downloads/go-license.txt"},
+	firstOpts := httpc.DefaultDownloadConfig()
+	firstOpts.FilePath = "downloads/go-license.txt"
+	first, err := httpc.Download(ctx, url, firstOpts,
 		httpc.WithTimeout(30*time.Second),
 	)
 	if err != nil {
 		log.Printf("Download error: %v\n", err)
 		return
 	}
-	fmt.Printf("Downloaded: %s (%s)\n", first.FilePath, formatBytes(first.BytesWritten))
+	fmt.Printf("Downloaded: %s (%s)\n", first.FilePath, httpc.FormatBytes(first.BytesWritten))
 
 	// Step 2: Compute the expected SHA-256 from the downloaded bytes.
 	// In production you would obtain this checksum from a trusted source
@@ -316,12 +297,12 @@ func demonstrateChecksumDownload() {
 	// Step 3: Re-download with checksum verification enabled. When Checksum is
 	// set, the body is hashed while streaming to disk and compared after
 	// completion; a mismatch removes the downloaded file and returns an error.
-	verified, err := httpc.Download(ctx, url, &httpc.DownloadConfig{
-		FilePath:          "downloads/go-license-verified.txt",
-		Overwrite:         true,
-		Checksum:          expected,
-		ChecksumAlgorithm: httpc.ChecksumSHA256,
-	}, httpc.WithTimeout(30*time.Second))
+	verifyOpts := httpc.DefaultDownloadConfig()
+	verifyOpts.FilePath = "downloads/go-license-verified.txt"
+	verifyOpts.Overwrite = true
+	verifyOpts.Checksum = expected
+	verifyOpts.ChecksumAlgorithm = httpc.ChecksumSHA256
+	verified, err := httpc.Download(ctx, url, verifyOpts, httpc.WithTimeout(30*time.Second))
 	if err != nil {
 		log.Printf("Checksum verification failed: %v\n", err)
 		return

@@ -6,6 +6,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"sync"
 	"sync/atomic"
 
@@ -99,15 +100,16 @@ type clientImpl struct {
 }
 
 // New creates a new HTTP client with the given configuration.
-// If no configuration is provided or nil is passed, DefaultConfig() is used.
+// Pass DefaultConfig() for sensible defaults, or use a preset like SecureConfig().
+//
+// Returns an error if the configuration fails validation (e.g., invalid
+// Security.SSRFExemptCIDRs, mutually exclusive security settings) or if the
+// underlying engine client cannot be created.
 //
 // Examples:
 //
-//	// Use default configuration
-//	client, err := httpc.New()
-//
-//	// Use default configuration (explicit nil)
-//	client, err := httpc.New(nil)
+//	// Use default configuration (or call NewDefault() for the same result)
+//	client, err := httpc.New(httpc.DefaultConfig())
 //
 //	// Use custom configuration
 //	cfg := httpc.DefaultConfig()
@@ -116,46 +118,40 @@ type clientImpl struct {
 //
 //	// Use preset configuration
 //	client, err := httpc.New(httpc.SecureConfig())
-func New(config ...*Config) (Client, error) {
-	var in *Config
-	if len(config) > 0 {
-		in = config[0]
-	}
-	cfg, err := prepareConfig(in)
-	if err != nil {
-		return nil, err
-	}
-	return newFromPreparedConfig(cfg)
-}
-
-// prepareConfig validates, deep-copies, parses SSRF exempt CIDRs, and fills nil
-// sub-configs from the defaults. Returns DefaultConfig() when in is nil.
-// Shared by New and NewDomain so the two constructors cannot drift apart; the
-// error wrapping matches the previously inlined logic exactly.
-func prepareConfig(in *Config) (*Config, error) {
-	if in == nil {
-		return DefaultConfig(), nil
-	}
-	if err := ValidateConfig(in); err != nil {
+func New(cfg Config) (Client, error) {
+	if err := ValidateConfig(&cfg); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
-	cfg := deepCopyConfig(in)
+	cfg = copyConfig(cfg)
 	if err := cfg.parseSSRFExemptCIDRs(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
-	return mergeNilSubConfigs(cfg), nil
+	return newFromConfig(cfg)
 }
 
-// newFromPreparedConfig creates a client from an already-validated and deep-copied config.
-// Used internally by NewDomain to avoid redundant validation and deep copy.
-func newFromPreparedConfig(cfg *Config) (Client, error) {
-	engineConfig, err := convertToEngineConfig(cfg)
+// NewDefault creates a new HTTP client with default configuration.
+// It is a convenience shortcut for New(DefaultConfig()); see New for possible
+// error conditions (default configuration is always valid, so this effectively
+// never returns an error in practice).
+//
+// Example:
+//
+//	client, err := httpc.NewDefault()
+//	defer func() { _ = client.Close() }()
+func NewDefault() (Client, error) {
+	return New(DefaultConfig())
+}
+
+// newFromConfig creates a client from an already-validated and copied config.
+// Used internally by New and NewDomain.
+func newFromConfig(cfg Config) (Client, error) {
+	engineConfig, err := convertToEngineConfig(&cfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to convert configuration: %w", err)
 	}
 
 	// Warn if InsecureSkipVerify is enabled outside test environment.
-	if cfg.Security != nil && cfg.Security.InsecureSkipVerify && !isTestEnvironment() {
+	if cfg.Security.InsecureSkipVerify && !isTestEnvironment() {
 		insecureSkipVerifyWarnOnce.Do(func() {
 			w := getSecurityWarnOutput()
 			fmt.Fprintf(w, "[SECURITY WARNING] InsecureSkipVerify is enabled - TLS certificate verification is DISABLED\n")
@@ -170,131 +166,74 @@ func newFromPreparedConfig(cfg *Config) (Client, error) {
 
 	client := &clientImpl{
 		engine:         engineClient,
-		hasMiddlewares: cfg.Middleware != nil && len(cfg.Middleware.Middlewares) > 0,
+		hasMiddlewares: len(cfg.Middleware.Middlewares) > 0,
 	}
 
 	// Build middleware chain if middlewares are configured
-	if client.hasMiddlewares && cfg.Middleware != nil {
+	if client.hasMiddlewares {
 		client.middlewareChain = client.buildMiddlewareChain(cfg.Middleware.Middlewares)
 	}
 
 	return client, nil
 }
 
-// deepCopyConfig creates a deep copy of the configuration to prevent
-// accidental mutation of shared config state. This is called internally
-// when creating a new client to ensure each client has its own
-// independent configuration.
+// copyConfig returns an independent copy of cfg. Value-type sub-configs are
+// copied by the struct assignment; this function deep-copies the remaining
+// reference types (maps, slices, *tls.Config) so the caller cannot mutate the
+// client's configuration after construction.
 //
 // Note: RetryConfig.CustomPolicy is NOT deep-copied. If the policy
 // implementation contains mutable state, do not share the same Config
 // instance across multiple clients concurrently.
-func deepCopyConfig(src *Config) *Config {
-	dst := *src
+func copyConfig(src Config) Config {
+	dst := src // value copy — all sub-config structs are independent
 
-	// Deep copy each sub-config pointer
-	if src.Timeouts != nil {
-		cp := *src.Timeouts
-		dst.Timeouts = &cp
-	}
-	if src.Connection != nil {
-		cp := *src.Connection
-		dst.Connection = &cp
-	}
-	if src.Security != nil {
-		cp := *src.Security
-		dst.Security = &cp
-		// Note: CertificatePinner is an interface copied by reference (shared),
-		// not deep-copied. Pinner implementations are concurrency-safe, so
-		// sharing across clients is intentional. See SecurityConfig.CertificatePinner.
-	}
-	if src.Retry != nil {
-		cp := *src.Retry
-		dst.Retry = &cp
-	}
-	if src.Middleware != nil {
-		cp := *src.Middleware
-		dst.Middleware = &cp
+	// Deep copy reference types within sub-configs
+	if dst.Defaults.Headers != nil {
+		dst.Defaults.Headers = make(map[string]string, len(src.Defaults.Headers))
+		maps.Copy(dst.Defaults.Headers, src.Defaults.Headers)
 	}
 
-	// Deep copy middleware headers
-	if src.Middleware != nil && src.Middleware.Headers != nil {
-		dst.Middleware.Headers = make(map[string]string, len(src.Middleware.Headers))
-		maps.Copy(dst.Middleware.Headers, src.Middleware.Headers)
-	}
-
-	// Deep copy middlewares slice
-	if src.Middleware != nil && len(src.Middleware.Middlewares) > 0 {
+	if len(dst.Middleware.Middlewares) > 0 {
 		dst.Middleware.Middlewares = make([]MiddlewareFunc, len(src.Middleware.Middlewares))
 		copy(dst.Middleware.Middlewares, src.Middleware.Middlewares)
 	}
 
-	// Deep copy redirect whitelist
-	if src.Security != nil && len(src.Security.RedirectWhitelist) > 0 {
+	if len(dst.Security.RedirectWhitelist) > 0 {
 		dst.Security.RedirectWhitelist = make([]string, len(src.Security.RedirectWhitelist))
 		copy(dst.Security.RedirectWhitelist, src.Security.RedirectWhitelist)
 	}
 
-	// Clone TLS config if present
-	if src.Security != nil && src.Security.TLSConfig != nil {
+	if len(dst.Connection.ProxyPool) > 0 {
+		dst.Connection.ProxyPool = make([]string, len(src.Connection.ProxyPool))
+		copy(dst.Connection.ProxyPool, src.Connection.ProxyPool)
+	}
+
+	if len(dst.Connection.ProxyRotateOnStatus) > 0 {
+		dst.Connection.ProxyRotateOnStatus = make([]int, len(src.Connection.ProxyRotateOnStatus))
+		copy(dst.Connection.ProxyRotateOnStatus, src.Connection.ProxyRotateOnStatus)
+	}
+
+	if dst.Security.TLSConfig != nil {
 		dst.Security.TLSConfig = src.Security.TLSConfig.Clone()
 	}
 
-	// Deep copy cookie security config if present
-	if src.Security != nil && src.Security.CookieSecurity != nil {
+	if dst.Security.CookieSecurity != nil {
 		cookieSec := *src.Security.CookieSecurity
 		dst.Security.CookieSecurity = &cookieSec
 	}
 
-	// Deep copy SSRF exempt CIDRs
-	if src.Security != nil && len(src.Security.SSRFExemptCIDRs) > 0 {
+	if len(dst.Security.SSRFExemptCIDRs) > 0 {
 		dst.Security.SSRFExemptCIDRs = make([]string, len(src.Security.SSRFExemptCIDRs))
 		copy(dst.Security.SSRFExemptCIDRs, src.Security.SSRFExemptCIDRs)
 	}
 
-	// Transfer cached parsed CIDRs (pointer slice is safe to share — net.IPNet is read-only)
 	if len(src.parsedCIDRs) > 0 {
 		dst.parsedCIDRs = make([]*net.IPNet, len(src.parsedCIDRs))
 		copy(dst.parsedCIDRs, src.parsedCIDRs)
 	}
 
-	return &dst
-}
-
-// mergeNilSubConfigs fills nil sub-config pointers with copies of the defaults
-// from DefaultConfig. This allows callers to partially configure a Config — any
-// nil sub-config gets sensible defaults, while non-nil sub-configs are used as-is.
-//
-// Each default is copied (not aliased) so the resulting Config owns its sub-configs
-// exclusively, matching the isolation that deepCopyConfig already provides for the
-// non-nil sub-configs. Without this, every client built from a partially-specified
-// Config would share the same DefaultConfig() sub-config pointers.
-func mergeNilSubConfigs(cfg *Config) *Config {
-	def := DefaultConfig()
-	if cfg.Timeouts == nil {
-		cp := *def.Timeouts
-		cfg.Timeouts = &cp
-	}
-	if cfg.Connection == nil {
-		cp := *def.Connection
-		cfg.Connection = &cp
-	}
-	if cfg.Security == nil {
-		cp := *def.Security
-		cfg.Security = &cp
-	}
-	if cfg.Retry == nil {
-		cp := *def.Retry
-		cfg.Retry = &cp
-	}
-	if cfg.Middleware == nil {
-		cp := *def.Middleware
-		// Give each client its own headers map rather than aliasing the default's.
-		cp.Headers = make(map[string]string, len(def.Middleware.Headers))
-		maps.Copy(cp.Headers, def.Middleware.Headers)
-		cfg.Middleware = &cp
-	}
-	return cfg
+	return dst
 }
 
 // buildMiddlewareChain constructs a middleware chain from the provided middlewares.
@@ -327,7 +266,8 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 		var onRequest func(*engine.Request) error
 		var onResponse func(*engine.Response) error
 		var allowPrivateIPs *bool
-		if engReq, ok := req.(*engine.Request); ok {
+		engReq, isEngineReq := req.(*engine.Request)
+		if isEngineReq {
 			if cb := engReq.OnRequest(); cb != nil {
 				onRequest = cb
 			}
@@ -362,6 +302,19 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 				}
 				if onResponse != nil {
 					r.SetOnResponse(onResponse)
+				}
+				// Transfer ownership of pooled maps to the engine request to
+				// prevent double-pooling. r now holds the same headers/queryParams
+				// map pointers that engReq held; the engine's deferred putRequest
+				// will return them to headersMapPool/queryParamsPool. Nilling them
+				// on engReq here ensures the deferred releaseMiddlewareRequest
+				// (which calls putHeadersMap/putQueryParamsMap again) skips them —
+				// without this, the same map enters the pool twice and two
+				// concurrent goroutines can retrieve it simultaneously, causing a
+				// data race that leaks headers between unrelated requests.
+				if isEngineReq {
+					engReq.SetHeaders(nil)
+					engReq.SetQueryParams(nil)
 				}
 				return nil
 			})
@@ -541,7 +494,7 @@ func getDefaultClient() (Client, error) {
 		return client, nil
 	}
 
-	newClient, err := New()
+	newClient, err := NewDefault()
 	if err != nil {
 		return nil, fmt.Errorf("failed to initialize default client: %w", err)
 	}
@@ -582,6 +535,13 @@ func withDefault(ctx context.Context, method, url string, options []RequestOptio
 	}
 	return client.Request(ctx, method, url, options...)
 }
+
+// Package-level HTTP convenience functions (Get, Post, Put, Patch, Delete,
+// Head, Options, Request) use a shared default client managed internally.
+// Each delegates to the corresponding method on that singleton client (see
+// SetDefaultClient, CloseDefaultClient). For production services, prefer an
+// explicit client created with NewDefault() to control configuration
+// and lifecycle.
 
 // Get makes a GET request to the specified URL using the default client.
 func Get(url string, options ...RequestOption) (*Result, error) {
@@ -739,13 +699,14 @@ func extractRequestCookies(headers http.Header) []*http.Cookie {
 		return nil
 	}
 
-	// Fast path: avoid map lookup when no Cookie header exists
-	cookieHeader := headers.Get("Cookie")
-	if cookieHeader == "" {
+	// Direct map lookup with the pre-canonicalized key "Cookie" avoids the
+	// textproto.CanonicalMIMEHeaderKey overhead of headers.Get on every request.
+	cookieVals := headers["Cookie"]
+	if len(cookieVals) == 0 || cookieVals[0] == "" {
 		return nil
 	}
 
-	return parseCookieHeader(cookieHeader)
+	return parseCookieHeader(cookieVals[0])
 }
 
 // cloneHeaders returns a deep copy of http.Header. Delegates to the engine's
@@ -758,7 +719,9 @@ func createCookieJar(enableCookies bool) (http.CookieJar, error) {
 	if !enableCookies {
 		return nil, nil
 	}
-	jar, err := newCookieJar()
+	jar, err := cookiejar.New(&cookiejar.Options{
+		PublicSuffixList: nil,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cookie jar: %w", err)
 	}

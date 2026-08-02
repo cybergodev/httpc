@@ -968,6 +968,68 @@ func TestDoHResolver_CacheFullTriggersEviction(t *testing.T) {
 	}
 }
 
+// TestDoHResolver_EvictOldestEntry verifies that when the cache is full of fresh
+// (unexpired) entries, evictOldestEntry removes the one closest to expiry — the
+// admission path that prevents freshly resolved hosts from being silently dropped.
+func TestDoHResolver_EvictOldestEntry(t *testing.T) {
+	r := NewDoHResolver(nil, 5*time.Minute)
+	defer func() { _ = r.Close() }()
+
+	now := time.Now()
+
+	// Populate cache with fresh entries at varying TTLs.
+	entries := []struct {
+		host   string
+		offset time.Duration // expiry offset from now
+	}{
+		{"long1.com", 1 * time.Hour},
+		{"mid.com", 30 * time.Minute},
+		{"short.com", 5 * time.Minute}, // nearest expiry — should be evicted
+		{"long2.com", 2 * time.Hour},
+	}
+	for _, e := range entries {
+		r.cache.Store(e.host, &cacheEntry{
+			IPs:     []net.IPAddr{{IP: net.ParseIP("1.2.3.4")}},
+			Expires: now.Add(e.offset),
+		})
+		r.cacheSize.Add(1)
+	}
+
+	r.evictOldestEntry()
+
+	// The entry nearest to expiry (short.com) should be gone.
+	if _, ok := r.cache.Load("short.com"); ok {
+		t.Error("short.com (nearest expiry) should have been evicted")
+	}
+
+	// All other entries should remain.
+	for _, e := range entries {
+		if e.host == "short.com" {
+			continue
+		}
+		if _, ok := r.cache.Load(e.host); !ok {
+			t.Errorf("%s should still be cached", e.host)
+		}
+	}
+
+	if size := r.CacheSize(); size != int64(len(entries)-1) {
+		t.Errorf("cache size = %d, want %d", size, len(entries)-1)
+	}
+}
+
+// TestDoHResolver_EvictOldestEntry_EmptyCache verifies evictOldestEntry is a
+// safe no-op when the cache holds no entries.
+func TestDoHResolver_EvictOldestEntry_EmptyCache(t *testing.T) {
+	r := NewDoHResolver(nil, 5*time.Minute)
+	defer func() { _ = r.Close() }()
+
+	r.evictOldestEntry() // must not panic
+
+	if size := r.CacheSize(); size != 0 {
+		t.Errorf("expected cache size 0, got %d", size)
+	}
+}
+
 // TestDoHResolver_LookupGoroutinePanicRecovered (SEC-003) verifies that a panic
 // inside the concurrent A/AAAA lookup goroutines is recovered and converted into
 // a lookup error instead of crashing the process. recover() does not cross

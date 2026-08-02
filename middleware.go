@@ -71,8 +71,13 @@ func (e AuditEvent) MarshalJSON() ([]byte, error) {
 	return json.Marshal(aux)
 }
 
-// AuditMiddlewareConfig configures the audit middleware behavior.
-type AuditMiddlewareConfig struct {
+// AuditConfig configures the audit middleware.
+// Use DefaultAuditConfig() as the starting point.
+type AuditConfig struct {
+	// OnAudit receives an AuditEvent for each completed request/response cycle.
+	// If nil, the middleware is a no-op.
+	OnAudit func(event AuditEvent)
+
 	// Format specifies the output format: "text" (default) or "json"
 	Format string
 
@@ -86,13 +91,66 @@ type AuditMiddlewareConfig struct {
 	SanitizeError bool
 }
 
-// DefaultAuditMiddlewareConfig returns the default audit middleware configuration.
-func DefaultAuditMiddlewareConfig() *AuditMiddlewareConfig {
-	return &AuditMiddlewareConfig{
+// DefaultAuditConfig returns an AuditConfig with default settings.
+//
+//	Format:         "text"
+//	IncludeHeaders: false
+//	MaskHeaders:    sensitive header names (Authorization, Cookie, etc.)
+//	SanitizeError:  true
+func DefaultAuditConfig() *AuditConfig {
+	return &AuditConfig{
 		Format:         "text",
 		IncludeHeaders: false,
 		MaskHeaders:    cachedSensitiveHeaderNames,
 		SanitizeError:  true,
+	}
+}
+
+// LoggingConfig configures the logging middleware.
+// Use DefaultLoggingConfig() as the starting point.
+type LoggingConfig struct {
+	// LogFunc receives formatted log messages (similar to log.Printf).
+	// If nil, logging is disabled.
+	LogFunc func(format string, args ...any)
+}
+
+// DefaultLoggingConfig returns a LoggingConfig with logging disabled.
+// Set LogFunc to enable logging.
+func DefaultLoggingConfig() *LoggingConfig {
+	return &LoggingConfig{}
+}
+
+// MetricsConfig configures the metrics middleware.
+// Use DefaultMetricsConfig() as the starting point.
+type MetricsConfig struct {
+	// OnMetrics is invoked with request metrics after each request completes.
+	// If nil, metrics collection is disabled.
+	OnMetrics func(method, url string, statusCode int, duration time.Duration, err error)
+}
+
+// DefaultMetricsConfig returns a MetricsConfig with metrics disabled.
+// Set OnMetrics to enable metrics collection.
+func DefaultMetricsConfig() *MetricsConfig {
+	return &MetricsConfig{}
+}
+
+// RequestIDConfig configures the request ID middleware.
+// Use DefaultRequestIDConfig() as the starting point.
+type RequestIDConfig struct {
+	// HeaderName is the HTTP header name for the request ID.
+	// Default: "X-Request-ID".
+	HeaderName string
+
+	// Generator produces the request ID string. If nil, a cryptographically
+	// secure random generator is used (crypto/rand, 16 bytes hex-encoded).
+	Generator func() string
+}
+
+// DefaultRequestIDConfig returns a RequestIDConfig with sensible defaults.
+// HeaderName defaults to "X-Request-ID"; Generator defaults to crypto/rand.
+func DefaultRequestIDConfig() *RequestIDConfig {
+	return &RequestIDConfig{
+		HeaderName: "X-Request-ID",
 	}
 }
 
@@ -118,10 +176,14 @@ func Chain(middlewares ...MiddlewareFunc) MiddlewareFunc {
 	}
 }
 
-// LoggingMiddleware creates a middleware that logs request and response information.
-// The log function receives formatted log messages (similar to log.Printf).
+// LoggingMiddleware creates a logging middleware with the given configuration.
+// A nil config selects DefaultLoggingConfig() (logging disabled).
 // SECURITY: URLs are sanitized to remove credentials before logging.
-func LoggingMiddleware(log func(format string, args ...any)) MiddlewareFunc {
+func LoggingMiddleware(config *LoggingConfig) MiddlewareFunc {
+	if config == nil {
+		config = DefaultLoggingConfig()
+	}
+	log := config.LogFunc
 	if log == nil {
 		log = func(string, ...any) {}
 	}
@@ -180,13 +242,21 @@ func RecoveryMiddleware() MiddlewareFunc {
 	}
 }
 
-// RequestIDMiddleware creates a middleware that adds a unique request ID to each request.
-// The request ID is added to the request headers with the specified header name.
-// If generator is nil, a cryptographically secure random ID generator is used.
+// RequestIDMiddleware creates a middleware that adds a unique request ID
+// to each request using the given configuration. A nil config selects
+// DefaultRequestIDConfig() ("X-Request-ID" header, crypto/rand generator).
 //
-// SECURITY: The default generator uses crypto/rand to produce unpredictable request IDs,
-// preventing request ID guessing attacks in security-sensitive applications.
-func RequestIDMiddleware(headerName string, generator func() string) MiddlewareFunc {
+// SECURITY: When Generator is nil, the default uses crypto/rand to produce
+// unpredictable request IDs, preventing request ID guessing attacks.
+func RequestIDMiddleware(config *RequestIDConfig) MiddlewareFunc {
+	if config == nil {
+		config = DefaultRequestIDConfig()
+	}
+	headerName := config.HeaderName
+	if headerName == "" {
+		headerName = "X-Request-ID"
+	}
+	generator := config.Generator
 	if generator == nil {
 		generator = func() string {
 			// SECURITY: Use cryptographically secure random for unpredictable request IDs
@@ -210,18 +280,42 @@ func RequestIDMiddleware(headerName string, generator func() string) MiddlewareF
 	}
 }
 
-// TimeoutMiddleware creates a middleware that enforces a maximum duration for requests.
-// If the request exceeds the timeout, the context is canceled and an error is returned.
-// This timeout applies at the middleware level, before the client's built-in timeout.
+// TimeoutMiddlewareConfig configures the timeout middleware.
+// The name includes "Middleware" to distinguish it from the client-level
+// TimeoutConfig in types.go. Use DefaultTimeoutMiddlewareConfig() as the
+// starting point.
+type TimeoutMiddlewareConfig struct {
+	// Duration is the maximum time allowed for the request. Zero or negative
+	// disables the timeout (the middleware passes the request through unchanged).
+	// Default: 0 (disabled).
+	Duration time.Duration
+}
+
+// DefaultTimeoutMiddlewareConfig returns a TimeoutMiddlewareConfig with the
+// timeout disabled. Set Duration to a positive value to enable the timeout.
+func DefaultTimeoutMiddlewareConfig() *TimeoutMiddlewareConfig {
+	return &TimeoutMiddlewareConfig{}
+}
+
+// TimeoutMiddleware creates a middleware that enforces a maximum duration for
+// requests, configured via TimeoutMiddlewareConfig. A nil config selects
+// DefaultTimeoutMiddlewareConfig() (timeout disabled — the middleware is a pass-through).
+// If the request exceeds the timeout, the context is canceled and an error is
+// returned. This timeout applies at the middleware level, before the client's
+// built-in timeout.
 //
 // Caveat — streaming and Download: this middleware cancels its derived context as soon
 // as the handler returns (defer cancel()), which for Download happens once the response
 // headers have been received but before the body stream is consumed. The cancel therefore
 // fires immediately on the first byte of the body, surfacing as a "context canceled"
 // error long before the requested timeout elapses. Do NOT wrap Download (or any
-// WithStreamBody request) with TimeoutMiddleware; use WithTimeout instead, whose deadline
+// WithStreamBody request) with this middleware; use WithTimeout instead, whose deadline
 // is applied on the engine's overall context and survives the body read.
-func TimeoutMiddleware(timeout time.Duration) MiddlewareFunc {
+func TimeoutMiddleware(config *TimeoutMiddlewareConfig) MiddlewareFunc {
+	if config == nil {
+		config = DefaultTimeoutMiddlewareConfig()
+	}
+	timeout := config.Duration
 	return func(next Handler) Handler {
 		return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
 			if timeout <= 0 {
@@ -250,10 +344,32 @@ func TimeoutMiddleware(timeout time.Duration) MiddlewareFunc {
 	}
 }
 
-// HeaderMiddleware creates a middleware that adds static headers to every request.
-// Existing headers with the same keys will be overwritten.
-// Headers are validated for security (CRLF injection prevention) before being set.
-func HeaderMiddleware(headers map[string]string) MiddlewareFunc {
+// HeaderConfig configures the header middleware.
+// Use DefaultHeaderConfig() as the starting point.
+type HeaderConfig struct {
+	// Headers contains static headers added to every request. Existing headers
+	// with the same keys are overwritten. Headers are validated for security
+	// (CRLF injection prevention) at middleware creation time.
+	// Default: empty (no headers added — the middleware is a pass-through).
+	Headers map[string]string
+}
+
+// DefaultHeaderConfig returns a HeaderConfig with no headers.
+func DefaultHeaderConfig() *HeaderConfig {
+	return &HeaderConfig{}
+}
+
+// HeaderMiddleware creates a middleware that adds static headers to every request,
+// configured via HeaderConfig. A nil config selects DefaultHeaderConfig() (no
+// headers — effectively a pass-through). Existing headers with the same keys will
+// be overwritten. Headers are validated for security (CRLF injection prevention)
+// at middleware creation time.
+func HeaderMiddleware(config *HeaderConfig) MiddlewareFunc {
+	if config == nil {
+		config = DefaultHeaderConfig()
+	}
+	headers := config.Headers
+
 	// Defensive copy to prevent concurrent mutation by caller
 	copied := make(map[string]string, len(headers))
 	for key, value := range headers {
@@ -283,9 +399,13 @@ func HeaderMiddleware(headers map[string]string) MiddlewareFunc {
 	}
 }
 
-// MetricsMiddleware creates a middleware that collects request metrics.
-// The onMetrics callback is invoked with metrics after each request completes.
-func MetricsMiddleware(onMetrics func(method, url string, statusCode int, duration time.Duration, err error)) MiddlewareFunc {
+// MetricsMiddleware creates a metrics middleware with the given configuration.
+// A nil config selects DefaultMetricsConfig() (metrics disabled).
+func MetricsMiddleware(config *MetricsConfig) MiddlewareFunc {
+	if config == nil {
+		config = DefaultMetricsConfig()
+	}
+	onMetrics := config.OnMetrics
 	return func(next Handler) Handler {
 		return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
 			start := time.Now()
@@ -321,46 +441,32 @@ func sanitizeCallbackError(err error, rawURL, sanitizedURL string) error {
 	return err
 }
 
-// AuditMiddleware creates a middleware that generates security audit events.
-// This is designed for high-security scenarios (financial, medical, government)
-// where comprehensive request logging is required for compliance.
+// AuditMiddleware creates a middleware that generates security audit events
+// with configurable output format and options. The callback is supplied via
+// config.OnAudit; if nil, the middleware is a no-op. A nil config selects
+// DefaultAuditConfig().
 //
-// The onAudit callback receives an AuditEvent with sanitized URL (credentials removed),
-// request metadata, and response information. SourceIP and UserID are extracted from
-// the request context using SourceIPKey and UserIDKey.
-//
-// Example:
-//
-//	auditMiddleware := httpc.AuditMiddleware(func(event httpc.AuditEvent) {
-//	    log.Printf("[AUDIT] %s %s -> %d (%v) user=%s ip=%s",
-//	        event.Method, event.URL, event.StatusCode, event.Duration,
-//	        event.UserID, event.SourceIP)
-//	})
-//
-// This is a convenience method that delegates to AuditMiddlewareWithConfig with nil config.
-func AuditMiddleware(onAudit func(event AuditEvent)) MiddlewareFunc {
-	return AuditMiddlewareWithConfig(onAudit, nil)
-}
-
-// AuditMiddlewareWithConfig creates a middleware that generates security audit events
-// with configurable output format and options.
+// This middleware is designed for high-security scenarios (financial, medical,
+// government) where comprehensive request logging is required for compliance.
+// SourceIP and UserID are extracted from the request context using SourceIPKey
+// and UserIDKey.
 //
 // Example:
 //
-//	config := &httpc.AuditMiddlewareConfig{
-//	    Format: "json",
-//	    IncludeHeaders: true,
-//	}
-//	auditMiddleware := httpc.AuditMiddlewareWithConfig(func(event httpc.AuditEvent) {
-//	    // event will be formatted according to config.Format
+//	cfg := httpc.DefaultAuditConfig()
+//	cfg.OnAudit = func(event httpc.AuditEvent) {
 //	    log.Printf("[AUDIT] %v", event)
-//	}, config)
-func AuditMiddlewareWithConfig(onAudit func(event AuditEvent), config *AuditMiddlewareConfig) MiddlewareFunc {
-	if onAudit == nil {
-		return func(next Handler) Handler { return next }
-	}
+//	}
+//	cfg.Format = "json"
+//	cfg.IncludeHeaders = true
+//	auditMiddleware := httpc.AuditMiddleware(cfg)
+func AuditMiddleware(config *AuditConfig) MiddlewareFunc {
 	if config == nil {
-		config = DefaultAuditMiddlewareConfig()
+		config = DefaultAuditConfig()
+	}
+	cb := config.OnAudit
+	if cb == nil {
+		return func(next Handler) Handler { return next }
 	}
 
 	// Pre-compute mask set once at middleware creation time instead of per-request.
@@ -409,7 +515,7 @@ func AuditMiddlewareWithConfig(onAudit func(event AuditEvent), config *AuditMidd
 				event.Error = fmt.Errorf("[sanitized]")
 			}
 
-			onAudit(event)
+			cb(event)
 
 			return resp, err
 		}

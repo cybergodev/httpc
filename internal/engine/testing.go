@@ -5,11 +5,17 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
 )
+
+// errForcedFailure is returned by mockTransport for the first failFirst calls,
+// enabling deterministic retry tests without goroutine timing. The message uses
+// "connection reset by peer" so the error classifier marks it as retryable.
+var errForcedFailure = errors.New("connection reset by peer")
 
 // mockTransport is a mock implementation of transportManager for testing.
 // It allows controlling the response and error returned by RoundTrip.
@@ -20,6 +26,11 @@ type mockTransport struct {
 	Called    bool
 	CallCount int
 	Requests  []*http.Request
+
+	// failFirst forces the first N RoundTrip calls to return errForcedFailure,
+	// then falls through to the normal Error/Response path. Useful for
+	// deterministic retry tests (fail-then-succeed scenarios).
+	failFirst int
 
 	// Redirect behavior
 	RedirectChain []string
@@ -45,6 +56,11 @@ func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	m.Called = true
 	m.CallCount++
 	m.Requests = append(m.Requests, req)
+
+	if m.failFirst > 0 {
+		m.failFirst--
+		return nil, errForcedFailure
+	}
 
 	if m.Error != nil {
 		return nil, m.Error
@@ -73,19 +89,6 @@ func (m *mockTransport) Close() error {
 	return nil
 }
 
-// SetResponse sets the response to return for subsequent requests.
-func (m *mockTransport) SetResponse(statusCode int, body string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.Response = &http.Response{
-		StatusCode: statusCode,
-		Status:     http.StatusText(statusCode),
-		Header:     make(http.Header),
-		Body:       io.NopCloser(strings.NewReader(body)),
-	}
-}
-
 // SetError sets the error to return for subsequent requests.
 func (m *mockTransport) SetError(err error) {
 	m.mu.Lock()
@@ -102,33 +105,11 @@ func (m *mockTransport) GetCallCount() int {
 	return m.CallCount
 }
 
-// GetLastRequest returns the last request made, or nil if none.
-func (m *mockTransport) GetLastRequest() *http.Request {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if len(m.Requests) == 0 {
-		return nil
-	}
-	return m.Requests[len(m.Requests)-1]
-}
-
 // withMockTransport returns a clientOption that injects a mock transport.
 func withMockTransport(mt *mockTransport) clientOption {
 	return func(opts *clientOptions) {
 		opts.customTransport = mt
 	}
-}
-
-// Reset clears all recorded state.
-func (m *mockTransport) Reset() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	m.Called = false
-	m.CallCount = 0
-	m.Requests = nil
-	m.Error = nil
 }
 
 // clearResponsePools resets all sync.Pool instances used for response processing.

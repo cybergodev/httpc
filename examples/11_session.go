@@ -33,7 +33,7 @@ func demonstrateBasicSession() {
 	fmt.Println("--- Basic Session Usage ---")
 
 	// Create a session manager
-	session, err := httpc.NewSessionManager()
+	session, err := httpc.NewSessionManagerDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -86,7 +86,7 @@ func demonstrateSessionWithClient() {
 	fmt.Println("--- Session with DomainClient ---")
 
 	// DomainClient has a built-in session
-	client, err := httpc.NewDomain("https://httpbin.org")
+	client, err := httpc.NewDomainDefault("https://httpbin.org")
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -118,7 +118,7 @@ func demonstrateSessionWithClient() {
 func demonstrateSessionState() {
 	fmt.Println("--- Session State Lifecycle ---")
 
-	session, err := httpc.NewSessionManager()
+	session, err := httpc.NewSessionManagerDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return

@@ -36,9 +36,6 @@ const (
 	defaultBufferSize = 4 * 1024 // 4KB - good balance for most responses
 	// maxBufferSize caps the buffer size to prevent memory bloat
 	maxBufferSize = 512 * 1024 // 512KB
-	// bufferStealThreshold is the size below which we "steal" the buffer
-	// instead of copying, reducing allocations for small responses
-	bufferStealThreshold = 32 * 1024 // 32KB
 
 	// SECURITY: maxCompressedSize limits the size of compressed response data
 	// to prevent decompression bomb (zip bomb) attacks. A highly compressed
@@ -57,6 +54,36 @@ var bufferPool = sync.Pool{
 	New: func() any {
 		return bytes.NewBuffer(make([]byte, 0, defaultBufferSize))
 	},
+}
+
+// ioCopyBufferPool reuses the 32KB read buffer that io.Copy would otherwise
+// allocate on every call. io.CopyBuffer with a non-nil buf from this pool
+// eliminates that per-response allocation entirely.
+var ioCopyBufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 32*1024)
+		return &buf
+	},
+}
+
+// getIOCopyBuffer retrieves a 32KB buffer pointer from the pool for use with
+// io.CopyBuffer. Returns *[]byte (not []byte) so the same pointer is passed to
+// putIOCopyBuffer — avoiding a per-call heap allocation from &param escaping.
+func getIOCopyBuffer() *[]byte {
+	bufPtr, _ := ioCopyBufferPool.Get().(*[]byte)
+	if bufPtr == nil {
+		b := make([]byte, 32*1024)
+		bufPtr = &b
+	}
+	return bufPtr
+}
+
+// putIOCopyBuffer returns a 32KB buffer pointer to the pool.
+func putIOCopyBuffer(bufPtr *[]byte) {
+	if bufPtr == nil || cap(*bufPtr) != 32*1024 {
+		return // discard nil or mismatched buffers
+	}
+	ioCopyBufferPool.Put(bufPtr)
 }
 
 // responsePool reuses Response objects to reduce allocations in the hot path
@@ -307,14 +334,16 @@ func (p *responseProcessor) readBody(httpResp *http.Response) ([]byte, error) {
 
 	// Slow path: unknown size, compressed, or large response
 	buf := getBuffer()
+	copyBufPtr := getIOCopyBuffer()
 
 	defer func() {
-		if buf != nil && buf.Cap() <= maxBufferSize {
+		if buf.Cap() <= maxBufferSize {
 			putBuffer(buf)
 		}
+		putIOCopyBuffer(copyBufPtr)
 	}()
 
-	_, err := io.Copy(buf, reader)
+	_, err := io.CopyBuffer(buf, reader, *copyBufPtr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
@@ -330,24 +359,13 @@ func (p *responseProcessor) readBody(httpResp *http.Response) ([]byte, error) {
 		return nil, fmt.Errorf("response body exceeds limit of %d bytes", maxSize)
 	}
 
-	// Optimization path for responses within steal threshold.
-	// Two sub-thresholds based on size:
-	//   - <= 2KB (defaultBufferSize/2): copy — not worth detaching a 4KB buffer for tiny data.
-	//   - 2KB–32KB: steal — detach the buffer from the pool to eliminate a copy.
-	if len(body) <= bufferStealThreshold {
-		if len(body) <= defaultBufferSize/2 {
-			result := make([]byte, len(body))
-			copy(result, body)
-			return result, nil
-		}
-		// Steal: detach buffer from pool and return backing array directly.
-		// buf=nil prevents the deferred putBuffer from returning the stolen buffer.
-		result := body
-		buf = nil
-		return result, nil
-	}
-
-	// For larger responses, copy to avoid holding large buffers
+	// Copy the body into a right-sized slice and return the buffer to the pool.
+	// The previous "steal" optimization (detaching the buffer for 2–32KB bodies
+	// to skip a copy) was removed because it emptied the pool on every call,
+	// forcing a fresh buffer allocation (struct + 4KB array) on the next
+	// request — 2 extra allocs that outweighed the single memcpy saved.
+	// Copying keeps the pool warm (0 allocs on the next read) at the cost of one
+	// memcpy, which is sub-microsecond for typical API responses.
 	result := make([]byte, len(body))
 	copy(result, body)
 	return result, nil

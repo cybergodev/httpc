@@ -25,6 +25,12 @@ func main() {
 	// Example 4: Proxy priority demonstration
 	demonstrateProxyPriority()
 
+	// Example 5: Proxy pool with round-robin rotation
+	demonstrateProxyPool()
+
+	// Example 6: Status-based proxy rotation (CF/WAF evasion)
+	demonstrateStatusRotation()
+
 	// Summary
 	printSummary()
 
@@ -178,6 +184,71 @@ func demonstrateProxyPriority() {
 	fmt.Println("Request succeeded through manual proxy\n ")
 }
 
+// demonstrateProxyPool shows round-robin rotation across multiple proxies.
+func demonstrateProxyPool() {
+	fmt.Println("--- Example 5: Proxy Pool (Round-Robin) ---")
+
+	config := httpc.DefaultConfig()
+	config.Connection.ProxyPool = []string{
+		"http://127.0.0.1:7890",
+		"http://127.0.0.1:7891",
+		"http://127.0.0.1:7892",
+	}
+	// ProxyPoolStrategy defaults to ProxyStrategyRoundRobin — each request
+	// (and each retry) advances to the next proxy automatically.
+	config.Timeouts.Request = 10 * time.Second
+
+	client, err := httpc.New(config)
+	if err != nil {
+		log.Printf("Failed to create client: %v\n", err)
+		return
+	}
+	defer client.Close()
+
+	fmt.Printf("Proxy pool: %d proxies, round-robin strategy\n", len(config.Connection.ProxyPool))
+	fmt.Println("Each request rotates to the next proxy IP.")
+	fmt.Println("Dead proxies are auto-removed after 3 consecutive failures (circuit breaking).")
+	fmt.Println("Customize with ProxyFailureThreshold and ProxyCooldown.\n ")
+
+	// Alternative: random strategy for less predictable distribution
+	fmt.Println("To use random selection instead, set ProxyPoolStrategy:")
+	fmt.Println(`  config.Connection.ProxyPoolStrategy = httpc.ProxyStrategyRandom`)
+	fmt.Println("  Random picks a healthy proxy uniformly — spreads load unpredictably.\n ")
+}
+
+// demonstrateStatusRotation shows proxy rotation triggered by HTTP status codes.
+func demonstrateStatusRotation() {
+	fmt.Println("--- Example 6: Rotate Proxy on 403 (CF/WAF Evasion) ---")
+
+	config := httpc.DefaultConfig()
+	config.Connection.ProxyPool = []string{
+		"http://127.0.0.1:7890",
+		"http://127.0.0.1:7891",
+		"http://127.0.0.1:7892",
+	}
+	// When a response returns 403 (e.g. CF challenge), retry with a
+	// different proxy. Under round-robin, the retry naturally picks the next
+	// proxy IP. This does NOT circuit-break the proxy — blocks are often
+	// target-specific.
+	config.Connection.ProxyRotateOnStatus = []int{403}
+
+	// Retry must be enabled for status rotation to take effect.
+	config.Retry.MaxRetries = 3
+	config.Retry.Delay = 500 * time.Millisecond
+	config.Timeouts.Request = 30 * time.Second
+
+	client, err := httpc.New(config)
+	if err != nil {
+		log.Printf("Failed to create client: %v\n", err)
+		return
+	}
+	defer client.Close()
+
+	fmt.Println("ProxyRotateOnStatus: [403]")
+	fmt.Println("On 403 -> retry -> next proxy IP (round-robin advances automatically)")
+	fmt.Println("Requires Retry.MaxRetries > 0 to take effect.\n ")
+}
+
 // printSummary shows configuration summary and common use cases
 func printSummary() {
 	fmt.Println("=== Configuration Priority ===")
@@ -185,8 +256,9 @@ func printSummary() {
 	fmt.Println("Priority | Setting              | Behavior")
 	fmt.Println("---------|----------------------|------------------------------------------")
 	fmt.Println("1 (High) | ProxyURL set         | Always use specified proxy")
-	fmt.Println("2        | EnableSystemProxy    | Auto-detect from OS/env vars")
-	fmt.Println("3 (Low)  | Neither set          | Direct connection (default)")
+	fmt.Println("2        | ProxyPool set        | Rotate across multiple proxies")
+	fmt.Println("3        | EnableSystemProxy    | Auto-detect from OS/env vars")
+	fmt.Println("4 (Low)  | Neither set          | Direct connection (default)")
 	fmt.Println()
 
 	fmt.Println("=== Common Use Cases ===")
@@ -195,6 +267,8 @@ func printSummary() {
 	fmt.Println("----------------------------|----------------------------------------")
 	fmt.Println("Corporate network           | ProxyURL: \"http://proxy.company.com:8080\"")
 	fmt.Println("VPN software (Clash/V2Ray)  | ProxyURL: \"http://127.0.0.1:7890\"")
+	fmt.Println("Proxy pool / scraping       | ProxyPool: [\"http://p1:8080\", \"http://p2:8080\"]")
+	fmt.Println("CF/WAF evasion              | ProxyPool + ProxyRotateOnStatus: [403]")
 	fmt.Println("System proxy (Windows/Mac)  | EnableSystemProxy: true")
 	fmt.Println("Development (no proxy)      | Default (no configuration needed)")
 	fmt.Println()

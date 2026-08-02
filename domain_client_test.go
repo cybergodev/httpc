@@ -13,6 +13,25 @@ import (
 	"github.com/cybergodev/httpc"
 )
 
+func TestNewDomainDefault(t *testing.T) {
+	// NewDomainDefault is a shortcut for NewDomain(baseURL, DefaultConfig()).
+	dc, err := httpc.NewDomainDefault("https://api.example.com")
+	if err != nil {
+		t.Fatalf("NewDomainDefault error: %v", err)
+	}
+	if dc == nil {
+		t.Fatal("Expected non-nil DomainClienter")
+	}
+	defer dc.Close()
+
+	if dc.URL() != "https://api.example.com" {
+		t.Errorf("expected base URL %q, got %q", "https://api.example.com", dc.URL())
+	}
+	if dc.Domain() != "api.example.com" {
+		t.Errorf("expected domain %q, got %q", "api.example.com", dc.Domain())
+	}
+}
+
 func TestNewDomain(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -53,7 +72,7 @@ func TestNewDomain(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client, err := httpc.NewDomain(tt.baseURL)
+			client, err := httpc.NewDomain(tt.baseURL, httpc.DefaultConfig())
 			if (err != nil) != tt.wantErr {
 				t.Errorf("NewDomain() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -244,7 +263,7 @@ func TestDomainClient_HeaderOverride(t *testing.T) {
 // NewDomain + defer Close boilerplate shared by the session-accessor tests.
 func newTestDomain(t *testing.T) httpc.DomainClienter {
 	t.Helper()
-	client, err := httpc.NewDomain("https://api.example.com")
+	client, err := httpc.NewDomain("https://api.example.com", httpc.DefaultConfig())
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
@@ -640,7 +659,7 @@ func TestDomainClient_ConcurrentAccess(t *testing.T) {
 }
 
 func TestDomainClient_InvalidHeaderValidation(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com")
+	client, err := httpc.NewDomain("https://api.example.com", httpc.DefaultConfig())
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
@@ -660,7 +679,7 @@ func TestDomainClient_InvalidHeaderValidation(t *testing.T) {
 }
 
 func TestDomainClient_InvalidCookieValidation(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com")
+	client, err := httpc.NewDomain("https://api.example.com", httpc.DefaultConfig())
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
@@ -1217,7 +1236,7 @@ func TestDomainClient_Accessors(t *testing.T) {
 	}))
 	defer server.Close()
 
-	dc, err := httpc.NewDomain(server.URL)
+	dc, err := httpc.NewDomainDefault(server.URL)
 	if err != nil {
 		t.Fatalf("NewDomain failed: %v", err)
 	}
@@ -1422,4 +1441,31 @@ func TestDomainClient_NilReceiver(t *testing.T) {
 			t.Errorf("nil Close() = %v, want nil", err)
 		}
 	})
+
+	t.Run("Request returns error", func(t *testing.T) {
+		_, err := dc.Request(context.Background(), "GET", "/test")
+		if err == nil {
+			t.Error("nil Request() should return error")
+		}
+	})
+
+	t.Run("Download returns error", func(t *testing.T) {
+		_, err := dc.Download(context.Background(), "/test", &httpc.DownloadConfig{FilePath: "test"})
+		if err == nil {
+			t.Error("nil Download() should return error")
+		}
+	})
+}
+
+// TestDomainClient_UninitializedFields verifies that a DomainClient with nil
+// internal fields (but non-nil pointer) is rejected by checkInit.
+func TestDomainClient_UninitializedFields(t *testing.T) {
+	// Construct a DomainClient with nil client and SessionManager.
+	// Only possible via zero-value struct literal since SessionManager is exported.
+	dc := &httpc.DomainClient{}
+
+	_, err := dc.Request(context.Background(), "GET", "/test")
+	if err == nil {
+		t.Error("expected error for uninitialized DomainClient Request")
+	}
 }

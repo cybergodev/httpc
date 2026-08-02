@@ -36,6 +36,17 @@ func TestClient_Creation(t *testing.T) {
 		}
 	})
 
+	t.Run("NewDefault", func(t *testing.T) {
+		client, err := NewDefault()
+		if err != nil {
+			t.Fatalf("NewDefault() failed: %v", err)
+		}
+		defer client.Close()
+		if client == nil {
+			t.Fatal("NewDefault() returned nil client")
+		}
+	})
+
 	t.Run("WithConfig", func(t *testing.T) {
 		config := DefaultConfig()
 		config.Timeouts.Request = 10 * time.Second
@@ -177,7 +188,7 @@ func TestClient_Concurrency(t *testing.T) {
 
 		cfg := DefaultConfig()
 		cfg.Security.AllowPrivateIPs = true
-		cfg.Middleware.Headers = map[string]string{"X-Initial": "value"}
+		cfg.Defaults.Headers = map[string]string{"X-Initial": "value"}
 
 		client, err := New(cfg)
 		if err != nil {
@@ -201,7 +212,7 @@ func TestClient_Concurrency(t *testing.T) {
 
 		// Modify original config (should not affect client)
 		for i := 0; i < 50; i++ {
-			cfg.Middleware.Headers["X-Modified"] = "new-value"
+			cfg.Defaults.Headers["X-Modified"] = "new-value"
 			cfg.Timeouts.Request = time.Duration(i) * time.Second
 		}
 
@@ -513,19 +524,19 @@ func TestSetDefaultClient_Boundaries(t *testing.T) {
 	})
 }
 
-func TestDeepCopyConfig(t *testing.T) {
+func TestCopyConfig(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Security.RedirectWhitelist = []string{"https://trusted.com"}
 	cfg.Security.AllowPrivateIPs = true
-	cfg.Middleware.Headers = map[string]string{"X-Test": "value"}
+	cfg.Defaults.Headers = map[string]string{"X-Test": "value"}
 
-	copied := deepCopyConfig(cfg)
+	copied := copyConfig(cfg)
 
 	// Modify original - copy should be independent
-	cfg.Middleware.Headers["X-Test"] = "modified"
+	cfg.Defaults.Headers["X-Test"] = "modified"
 	cfg.Security.RedirectWhitelist[0] = "https://evil.com"
 
-	if copied.Middleware.Headers["X-Test"] != "value" {
+	if copied.Defaults.Headers["X-Test"] != "value" {
 		t.Error("copy should be independent of original")
 	}
 	if copied.Security.RedirectWhitelist[0] != "https://trusted.com" {
@@ -580,58 +591,7 @@ func TestClient_Lifecycle_AfterClose(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
-// mergeNilSubConfigs — covers the five nil sub-config branches (FIX-001)
-// ----------------------------------------------------------------------------
-
-func TestMergeNilSubConfigs(t *testing.T) {
-	// Each sub-config left nil is filled from DefaultConfig; non-nil sub-configs
-	// are preserved as-is. Exercises all five nil-branches plus an all-nil case.
-	// Compared by value (reflect.DeepEqual) because DefaultConfig() returns fresh
-	// sub-config pointers on each call.
-	def := DefaultConfig()
-
-	tests := []struct {
-		name     string
-		nilField func(*Config)
-		filled   func(*Config) bool
-	}{
-		{"Timeouts nil", func(c *Config) { c.Timeouts = nil }, func(c *Config) bool { return c.Timeouts != nil && reflect.DeepEqual(c.Timeouts, def.Timeouts) }},
-		{"Connection nil", func(c *Config) { c.Connection = nil }, func(c *Config) bool { return c.Connection != nil && reflect.DeepEqual(c.Connection, def.Connection) }},
-		{"Security nil", func(c *Config) { c.Security = nil }, func(c *Config) bool { return c.Security != nil && reflect.DeepEqual(c.Security, def.Security) }},
-		{"Retry nil", func(c *Config) { c.Retry = nil }, func(c *Config) bool { return c.Retry != nil && reflect.DeepEqual(c.Retry, def.Retry) }},
-		{"Middleware nil", func(c *Config) { c.Middleware = nil }, func(c *Config) bool { return c.Middleware != nil && reflect.DeepEqual(c.Middleware, def.Middleware) }},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := DefaultConfig()
-			tt.nilField(cfg)
-			if !tt.filled(mergeNilSubConfigs(cfg)) {
-				t.Errorf("mergeNilSubConfigs did not fill the nil sub-config from DefaultConfig")
-			}
-		})
-	}
-
-	t.Run("all nil", func(t *testing.T) {
-		got := mergeNilSubConfigs(&Config{})
-		if got.Timeouts == nil || got.Connection == nil || got.Security == nil ||
-			got.Retry == nil || got.Middleware == nil {
-			t.Error("mergeNilSubConfigs left a sub-config nil for an all-nil Config")
-		}
-	})
-
-	t.Run("preserves non-nil sub-config", func(t *testing.T) {
-		cfg := DefaultConfig()
-		custom := &TimeoutConfig{Request: 99 * time.Second}
-		cfg.Timeouts = custom
-		if mergeNilSubConfigs(cfg).Timeouts != custom {
-			t.Error("mergeNilSubConfigs overwrote a non-nil sub-config")
-		}
-	})
-}
-
-// ----------------------------------------------------------------------------
-// newFromPreparedConfig — InsecureSkipVerify warn-once path (FIX-001)
+// newFromConfig — InsecureSkipVerify warn-once path (FIX-001)
 // ----------------------------------------------------------------------------
 
 func TestNewFromPreparedConfig_InsecureSkipVerifyWarn(t *testing.T) {
@@ -660,9 +620,9 @@ func TestNewFromPreparedConfig_InsecureSkipVerifyWarn(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.Security.InsecureSkipVerify = true
-	client, err := newFromPreparedConfig(cfg)
+	client, err := newFromConfig(cfg)
 	if err != nil {
-		t.Fatalf("newFromPreparedConfig failed: %v", err)
+		t.Fatalf("newFromConfig failed: %v", err)
 	}
 	defer client.Close()
 

@@ -30,7 +30,7 @@ import (
 )
 
 func main() {
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }
@@ -61,7 +61,7 @@ import (
 
 func main() {
     // Create a client
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }
@@ -96,7 +96,7 @@ type User struct {
 }
 
 func main() {
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }
@@ -131,7 +131,7 @@ type User struct {
 }
 
 func main() {
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }
@@ -161,7 +161,7 @@ Always create a client and close it when done:
 
 ```go
 // Create client
-client, err := httpc.New()
+client, err := httpc.NewDefault()
 if err != nil {
     log.Fatal(err)
 }
@@ -320,7 +320,7 @@ if err := result.Unmarshal(&data); err != nil {
 **Standard Client (Recommended for Production)**
 
 ```go
-client, err := httpc.New()
+client, err := httpc.NewDefault()
 if err != nil {
     log.Fatal(err)
 }
@@ -332,7 +332,7 @@ defer client.Close()  // Always close to release resources
 ```go
 config := httpc.DefaultConfig()
 config.Timeouts.Request = 30 * time.Second
-config.Middleware.UserAgent = "MyApp/1.0"
+config.Defaults.UserAgent = "MyApp/1.0"
 
 client, err := httpc.New(config)
 if err != nil {
@@ -421,7 +421,7 @@ type APIClient struct {
 }
 
 func NewAPIClient(baseURL, token string) (*APIClient, error) {
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         return nil, err
     }
@@ -465,7 +465,7 @@ func (c *APIClient) GetUser(id int) (*User, error) {
 
 ```go
 func fetchData(ctx context.Context, url string) ([]byte, error) {
-    client, err := httpc.New()
+    client, err := httpc.NewDefault()
     if err != nil {
         return nil, err
     }
@@ -517,7 +517,7 @@ Now that you understand the basics, explore these guides:
 
 ```go
 // Uses secure defaults (TLS 1.2+, 180s timeout, 3 retries)
-client, err := httpc.New()
+client, err := httpc.NewDefault()
 ```
 
 ### Using Presets

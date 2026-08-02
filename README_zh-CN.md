@@ -126,8 +126,8 @@ import (
 )
 
 func main() {
-    // 创建可复用的客户端 (无参数时 New() 内部使用 DefaultConfig())
-    client, err := httpc.New()
+    // 创建可复用的客户端 (使用默认配置)
+    client, err := httpc.NewDefault()
     if err != nil {
         log.Fatal(err)
     }
@@ -525,7 +525,7 @@ result, _ := httpc.Download(ctx, url, opts,
 用于对同一域名发起多次请求，自动管理 Cookie 和请求头：
 
 ```go
-client, _ := httpc.NewDomain("https://api.example.com")
+client, _ := httpc.NewDomainDefault("https://api.example.com")
 defer client.Close()
 
 // 登录 - 服务器设置 Cookie
@@ -606,7 +606,7 @@ result, _ := client.Request(ctx, "PROPFIND", "/resource")
 
 ```go
 // 创建会话管理器
-sm, _ := httpc.NewSessionManager()
+sm, _ := httpc.NewSessionManagerDefault()
 
 // 或带 Cookie 安全验证
 cfg := httpc.DefaultSessionConfig()
@@ -643,8 +643,8 @@ sm.SetCookieSecurity(httpc.StrictCookieSecurityConfig())
 ### 预设配置
 
 ```go
-// 推荐的默认配置 (等同于无参数调用 httpc.New())
-client, _ := httpc.New(httpc.DefaultConfig())
+// 推荐的默认配置
+client, _ := httpc.NewDefault()
 
 // 最高安全性 (启用 SSRF 防护)
 client, _ := httpc.New(httpc.SecureConfig())
@@ -662,9 +662,9 @@ client, _ := httpc.New(httpc.TestingConfig())
 ### 自定义配置
 
 ```go
-config := &httpc.Config{
+config := httpc.Config{
     // 超时设置
-    Timeouts: &httpc.TimeoutConfig{
+    Timeouts: httpc.TimeoutConfig{
         Request:        30 * time.Second,
         Dial:           10 * time.Second,
         TLSHandshake:   10 * time.Second,
@@ -673,7 +673,7 @@ config := &httpc.Config{
     },
 
     // 连接设置
-    Connection: &httpc.ConnectionConfig{
+    Connection: httpc.ConnectionConfig{
         MaxIdleConns:    100,
         MaxConnsPerHost: 20,
         EnableHTTP2:     true,
@@ -681,7 +681,7 @@ config := &httpc.Config{
     },
 
     // 安全设置
-    Security: &httpc.SecurityConfig{
+    Security: httpc.SecurityConfig{
         MinTLSVersion:       tls.VersionTLS12,
         MaxTLSVersion:       tls.VersionTLS13,
         MaxResponseBodySize: 50 * 1024 * 1024, // 50 MB
@@ -689,15 +689,15 @@ config := &httpc.Config{
     },
 
     // 重试设置
-    Retry: &httpc.RetryConfig{
+    Retry: httpc.RetryConfig{
         MaxRetries:    3,
         Delay:         1 * time.Second,
         BackoffFactor: 2.0,
         EnableJitter:  true,
     },
 
-    // 中间件设置
-    Middleware: &httpc.MiddlewareConfig{
+    // 默认设置 (每次请求的默认值：User-Agent、请求头、重定向策略)
+    Defaults: httpc.RequestDefaults{
         UserAgent:       "MyApp/1.0",
         FollowRedirects: true,
         MaxRedirects:    10,
@@ -705,7 +705,7 @@ config := &httpc.Config{
 }
 
 // 创建客户端前验证配置 (New() 内部也会自动验证)
-if err := httpc.ValidateConfig(config); err != nil {
+if err := httpc.ValidateConfig(&config); err != nil {
     log.Fatal(err)
 }
 
@@ -738,8 +738,13 @@ fmt.Println(config.String())
 | **连接设置** (`Connection`) ||||
 | `Connection.MaxIdleConns` | `int` | `50` | 最大空闲连接数 |
 | `Connection.MaxConnsPerHost` | `int` | `10` | 每个主机最大连接数 |
-| `Connection.ProxyURL` | `string` | `""` | 代理 URL (http/https) |
+| `Connection.ProxyURL` | `string` | `""` | 代理 URL (http/https/socks5/socks5h) |
 | `Connection.EnableSystemProxy` | `bool` | `false` | 自动检测系统代理 |
+| `Connection.ProxyPool` | `[]string` | `nil` | 用于轮换的代理 URL（见[代理配置](#代理配置)） |
+| `Connection.ProxyPoolStrategy` | `ProxyStrategy` | `ProxyStrategyRoundRobin` | 代理选择算法（`ProxyStrategyRoundRobin` 或 `ProxyStrategyRandom`） |
+| `Connection.ProxyFailureThreshold` | `int` | `3` | 触发熔断前的连续连接失败次数 |
+| `Connection.ProxyCooldown` | `time.Duration` | `30s` | 被熔断的代理退出轮换的时长 |
+| `Connection.ProxyRotateOnStatus` | `[]int` | `nil` | 触发代理轮换的 HTTP 状态码（如 `[]int{403}`） |
 | `Connection.EnableHTTP2` | `bool` | `true` | 启用 HTTP/2 |
 | `Connection.EnableCookies` | `bool` | `false` | 启用 Cookie Jar |
 | `Connection.EnableDoH` | `bool` | `false` | 启用 DNS-over-HTTPS |
@@ -768,54 +773,61 @@ fmt.Println(config.String())
 | `Retry.EnableJitter` | `bool` | `true` | 重试添加抖动 |
 | `Retry.MaxRetryDelay` | `time.Duration` | `30s` | 最大重试延迟上限 |
 | `Retry.CustomPolicy` | `RetryPolicy` | `nil` | 自定义重试逻辑 |
-| **中间件设置** (`Middleware`) ||||
+| **中间件设置** (`Middleware: httpc.MiddlewareConfig{...}`) ||||
 | `Middleware.Middlewares` | `[]MiddlewareFunc` | `nil` | 中间件链 |
-| `Middleware.UserAgent` | `string` | `"httpc/1.0"` | 默认 User-Agent |
-| `Middleware.Headers` | `map[string]string` | `{}` | 默认请求头 |
-| `Middleware.FollowRedirects` | `bool` | `true` | 跟随重定向 |
-| `Middleware.MaxRedirects` | `int` | `10` | 最大重定向次数 |
+| **默认设置** (`Defaults: httpc.RequestDefaults{...}`) ||||
+| `Defaults.UserAgent` | `string` | `"httpc/1.0"` | 默认 User-Agent |
+| `Defaults.Headers` | `map[string]string` | `{}` | 默认请求头 |
+| `Defaults.FollowRedirects` | `bool` | `true` | 跟随重定向 |
+| `Defaults.MaxRedirects` | `int` | `10` | 最大重定向次数 |
 
 ---
 
 ## 中间件
 
+每个可配置中间件遵循相同模式：`XxxConfig` 结构体、`DefaultXxxConfig()`
+构造函数，以及 `XxxMiddleware(cfg)` 工厂函数。传入 `nil` 使用默认值。
+
 ### 内置中间件
 
 ```go
 // 请求日志
-httpc.LoggingMiddleware(log.Printf)
+httpc.LoggingMiddleware(&httpc.LoggingConfig{LogFunc: log.Printf})
 
-// Panic 恢复
+// Panic 恢复（无需配置）
 httpc.RecoveryMiddleware()
 
-// 请求 ID
-httpc.RequestIDMiddleware("X-Request-ID", nil)
+// 请求 ID（nil 配置 = 默认值："X-Request-ID" 头，crypto/rand 生成器）
+httpc.RequestIDMiddleware(&httpc.RequestIDConfig{HeaderName: "X-Request-ID"})
 
 // 超时强制执行
-httpc.TimeoutMiddleware(30*time.Second)
+httpc.TimeoutMiddleware(&httpc.TimeoutMiddlewareConfig{Duration: 30 * time.Second})
 
 // 静态请求头
-httpc.HeaderMiddleware(map[string]string{
-    "X-App-Version": "1.0.0",
+httpc.HeaderMiddleware(&httpc.HeaderConfig{
+    Headers: map[string]string{"X-App-Version": "1.0.0"},
 })
 
 // 指标收集
-httpc.MetricsMiddleware(func(method, url string, statusCode int, duration time.Duration, err error) {
-    metrics.Record(method, url, statusCode, duration)
+httpc.MetricsMiddleware(&httpc.MetricsConfig{
+    OnMetrics: func(method, url string, statusCode int, duration time.Duration, err error) {
+        metrics.Record(method, url, statusCode, duration)
+    },
 })
 
 // 安全审计
-httpc.AuditMiddleware(func(a httpc.AuditEvent) {
+auditCfg := httpc.DefaultAuditConfig()
+auditCfg.OnAudit = func(a httpc.AuditEvent) {
     log.Printf("[AUDIT] %s %s -> %d (%v)", a.Method, a.URL, a.StatusCode, a.Duration)
-})
+}
+httpc.AuditMiddleware(auditCfg)
 
-// 带自定义配置的审计
-auditCfg := httpc.DefaultAuditMiddlewareConfig()
-auditCfg.IncludeHeaders = true
-auditCfg.Format = "json"
-httpc.AuditMiddlewareWithConfig(func(a httpc.AuditEvent) {
-    log.Printf("[AUDIT] %v", a)
-}, auditCfg)
+// 带自定义配置的审计（JSON 格式，包含请求头）
+auditCfgJSON := httpc.DefaultAuditConfig()
+auditCfgJSON.OnAudit = func(a httpc.AuditEvent) { log.Printf("[AUDIT] %v", a) }
+auditCfgJSON.IncludeHeaders = true
+auditCfgJSON.Format = "json"
+httpc.AuditMiddleware(auditCfgJSON)
 ```
 
 ### AuditEvent 字段
@@ -842,9 +854,9 @@ httpc.AuditMiddlewareWithConfig(func(a httpc.AuditEvent) {
 ```go
 chainedMiddleware := httpc.Chain(
     httpc.RecoveryMiddleware(),
-    httpc.LoggingMiddleware(log.Printf),
-    httpc.RequestIDMiddleware("X-Request-ID", nil),
-    httpc.HeaderMiddleware(map[string]string{"X-App": "v1"}),
+    httpc.LoggingMiddleware(&httpc.LoggingConfig{LogFunc: log.Printf}),
+    httpc.RequestIDMiddleware(nil),
+    httpc.HeaderMiddleware(&httpc.HeaderConfig{Headers: map[string]string{"X-App": "v1"}}),
 )
 config.Middleware.Middlewares = []httpc.MiddlewareFunc{chainedMiddleware}
 ```
@@ -882,6 +894,34 @@ config.Connection.ProxyURL = "http://127.0.0.1:8080"
 config := httpc.DefaultConfig()
 config.Connection.EnableSystemProxy = true  // 从环境变量和系统设置读取
 ```
+
+### 代理池（轮换 + 熔断）
+
+在多个代理之间分发请求，支持自动故障转移和基于状态码的轮换：
+
+```go
+config := httpc.DefaultConfig()
+config.Connection.ProxyPool = []string{
+    "http://proxy1.example.com:7070",
+    "http://proxy2.example.com:8080",
+    "socks5://proxy3.example.com:1080",
+}
+// 策略：ProxyStrategyRoundRobin（默认）或 ProxyStrategyRandom
+config.Connection.ProxyPoolStrategy = httpc.ProxyStrategyRoundRobin
+
+// 熔断：连续 5 次连接失败后跳过该代理 60 秒，然后重试（半开探测）。
+// 默认值：阈值=3，冷却=30s。
+config.Connection.ProxyFailureThreshold = 5
+config.Connection.ProxyCooldown = 60 * time.Second
+
+// 遇到 403 时轮换代理（Cloudflare/WAF IP 封锁）。请求会通过不同的代理 IP 重试。
+// 需要 Retry.MaxRetries > 0。
+// 与连接失败不同，基于状态码的轮换不会触发熔断——封锁通常是目标相关的。
+config.Connection.ProxyRotateOnStatus = []int{403}
+config.Retry.MaxRetries = 3
+```
+
+**优先级：** `ProxyURL` > `ProxyPool` > `EnableSystemProxy` > 直连。
 
 ---
 
@@ -1067,7 +1107,7 @@ if errors.As(err, &clientErr) {
 HTTPC 设计为 goroutine 安全：
 
 ```go
-client, _ := httpc.New() // 内部使用 DefaultConfig()
+client, _ := httpc.NewDefault() // 默认配置
 defer client.Close()
 
 var wg sync.WaitGroup

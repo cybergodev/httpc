@@ -193,6 +193,40 @@ func TestRetryEngine_ShouldRetry(t *testing.T) {
 	})
 }
 
+// TestRetryEngine_ExtraRetryableStatusCodes verifies that status codes supplied
+// via ExtraRetryableStatusCodes (e.g. 403 for proxy rotation) are treated as
+// retryable while codes outside both the built-in and extra sets are not.
+func TestRetryEngine_ExtraRetryableStatusCodes(t *testing.T) {
+	config := &Config{
+		MaxRetries:                3,
+		ExtraRetryableStatusCodes: []int{403},
+	}
+	engine := newRetryEngine(config)
+
+	tests := []struct {
+		name       string
+		statusCode int
+		expected   bool
+	}{
+		{"403 extra-retryable", 403, true},
+		{"429 built-in retryable", 429, true},
+		{"200 not retryable", 200, false},
+		{"404 not retryable", 404, false},
+		{"500 built-in retryable", 500, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp := &Response{}
+			resp.SetStatusCode(tt.statusCode)
+			result := engine.ShouldRetry(resp, nil, 0)
+			if result != tt.expected {
+				t.Errorf("status %d: expected retryable=%v, got %v", tt.statusCode, tt.expected, result)
+			}
+		})
+	}
+}
+
 func TestRetryEngine_GetDelay_ExponentialBackoff(t *testing.T) {
 	config := &Config{
 		RetryDelay:    100 * time.Millisecond,

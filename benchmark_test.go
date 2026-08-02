@@ -744,3 +744,61 @@ func BenchmarkConcurrent_DifferentURLs(b *testing.B) {
 		_ = counter
 	})
 }
+
+// BenchmarkClient_WithConfigHeaders measures end-to-end performance when the
+// client has default headers in its config (exercises pre-canonicalization).
+func BenchmarkClient_WithConfigHeaders(b *testing.B) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	defer server.Close()
+
+	config := DefaultConfig()
+	config.Security.AllowPrivateIPs = true
+	config.Retry.MaxRetries = 0
+	config.Defaults.Headers = map[string]string{
+		"X-Custom-Header-1": "value1",
+		"X-Custom-Header-2": "value2",
+		"Accept":            "application/json",
+	}
+	client, _ := New(config)
+	defer func() { _ = client.Close() }()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := client.Get(server.URL)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkClient_WithCookies measures end-to-end performance with per-request
+// cookies (exercises the batch cookie header builder).
+func BenchmarkClient_WithCookies(b *testing.B) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("OK"))
+	}))
+	defer server.Close()
+
+	client, _ := newBenchmarkClient()
+	defer func() { _ = client.Close() }()
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		_, err := client.Get(server.URL,
+			WithCookie(http.Cookie{Name: "session_id", Value: "abc123def456"}),
+			WithCookie(http.Cookie{Name: "csrf_token", Value: "xyz789"}),
+			WithCookie(http.Cookie{Name: "user_pref", Value: "dark_mode"}),
+		)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}

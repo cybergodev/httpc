@@ -13,7 +13,7 @@ import (
 // ============================================================================
 
 func TestNewSessionManager(t *testing.T) {
-	session, err := NewSessionManager()
+	session, err := NewSessionManager(DefaultSessionConfig())
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
@@ -45,8 +45,28 @@ func TestNewSessionManagerWithConfig(t *testing.T) {
 	}
 }
 
+func TestNewSessionManagerDefault(t *testing.T) {
+	// NewSessionManagerDefault is a shortcut for NewSessionManager(DefaultSessionConfig()).
+	session, err := NewSessionManagerDefault()
+	if err != nil {
+		t.Fatalf("NewSessionManagerDefault error: %v", err)
+	}
+	if session == nil {
+		t.Fatal("Expected non-nil SessionManager")
+	}
+	if len(session.cookies) != 0 {
+		t.Error("Expected empty cookies map")
+	}
+	if len(session.headers) != 0 {
+		t.Error("Expected empty headers map")
+	}
+	if session.cookieSecurity != nil {
+		t.Error("Expected nil cookieSecurity with default config")
+	}
+}
+
 func TestSessionManager_SetCookieSecurity(t *testing.T) {
-	session, err := NewSessionManager()
+	session, err := NewSessionManagerDefault()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
@@ -110,7 +130,7 @@ func TestSessionManager_CookieSecurityValidation(t *testing.T) {
 // (Not used by TestNewSessionManager itself, which validates the constructor.)
 func newTestSession(t *testing.T) *SessionManager {
 	t.Helper()
-	session, err := NewSessionManager()
+	session, err := NewSessionManagerDefault()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
@@ -255,7 +275,7 @@ func TestSessionManager_ClearHeaders(t *testing.T) {
 }
 
 func TestSessionManager_prepareOptions(t *testing.T) {
-	session, err := NewSessionManager()
+	session, err := NewSessionManagerDefault()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
@@ -301,7 +321,7 @@ func TestSessionManager_prepareOptions(t *testing.T) {
 }
 
 func TestSessionManager_UpdateFromResult(t *testing.T) {
-	session, err := NewSessionManager()
+	session, err := NewSessionManagerDefault()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
@@ -331,7 +351,7 @@ func TestSessionManager_UpdateFromResult(t *testing.T) {
 
 func TestSessionManager_SecurityValidation_SetCookieSecurity(t *testing.T) {
 	// Test that SetCookieSecurity affects subsequent SetCookie calls
-	session, err := NewSessionManager()
+	session, err := NewSessionManagerDefault()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
@@ -359,7 +379,7 @@ func TestSessionManager_SecurityValidation_SetCookieSecurity(t *testing.T) {
 // ----------------------------------------------------------------------------
 
 func TestSessionManager_UpdateFromCookies(t *testing.T) {
-	session, err := NewSessionManager()
+	session, err := NewSessionManagerDefault()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}
@@ -381,7 +401,7 @@ func TestSessionManager_UpdateFromCookies(t *testing.T) {
 }
 
 func TestSessionManager_SetCookies_NilElement(t *testing.T) {
-	session, err := NewSessionManager()
+	session, err := NewSessionManagerDefault()
 	if err != nil {
 		t.Fatalf("NewSessionManager error: %v", err)
 	}

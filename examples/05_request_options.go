@@ -16,7 +16,7 @@ import (
 func main() {
 	fmt.Println("=== Request Options Examples ===\n ")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Fatal(err)
 	}

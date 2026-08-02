@@ -39,7 +39,7 @@ func main() {
 func demonstrateBasicTimeout() {
 	fmt.Println("--- Example 1: Basic Timeout ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -64,7 +64,7 @@ func demonstrateBasicTimeout() {
 func demonstrateContextTimeout() {
 	fmt.Println("--- Example 2: Context with Timeout ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -92,7 +92,7 @@ func demonstrateContextTimeout() {
 func demonstrateRetry() {
 	fmt.Println("--- Example 3: Retry Configuration ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -119,7 +119,7 @@ func demonstrateRetry() {
 func demonstrateCombined() {
 	fmt.Println("--- Example 4: Combined Timeout and Retry ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -154,7 +154,7 @@ func demonstrateCombined() {
 func demonstrateNoRetry() {
 	fmt.Println("--- Example 5: Disable Retries ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return

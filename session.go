@@ -26,8 +26,8 @@ type SessionConfig struct {
 //	cfg := httpc.DefaultSessionConfig()
 //	cfg.CookieSecurity = validation.StrictCookieSecurityConfig()
 //	sm, err := httpc.NewSessionManager(cfg)
-func DefaultSessionConfig() *SessionConfig {
-	return &SessionConfig{}
+func DefaultSessionConfig() SessionConfig {
+	return SessionConfig{}
 }
 
 // SessionManager manages session state including cookies and headers
@@ -40,29 +40,33 @@ type SessionManager struct {
 }
 
 // NewSessionManager creates a new SessionManager with the given configuration.
-// If no configuration is provided or nil is passed, DefaultSessionConfig() is used.
+// Pass DefaultSessionConfig() for defaults, or use NewSessionManagerDefault() as
+// a zero-argument shortcut.
 //
-// Examples:
+// Example:
 //
-//	// Use default configuration
-//	sm, err := httpc.NewSessionManager()
-//
-//	// Use custom configuration
 //	cfg := httpc.DefaultSessionConfig()
 //	cfg.CookieSecurity = mySecurityConfig
 //	sm, err := httpc.NewSessionManager(cfg)
 //
 // Currently always returns a nil error; the error return is reserved for future validation.
-func NewSessionManager(config ...*SessionConfig) (*SessionManager, error) {
-	cfg := DefaultSessionConfig()
-	if len(config) > 0 && config[0] != nil {
-		cfg = config[0]
-	}
+func NewSessionManager(cfg SessionConfig) (*SessionManager, error) {
 	return &SessionManager{
 		cookies:        make(map[string]*http.Cookie),
 		headers:        make(map[string]string),
 		cookieSecurity: cfg.CookieSecurity,
 	}, nil
+}
+
+// NewSessionManagerDefault creates a SessionManager with default settings.
+// It is a convenience shortcut for NewSessionManager(DefaultSessionConfig()),
+// mirroring NewDefault() for the main client.
+//
+// Example:
+//
+//	sm, err := httpc.NewSessionManagerDefault()
+func NewSessionManagerDefault() (*SessionManager, error) {
+	return NewSessionManager(DefaultSessionConfig())
 }
 
 // SetCookieSecurity sets the cookie security configuration.

@@ -4,6 +4,49 @@ All notable changes to the cybergodev/httpc library will be documented in this f
 
 ---
 
+## v2.0.0 - API Unification, Proxy Pool & Performance (2026-08-03)
+
+### Breaking
+- Config sub-configs changed from pointer types (`*TimeoutConfig`) to value types (`TimeoutConfig`); `DefaultConfig()` returns `Config` (value) not `*Config`
+- `New(config ...*Config)` → `New(cfg Config)`; `NewDomain(baseURL, config ...*Config)` → `NewDomain(baseURL, config ...Config)`
+- `MiddlewareConfig` request-default fields (`UserAgent`, `Headers`, `FollowRedirects`, `MaxRedirects`) removed — use `Config.Defaults` (`RequestDefaults` struct)
+- Removed 6 deprecated positional-parameter middleware constructors (`LoggingMiddleware(log)`, `MetricsMiddleware(onMetrics)`, etc.)
+- Renamed `XxxMiddlewareWithConfig` → `XxxMiddleware` for all 6 configurable middlewares (single `*XxxConfig` param, `nil` = defaults)
+- `AuditMiddlewareConfig` → `AuditConfig`; `DefaultAuditMiddlewareConfig()` → `DefaultAuditConfig()`
+- `SecureConfig`/`PerformanceConfig`/`TestingConfig`/`MinimalConfig` return `Config` instead of `*Config`
+
+### Added
+- `NewDefault()` zero-arg constructor + `NewDomainDefault(baseURL)` + `NewSessionManagerDefault()`
+- Proxy pool package (`internal/proxypool`): round-robin/random selection, passive circuit breaking, status-based rotation
+- `ProxyStrategy` type + constants; `ConnectionConfig` fields (`ProxyPool`, `ProxyPoolStrategy`, `ProxyFailureThreshold`, `ProxyCooldown`, `ProxyRotateOnStatus`)
+- Auto-raise `MaxRetries` to `len(ProxyPool)-1` when status rotation is configured (`calculateMaxRetries`)
+- Middleware `Config` structs: `LoggingConfig`, `MetricsConfig`, `RequestIDConfig`, `TimeoutMiddlewareConfig`, `HeaderConfig` (+ `Default*()` + constructors)
+- Platform-specific retryable syscall errors: `errors_windows.go` (WSA codes), `errors_unix.go` (stub)
+- `RequestDefaults` struct on `Config` — preferred location for per-request defaults
+- `HTTPC_DEBUG` env var for proxy rotation diagnostics
+
+### Fixed
+- Middleware double-pool race leaking request headers (incl. `Authorization`) between concurrent requests
+- Proxy rotation desynchronized by redirect-following within retries (`CloseIdleConnections` between attempts)
+- Connection-refused not retryable on Go 1.25+ Windows (WSA error code mapping)
+- URL cache eviction O(N×M) → O(N+M), no longer blocking all readers
+- `Config.String()` pool cap guard; `validateFormInput` rejects unsupported types; `WithCookieString` capacity reuse
+- `dev_test/` build failure (`//go:build ignore` on all 6 scratch files)
+
+### Performance
+- `io.CopyBuffer` pool eliminates 1 alloc + 32KB per response read; buffer steal removal: −2 allocs / −7KB on compressed responses
+- Cookie header batching (`buildCookieHeader`): ~93% allocation reduction for cookie-bearing requests
+- Pre-canonicalized header keys eliminate per-request `http.CanonicalHeaderKey` overhead
+- `AppendQueryEscape` exported for zero-intermediate-string form encoding
+- `ClientError` `urlSanitized` flag skips redundant `SanitizeURL` (~22% faster `Error()`)
+
+### Changed
+- API documentation unified: "Two API Layers" and "Configuration Conventions" sections in `doc.go`
+- Code quality: inlined `newCookieJar`, simplified `putMIMEHeader`, unexported composition-only sub-interfaces
+- Test suite: coverage 88.7% → 90.0%; table-driven consolidation across packages
+
+---
+
 ## v1.5.3 - Socks5 Proxy Fix, DoH Crash Guard & Performance (2026-07-10)
 
 ### Fixed

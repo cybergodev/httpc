@@ -43,7 +43,7 @@ var sensitiveHeaders = map[string]bool{
 }
 
 // cachedSensitiveHeaderNames is a pre-computed slice of sensitive header names.
-// Avoids map iteration and allocation on every DefaultAuditMiddlewareConfig() call.
+// Avoids map iteration and allocation on every DefaultAuditConfig() call.
 var cachedSensitiveHeaderNames = func() []string {
 	names := make([]string, 0, len(sensitiveHeaders))
 	for k := range sensitiveHeaders {

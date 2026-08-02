@@ -318,3 +318,56 @@ func TestTransferRequestHeaders_OwnershipContract(t *testing.T) {
 		t.Error("second TransferRequestHeaders should return nil after ownership transfer")
 	}
 }
+
+// TestPoolHelpers_EdgeCases exercises the guard clauses and reuse paths of the
+// internal sync.Pool helpers that are not directly exercised by integration tests.
+func TestPoolHelpers_EdgeCases(t *testing.T) {
+	t.Run("putQueryParamsMap nil is no-op", func(t *testing.T) {
+		putQueryParamsMap(nil) // must not panic
+	})
+
+	t.Run("putQueryParamsMap oversized map discarded", func(t *testing.T) {
+		big := make(map[string]any, 40)
+		for i := 0; i < 40; i++ {
+			big[strconv.Itoa(i)] = i
+		}
+		putQueryParamsMap(big) // must not panic; oversized maps are not returned to pool
+	})
+
+	t.Run("getQueryParamsMap reuse clears entries", func(t *testing.T) {
+		m := getQueryParamsMap()
+		m["key"] = "value"
+		putQueryParamsMap(m)
+
+		// Next get should return a map without the previous entry.
+		m2 := getQueryParamsMap()
+		if _, ok := m2["key"]; ok {
+			t.Error("reused map should be cleared of previous entries")
+		}
+		putQueryParamsMap(m2)
+	})
+
+	t.Run("getHTTPHeader reuse clears entries", func(t *testing.T) {
+		h := getHTTPHeader()
+		h.Set("X-Test", "value")
+		putHTTPHeader(h)
+
+		h2 := getHTTPHeader()
+		if h2.Get("X-Test") != "" {
+			t.Error("reused header should be cleared of previous entries")
+		}
+		putHTTPHeader(h2)
+	})
+
+	t.Run("getMIMEHeader reuse clears entries", func(t *testing.T) {
+		h := getMIMEHeader()
+		(*h)["X-Test"] = []string{"value"}
+		putMIMEHeader(h)
+
+		h2 := getMIMEHeader()
+		if _, ok := (*h2)["X-Test"]; ok {
+			t.Error("reused MIMEHeader should be cleared of previous entries")
+		}
+		putMIMEHeader(h2)
+	})
+}

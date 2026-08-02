@@ -38,9 +38,6 @@ func calculateIdleConnsPerHost(maxConnsPerHost int) int {
 // resolveTLSVersions returns the minimum and maximum TLS versions from config.
 // Falls back to TLS 1.2 and TLS 1.3 if not specified.
 func resolveTLSVersions(cfg *Config) (min, max uint16) {
-	if cfg.Security == nil {
-		return tls.VersionTLS12, tls.VersionTLS13
-	}
 	min = cfg.Security.MinTLSVersion
 	if min == 0 {
 		min = tls.VersionTLS12
@@ -55,10 +52,35 @@ func resolveTLSVersions(cfg *Config) (min, max uint16) {
 // calculateMaxRetryDelay returns the maximum retry delay from configuration.
 // Uses the user-provided MaxRetryDelay if set (> 0), otherwise defaults to 30s.
 func calculateMaxRetryDelay(cfg *Config) time.Duration {
-	if cfg.Retry != nil && cfg.Retry.MaxRetryDelay > 0 {
+	if cfg.Retry.MaxRetryDelay > 0 {
 		return cfg.Retry.MaxRetryDelay
 	}
 	return 30 * time.Second
+}
+
+// calculateMaxRetries returns the effective MaxRetries, automatically raising
+// it when proxy-rotation-on-status is configured so that every proxy in the
+// pool is tried at least once before retries are exhausted.
+//
+// Without this adjustment, a user with 5 proxies and the default MaxRetries=3
+// would only try 4 of the 5 proxies before giving up on a 403. When
+// ProxyRotateOnStatus is set, the intent is explicitly to rotate through all
+// proxies, so the retry budget is raised to len(ProxyPool)-1 (capped at
+// maxRetryAttempts to respect the hard ceiling enforced by ValidateConfig).
+func calculateMaxRetries(cfg *Config) int {
+	maxRetries := cfg.Retry.MaxRetries
+
+	if len(cfg.Connection.ProxyRotateOnStatus) > 0 && len(cfg.Connection.ProxyPool) > 1 {
+		needed := len(cfg.Connection.ProxyPool) - 1 // retries beyond the initial attempt
+		if needed > maxRetries {
+			if needed > maxRetryAttempts {
+				needed = maxRetryAttempts
+			}
+			maxRetries = needed
+		}
+	}
+
+	return maxRetries
 }
 
 // convertToEngineConfig converts public Config to engine Config.
@@ -89,6 +111,10 @@ func convertToEngineConfig(cfg *Config) (*engine.Config, error) {
 		MaxResponseHeaderBytes: cfg.Connection.MaxResponseHeaderBytes,
 		ProxyURL:               cfg.Connection.ProxyURL,
 		EnableSystemProxy:      cfg.Connection.EnableSystemProxy,
+		ProxyPool:              cfg.Connection.ProxyPool,
+		ProxyPoolStrategy:      cfg.Connection.ProxyPoolStrategy,
+		ProxyFailureThreshold:  cfg.Connection.ProxyFailureThreshold,
+		ProxyCooldown:          cfg.Connection.ProxyCooldown,
 		EnableHTTP2:            cfg.Connection.EnableHTTP2,
 		CookieJar:              cookieJar,
 		EnableCookies:          cfg.Connection.EnableCookies,
@@ -110,18 +136,19 @@ func convertToEngineConfig(cfg *Config) (*engine.Config, error) {
 		CertificatePinner:       cfg.Security.CertificatePinner,
 
 		// Retry settings
-		MaxRetries:        cfg.Retry.MaxRetries,
-		RetryDelay:        cfg.Retry.Delay,
-		MaxRetryDelay:     maxRetryDelay,
-		BackoffFactor:     cfg.Retry.BackoffFactor,
-		Jitter:            cfg.Retry.EnableJitter,
-		CustomRetryPolicy: cfg.Retry.CustomPolicy,
+		MaxRetries:                calculateMaxRetries(cfg),
+		RetryDelay:                cfg.Retry.Delay,
+		MaxRetryDelay:             maxRetryDelay,
+		BackoffFactor:             cfg.Retry.BackoffFactor,
+		Jitter:                    cfg.Retry.EnableJitter,
+		ExtraRetryableStatusCodes: cfg.Connection.ProxyRotateOnStatus,
+		CustomRetryPolicy:         cfg.Retry.CustomPolicy,
 
-		// Middleware settings
-		UserAgent:       cfg.Middleware.UserAgent,
-		Headers:         cfg.Middleware.Headers,
-		FollowRedirects: cfg.Middleware.FollowRedirects,
-		MaxRedirects:    cfg.Middleware.MaxRedirects,
+		// Request defaults (from Config.Defaults)
+		UserAgent:       cfg.Defaults.UserAgent,
+		Headers:         cfg.Defaults.Headers,
+		FollowRedirects: cfg.Defaults.FollowRedirects,
+		MaxRedirects:    cfg.Defaults.MaxRedirects,
 	}
 
 	if len(cfg.Security.RedirectWhitelist) > 0 {

@@ -34,7 +34,7 @@ func main() {
 func demonstrateParallelRequests() {
 	fmt.Println("--- Example 1: Parallel Requests ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -101,7 +101,7 @@ func demonstrateParallelRequests() {
 func demonstrateWorkerPool() {
 	fmt.Println("--- Example 2: Worker Pool Pattern ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -165,7 +165,7 @@ func demonstrateWorkerPool() {
 func demonstrateConcurrentWithErrors() {
 	fmt.Println("--- Example 3: Concurrent with Error Handling ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -251,7 +251,7 @@ func demonstrateConcurrentWithErrors() {
 func demonstrateRateLimited() {
 	fmt.Println("--- Example 4: Rate-Limited Concurrent Requests ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return

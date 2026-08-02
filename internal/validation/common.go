@@ -8,22 +8,35 @@ import (
 	"strings"
 )
 
-// Common validation constants
+// Validation length limits for credentials, query parameters, cookies, headers,
+// and filenames used across the validation package.
 const (
-	MaxCredLen     = 255  // Maximum credential length (username/password)
-	MaxTokenLen    = 2048 // Maximum bearer token length
-	MaxKeyLen      = 256  // Maximum query parameter key length
-	MaxValueLen    = 8192 // Maximum query parameter value length
-	MaxFilenameLen = 256  // Maximum filename length for uploads
+	// MaxCredLen is the maximum allowed length for credentials (username/password).
+	MaxCredLen = 255
+	// MaxTokenLen is the maximum allowed length for bearer tokens.
+	MaxTokenLen = 2048
+	// MaxKeyLen is the maximum allowed length for query parameter keys.
+	MaxKeyLen = 256
+	// MaxValueLen is the maximum allowed length for query parameter values.
+	MaxValueLen = 8192
+	// MaxFilenameLen is the maximum allowed filename length for file uploads.
+	MaxFilenameLen = 256
 
-	MaxCookieNameLen   = 256
-	MaxCookieValueLen  = 4096
+	// MaxCookieNameLen is the maximum allowed length for cookie names.
+	MaxCookieNameLen = 256
+	// MaxCookieValueLen is the maximum allowed length for cookie values.
+	MaxCookieValueLen = 4096
+	// MaxCookieDomainLen is the maximum allowed length for cookie domains.
 	MaxCookieDomainLen = 255
-	MaxCookiePathLen   = 1024
+	// MaxCookiePathLen is the maximum allowed length for cookie paths.
+	MaxCookiePathLen = 1024
 
-	MaxHeaderKeyLen   = 256
+	// MaxHeaderKeyLen is the maximum allowed length for HTTP header keys.
+	MaxHeaderKeyLen = 256
+	// MaxHeaderValueLen is the maximum allowed length for HTTP header values.
 	MaxHeaderValueLen = 8192
-	maxURLLen         = 2048 // Maximum URL length
+
+	maxURLLen = 2048 // Maximum URL length
 )
 
 // validateInputString performs common string validation to prevent injection attacks.

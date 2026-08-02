@@ -14,7 +14,7 @@ import (
 func main() {
 	fmt.Println("=== Response Handling Examples ===\n ")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Fatal(err)
 	}

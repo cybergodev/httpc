@@ -29,7 +29,7 @@ type APIClient struct {
 
 // NewAPIClient creates a new API client
 func NewAPIClient(baseURL, token string) (*APIClient, error) {
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 	}

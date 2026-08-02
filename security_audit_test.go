@@ -48,7 +48,7 @@ func Test_SSRF_RedirectProtection(t *testing.T) {
 	// Create a new config that disallows private IPs for redirect testing
 	cfg := DefaultConfig()
 	cfg.Security.AllowPrivateIPs = false
-	cfg.Middleware.FollowRedirects = true
+	cfg.Defaults.FollowRedirects = true
 
 	client, err := New(cfg)
 	if err != nil {
@@ -154,12 +154,12 @@ func TestPanicSafety(t *testing.T) {
 		fn   func()
 	}{
 		{"NilConfig", func() {
-			client, err := New(nil)
+			client, err := New(DefaultConfig())
 			if err != nil {
-				t.Errorf("New(nil) should succeed with defaults, got error: %v", err)
+				t.Errorf("New(DefaultConfig()) should succeed with defaults, got error: %v", err)
 			}
 			if client == nil {
-				t.Error("New(nil) should return a valid client")
+				t.Error("New(DefaultConfig()) should return a valid client")
 			}
 			if client != nil {
 				client.Close()
@@ -215,8 +215,8 @@ func TestPanicSafety(t *testing.T) {
 				t.Error("Expected error from recovered panic")
 			}
 		}},
-		{"DomainClientNilConfig", func() {
-			_, err := NewDomain("not a url")
+		{"DomainClientInvalidURL", func() {
+			_, err := NewDomain("not a url", DefaultConfig())
 			if err == nil {
 				t.Error("Expected error for invalid base URL")
 			}
@@ -234,7 +234,7 @@ func TestPanicSafety(t *testing.T) {
 			}
 		}},
 		{"SessionManagerNilInput", func() {
-			session, err := NewSessionManager()
+			session, err := NewSessionManagerDefault()
 			if err != nil {
 				return
 			}
@@ -429,7 +429,7 @@ func Test_WithAllowPrivateIPs_FalseReEnablesProtection(t *testing.T) {
 func Test_WithAllowPrivateIPs_RedirectOverride(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Security.AllowPrivateIPs = false // SSRF protection enabled
-	cfg.Middleware.FollowRedirects = true
+	cfg.Defaults.FollowRedirects = true
 
 	client, err := New(cfg)
 	if err != nil {

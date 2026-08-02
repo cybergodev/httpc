@@ -18,11 +18,11 @@ func main() {
 	// 1. Request/Response Callbacks
 	demonstrateCallbacks()
 
-	// 2. Result Pool Optimization
-	demonstrateResultPool()
+	// 2. Internal Pooling Model
+	demonstratePoolingModel()
 
-	// 3. Stream Body Mode
-	demonstrateStreamBody()
+	// 3. Save Response to File
+	demonstrateSaveToFile()
 
 	// 4. Testing Configuration
 	demonstrateTestingConfig()
@@ -40,7 +40,7 @@ func main() {
 func demonstrateCallbacks() {
 	fmt.Println("--- Example 1: Request/Response Callbacks ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -83,11 +83,12 @@ func demonstrateCallbacks() {
 	fmt.Println()
 }
 
-// demonstrateResultPool shows result pool optimization
-func demonstrateResultPool() {
-	fmt.Println("--- Example 2: Result Pool Optimization ---")
+// demonstratePoolingModel shows how internal responses are pooled while Result
+// objects are freshly allocated per request and GC-reclaimed.
+func demonstratePoolingModel() {
+	fmt.Println("--- Example 2: Internal Pooling Model ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -110,11 +111,11 @@ func demonstrateResultPool() {
 	fmt.Println()
 }
 
-// demonstrateStreamBody shows streaming mode for large responses
-func demonstrateStreamBody() {
+// demonstrateSaveToFile shows how to persist a response body to disk.
+func demonstrateSaveToFile() {
 	fmt.Println("--- Example 3: Save Response to File ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return

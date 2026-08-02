@@ -749,6 +749,19 @@ func TestCookieSlicePool_BoundaryConditions(t *testing.T) {
 		putCookiesSlice(slice)
 	})
 
+	t.Run("pool type assertion fallback", func(t *testing.T) {
+		// Poison the pool with a wrong type to exercise the fallback branch.
+		cookieSlicePool.Put("not a cookie slice")
+		slice := getCookiesSlice()
+		if slice == nil {
+			t.Fatal("expected non-nil slice from fallback path")
+		}
+		if len(*slice) != 0 {
+			t.Error("expected empty slice from fallback")
+		}
+		putCookiesSlice(slice)
+	})
+
 	t.Run("oversized slice not pooled", func(t *testing.T) {
 		s := make([]*http.Cookie, 0, 128)
 		slice := &s

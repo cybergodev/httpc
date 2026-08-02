@@ -13,15 +13,23 @@ import (
 )
 
 type retryEngine struct {
-	config *Config
+	config         *Config
+	extraRetryable map[int]bool
 }
 
 // Compile-time interface check
 var _ types.RetryPolicy = (*retryEngine)(nil)
 
 func newRetryEngine(config *Config) *retryEngine {
+	// Pre-build the extra-retryable set once so isRetryableStatus stays a
+	// pair of map lookups with no per-call allocation.
+	extra := make(map[int]bool, len(config.ExtraRetryableStatusCodes))
+	for _, code := range config.ExtraRetryableStatusCodes {
+		extra[code] = true
+	}
 	return &retryEngine{
-		config: config,
+		config:         config,
+		extraRetryable: extra,
 	}
 }
 
@@ -183,5 +191,5 @@ func (r *retryEngine) getJitter(maxJitter time.Duration) time.Duration {
 }
 
 func (r *retryEngine) isRetryableStatus(statusCode int) bool {
-	return retryableStatusCodes[statusCode]
+	return retryableStatusCodes[statusCode] || r.extraRetryable[statusCode]
 }

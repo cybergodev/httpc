@@ -3,9 +3,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"time"
 
 	"github.com/cybergodev/httpc"
 )
@@ -24,6 +27,9 @@ func main() {
 	// 3. Relative Path Usage
 	demonstrateRelativePaths()
 
+	// 4. Custom Configuration + Download
+	demonstrateCustomConfigAndDownload()
+
 	fmt.Println("\n=== All Examples Completed ===")
 }
 
@@ -32,7 +38,7 @@ func demonstrateBasicUsage() {
 	fmt.Println("--- Basic DomainClient Usage ---")
 
 	// Create domain-specific client
-	client, err := httpc.NewDomain("https://httpbin.org")
+	client, err := httpc.NewDomainDefault("https://httpbin.org")
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -82,7 +88,7 @@ func demonstrateBasicUsage() {
 func demonstrateStateManagement() {
 	fmt.Println("--- State Management ---")
 
-	client, err := httpc.NewDomain("https://httpbin.org")
+	client, err := httpc.NewDomainDefault("https://httpbin.org")
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -145,7 +151,7 @@ func demonstrateStateManagement() {
 func demonstrateRelativePaths() {
 	fmt.Println("--- Relative Path Usage ---")
 
-	client, err := httpc.NewDomain("https://httpbin.org")
+	client, err := httpc.NewDomainDefault("https://httpbin.org")
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -171,4 +177,50 @@ func demonstrateRelativePaths() {
 
 	fmt.Println("\nTip: Use relative paths for domain-scoped requests")
 	fmt.Println("  Example: client.Get(\"/api/users\") instead of full URLs")
+}
+
+// demonstrateCustomConfigAndDownload shows NewDomain with a custom Config
+// and the DomainClient.Download method (which captures response cookies
+// into the session automatically).
+func demonstrateCustomConfigAndDownload() {
+	fmt.Println("--- Custom Config & Download ---")
+
+	// NewDomain accepts a full Config — customize timeouts, retries, etc.
+	cfg := httpc.DefaultConfig()
+	cfg.Timeouts.Request = 15 * time.Second
+	cfg.Retry.MaxRetries = 2
+	cfg.Defaults.UserAgent = "domain-client-demo/1.0"
+
+	dc, err := httpc.NewDomain("https://httpbin.org", cfg)
+	if err != nil {
+		log.Printf("Failed to create domain client: %v\n", err)
+		return
+	}
+	defer dc.Close()
+	fmt.Printf("✓ Created DomainClient with custom config (UA: %s)\n", cfg.Defaults.UserAgent)
+
+	// DomainClient.Download works like Client.Download but resolves the path
+	// against the base URL and captures response cookies into the session.
+	if err := os.MkdirAll("downloads", 0755); err != nil {
+		log.Printf("Warning: downloads dir: %v\n", err)
+	}
+
+	dlCfg := httpc.DefaultDownloadConfig()
+	dlCfg.FilePath = "downloads/domain-download.json"
+	dlCfg.Overwrite = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	result, err := dc.Download(ctx, "/get", dlCfg,
+		httpc.WithBearerToken("domain-token"),
+	)
+	if err != nil {
+		log.Printf("Download error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("✓ Downloaded via DomainClient: %s (%s)\n",
+		result.FilePath, httpc.FormatBytes(result.BytesWritten))
+	fmt.Println("  Response cookies are captured into the session automatically.\n ")
 }

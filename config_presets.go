@@ -14,7 +14,7 @@ import (
 //   - Smaller response limits: Prevents memory exhaustion
 //
 // Use this preset when making requests to user-provided URLs or in security-sensitive contexts.
-func SecureConfig() *Config {
+func SecureConfig() Config {
 	cfg := DefaultConfig()
 
 	// Timeouts - stricter for security
@@ -40,7 +40,7 @@ func SecureConfig() *Config {
 	cfg.Retry.EnableJitter = true
 
 	// Middleware - no redirects for security
-	cfg.Middleware.FollowRedirects = false
+	cfg.Defaults.FollowRedirects = false
 
 	return cfg
 }
@@ -53,7 +53,7 @@ func SecureConfig() *Config {
 // If you need to disable these for maximum performance in a trusted environment,
 // manually set cfg.Security.ValidateURL = false and cfg.Security.ValidateHeaders = false, but be
 // aware of the security implications (injection attacks, SSRF).
-func PerformanceConfig() *Config {
+func PerformanceConfig() Config {
 	cfg := DefaultConfig()
 
 	// Timeouts - longer for throughput
@@ -88,7 +88,7 @@ func PerformanceConfig() *Config {
 //
 // SECURITY: This function will log a warning if called outside of a test environment.
 // For production, use SecureConfig() or DefaultConfig() instead.
-func TestingConfig() *Config {
+func TestingConfig() Config {
 	// Security warning for non-test environments
 	warnTestingConfigInProduction()
 
@@ -118,14 +118,14 @@ func TestingConfig() *Config {
 	cfg.Retry.EnableJitter = false
 
 	// Middleware - test user agent
-	cfg.Middleware.UserAgent = "httpc-test/1.0"
+	cfg.Defaults.UserAgent = "httpc-test/1.0"
 
 	return cfg
 }
 
 // MinimalConfig returns a lightweight configuration with minimal features.
 // Use this for simple, one-off requests where you don't need retries or advanced features.
-func MinimalConfig() *Config {
+func MinimalConfig() Config {
 	cfg := DefaultConfig()
 
 	// Timeouts - reasonable defaults
@@ -149,8 +149,8 @@ func MinimalConfig() *Config {
 	cfg.Retry.BackoffFactor = 1.0
 	cfg.Retry.EnableJitter = false
 
-	// Middleware - no redirects
-	cfg.Middleware.FollowRedirects = false
+	// Defaults - no redirects
+	cfg.Defaults.FollowRedirects = false
 
 	return cfg
 }

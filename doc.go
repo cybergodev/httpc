@@ -18,11 +18,37 @@
 //	}
 //	fmt.Println(result.Body())
 //
+// # Two API Layers
+//
+// httpc offers two equivalent request paths, mirroring the net/http split
+// between http.Get and http.Client:
+//
+//   - Package-level functions (httpc.Get, httpc.Post, ...) use a lazily
+//     initialized default client. Best for scripts and one-off requests.
+//   - Client instance methods (client.Get, client.Post, ...) give full control
+//     over configuration, connection pooling, and lifecycle.
+//
+// Both layers accept the same request options (WithHeader, WithJSON, ...) and
+// return the same *Result type:
+//
+//	// Package-level — zero setup, shared default client
+//	result, err := httpc.Get("https://api.example.com/data")
+//
+//	// Client instance — full control, explicit lifecycle
+//	client, err := httpc.NewDefault()
+//	defer func() { _ = client.Close() }()
+//	result, err := client.Get("https://api.example.com/data")
+//
+// Package-level functions are thin wrappers around a singleton client managed
+// internally (see SetDefaultClient, CloseDefaultClient). For long-running
+// services, prefer an explicit client instance so you control its configuration
+// and lifetime.
+//
 // # Client Creation
 //
 // Create a client with default configuration:
 //
-//	client, err := httpc.New()
+//	client, err := httpc.NewDefault()
 //	defer func() { _ = client.Close() }()
 //
 // Create a client with custom configuration:
@@ -37,6 +63,37 @@
 //	client, err := httpc.New(httpc.SecureConfig())      // Security-focused
 //	client, err := httpc.New(httpc.PerformanceConfig()) // High-throughput
 //	client, err := httpc.New(httpc.TestingConfig())     // Testing only!
+//
+// # Configuration Conventions
+//
+// All httpc constructors follow the same pattern:
+//
+//   - Instance configuration uses Config structs, not functional options.
+//   - Every Config struct has a Default*Config() function returning sensible
+//     defaults — start from it, then modify fields as needed.
+//   - The main Config and SessionConfig are passed by value (required). Middleware
+//     configs are passed by pointer and may be nil to accept defaults;
+//     DownloadConfig is passed by pointer but is required (FilePath must be set).
+//
+// Per-request modifiers (WithHeader, WithJSON, WithTimeout, ...) are functional
+// options applied to individual requests. This is a separate concern from
+// instance configuration: instance config lives in Config structs; per-request
+// config lives in With* options.
+//
+//	// Main client: shortcut for defaults
+//	client, err := httpc.NewDefault()
+//
+//	// Main client: Config by value (customized)
+//	cfg := httpc.DefaultConfig()
+//	cfg.Timeouts.Request = 60 * time.Second
+//	client, err := httpc.New(cfg)
+//
+//	// Session manager: required SessionConfig (NewSessionManagerDefault() for defaults)
+//	sm, err := httpc.NewSessionManagerDefault()
+//
+//	// Download: *DownloadConfig (required, must set FilePath)
+//	dcfg := httpc.DefaultDownloadConfig()
+//	dcfg.FilePath = "/path/to/file"
 //
 // # SSRF Protection
 //
@@ -102,7 +159,7 @@
 //
 // For session management across requests to the same domain:
 //
-//	dc, err := httpc.NewDomain("https://api.example.com")
+//	dc, err := httpc.NewDomain("https://api.example.com", httpc.DefaultConfig())
 //	defer dc.Close()
 //
 //	dc.SetHeader("Authorization", "Bearer "+token)
@@ -138,6 +195,41 @@
 // For security-critical applications, use SecureConfig() which sets a strict
 // transport-level ResponseHeaderTimeout as defense-in-depth against slowloris
 // attacks.
+//
+// # Request Defaults (RequestDefaults)
+//
+// Per-request defaults — User-Agent, default headers, redirect policy — live on
+// Config.Defaults (RequestDefaults), populated by DefaultConfig():
+//
+//	cfg := httpc.DefaultConfig()
+//	cfg.Defaults.UserAgent = "myapp/2.0"
+//	cfg.Defaults.FollowRedirects = false
+//	cfg.Defaults.Headers["Authorization"] = "Bearer token"
+//	client, err := httpc.New(cfg)
+//
+// # Middleware Configuration
+//
+// Every configurable middleware follows the same pattern: a XxxConfig struct, a
+// DefaultXxxConfig() constructor, and a XxxMiddleware(cfg) factory that
+// accepts a nil config (selecting defaults). Start from the default, modify fields,
+// then pass to the constructor:
+//
+//	mw := httpc.LoggingMiddleware(&httpc.LoggingConfig{
+//	    LogFunc: log.Printf,
+//	})
+//	mw := httpc.MetricsMiddleware(&httpc.MetricsConfig{
+//	    OnMetrics: func(method, url string, code int, d time.Duration, err error) { ... },
+//	})
+//	mw := httpc.RequestIDMiddleware(httpc.DefaultRequestIDConfig())
+//	auditCfg := httpc.DefaultAuditConfig()
+//	auditCfg.OnAudit = func(event httpc.AuditEvent) { ... }
+//	mw := httpc.AuditMiddleware(auditCfg)
+//	mw := httpc.TimeoutMiddleware(&httpc.TimeoutMiddlewareConfig{
+//	    Duration: 30 * time.Second,
+//	})
+//	mw := httpc.HeaderMiddleware(&httpc.HeaderConfig{
+//	    Headers: map[string]string{"X-Service": "api"},
+//	})
 //
 // For more information, see https://github.com/cybergodev/httpc
 package httpc

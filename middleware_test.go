@@ -88,7 +88,7 @@ func TestLoggingMiddleware(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		LoggingMiddleware(logger),
+		LoggingMiddleware(&LoggingConfig{LogFunc: logger}),
 	}
 
 	client, err := New(cfg)
@@ -124,8 +124,9 @@ func TestRequestIDMiddleware(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		RequestIDMiddleware("X-Request-ID", func() string {
-			return "test-request-id-123"
+		RequestIDMiddleware(&RequestIDConfig{
+			HeaderName: "X-Request-ID",
+			Generator:  func() string { return "test-request-id-123" },
 		}),
 	}
 
@@ -155,7 +156,7 @@ func TestTimeoutMiddleware(t *testing.T) {
 	cfg := testConfig()
 	cfg.Timeouts.Request = 5 * time.Second
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		TimeoutMiddleware(10 * time.Millisecond),
+		TimeoutMiddleware(&TimeoutMiddlewareConfig{Duration: 10 * time.Millisecond}),
 	}
 
 	client, err := New(cfg)
@@ -177,6 +178,30 @@ func TestTimeoutMiddleware(t *testing.T) {
 	}
 }
 
+func TestTimeoutMiddleware_NilConfig(t *testing.T) {
+	// Nil config = DefaultTimeoutMiddlewareConfig() = Duration 0 = pass-through.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	cfg := testConfig()
+	cfg.Middleware.Middlewares = []MiddlewareFunc{
+		TimeoutMiddleware(nil),
+	}
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	_, err = client.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("nil-config timeout middleware should be a pass-through: %v", err)
+	}
+}
+
 func TestTimeoutMiddleware_CancelledContext(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -185,7 +210,7 @@ func TestTimeoutMiddleware_CancelledContext(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		TimeoutMiddleware(5 * time.Second),
+		TimeoutMiddleware(&TimeoutMiddlewareConfig{Duration: 5 * time.Second}),
 	}
 
 	client, err := New(cfg)
@@ -204,6 +229,16 @@ func TestTimeoutMiddleware_CancelledContext(t *testing.T) {
 	}
 }
 
+func TestDefaultTimeoutMiddlewareConfig(t *testing.T) {
+	config := DefaultTimeoutMiddlewareConfig()
+	if config == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if config.Duration != 0 {
+		t.Errorf("expected Duration 0 (disabled), got %v", config.Duration)
+	}
+}
+
 func TestHeaderMiddleware(t *testing.T) {
 	var receivedHeaders map[string]string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -217,9 +252,11 @@ func TestHeaderMiddleware(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		HeaderMiddleware(map[string]string{
-			"X-Custom-Header": "custom-value",
-			"Authorization":   "Bearer test-token",
+		HeaderMiddleware(&HeaderConfig{
+			Headers: map[string]string{
+				"X-Custom-Header": "custom-value",
+				"Authorization":   "Bearer test-token",
+			},
 		}),
 	}
 
@@ -242,6 +279,68 @@ func TestHeaderMiddleware(t *testing.T) {
 	}
 }
 
+func TestHeaderMiddleware_NilConfig(t *testing.T) {
+	// Nil config = DefaultHeaderConfig() = no headers (pass-through).
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	cfg := testConfig()
+	cfg.Middleware.Middlewares = []MiddlewareFunc{
+		HeaderMiddleware(nil),
+	}
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	_, err = client.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("nil-config header middleware should be a pass-through: %v", err)
+	}
+}
+
+func TestHeaderMiddleware_InvalidHeader(t *testing.T) {
+	cfg := testConfig()
+	cfg.Middleware.Middlewares = []MiddlewareFunc{
+		HeaderMiddleware(&HeaderConfig{
+			Headers: map[string]string{
+				"X-Invalid": "value\r\nX-Injected: malicious", // CRLF injection attempt
+			},
+		}),
+	}
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	// Should fail due to invalid header
+	_, err = client.Get(ts.URL)
+	if err == nil {
+		t.Error("expected error for invalid header")
+	}
+}
+
+func TestDefaultHeaderConfig(t *testing.T) {
+	config := DefaultHeaderConfig()
+	if config == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if config.Headers != nil {
+		t.Errorf("expected nil Headers, got: %v", config.Headers)
+	}
+}
+
 func TestMetricsMiddleware(t *testing.T) {
 	var metrics struct {
 		method     string
@@ -260,15 +359,17 @@ func TestMetricsMiddleware(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		MetricsMiddleware(func(method, url string, statusCode int, duration time.Duration, err error) {
-			mu.Lock()
-			defer mu.Unlock()
-			metrics.method = method
-			metrics.url = url
-			metrics.statusCode = statusCode
-			metrics.duration = duration
-			metrics.err = err
-			metrics.called = true
+		MetricsMiddleware(&MetricsConfig{
+			OnMetrics: func(method, url string, statusCode int, duration time.Duration, err error) {
+				mu.Lock()
+				defer mu.Unlock()
+				metrics.method = method
+				metrics.url = url
+				metrics.statusCode = statusCode
+				metrics.duration = duration
+				metrics.err = err
+				metrics.called = true
+			},
 		}),
 	}
 
@@ -558,12 +659,14 @@ func TestAuditMiddleware(t *testing.T) {
 	defer ts.Close()
 
 	cfg := testConfig()
+	auditCfg := DefaultAuditConfig()
+	auditCfg.OnAudit = func(event AuditEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		capturedEvent = event
+	}
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		AuditMiddleware(func(event AuditEvent) {
-			mu.Lock()
-			defer mu.Unlock()
-			capturedEvent = event
-		}),
+		AuditMiddleware(auditCfg),
 	}
 
 	client, err := New(cfg)
@@ -601,12 +704,14 @@ func TestAuditMiddlewareWithContextValues(t *testing.T) {
 	defer ts.Close()
 
 	cfg := testConfig()
+	auditCfg := DefaultAuditConfig()
+	auditCfg.OnAudit = func(event AuditEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		capturedEvent = event
+	}
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		AuditMiddleware(func(event AuditEvent) {
-			mu.Lock()
-			defer mu.Unlock()
-			capturedEvent = event
-		}),
+		AuditMiddleware(auditCfg),
 	}
 
 	client, err := New(cfg)
@@ -635,17 +740,17 @@ func TestAuditMiddlewareWithContextValues(t *testing.T) {
 	}
 }
 
-func TestAuditMiddlewareWithConfig(t *testing.T) {
+func TestAuditMiddleware_ConfigVariants(t *testing.T) {
 	tests := []struct {
 		name           string
-		config         *AuditMiddlewareConfig
+		config         *AuditConfig
 		serverStatus   int
 		expectedMethod string
 		expectedStatus int
 	}{
 		{
 			name: "JSON format with headers",
-			config: &AuditMiddlewareConfig{
+			config: &AuditConfig{
 				Format:         "json",
 				IncludeHeaders: true,
 				SanitizeError:  true,
@@ -655,8 +760,8 @@ func TestAuditMiddlewareWithConfig(t *testing.T) {
 		},
 		{
 			name: "JSON format with default config",
-			config: func() *AuditMiddlewareConfig {
-				c := DefaultAuditMiddlewareConfig()
+			config: func() *AuditConfig {
+				c := DefaultAuditConfig()
 				c.Format = "json"
 				return c
 			}(),
@@ -666,7 +771,7 @@ func TestAuditMiddlewareWithConfig(t *testing.T) {
 		},
 		{
 			name: "Text format",
-			config: &AuditMiddlewareConfig{
+			config: &AuditConfig{
 				Format: "text",
 			},
 			serverStatus:   http.StatusOK,
@@ -685,13 +790,18 @@ func TestAuditMiddlewareWithConfig(t *testing.T) {
 			}))
 			defer ts.Close()
 
+			auditCfg := tt.config
+			if auditCfg == nil {
+				auditCfg = DefaultAuditConfig()
+			}
+			auditCfg.OnAudit = func(event AuditEvent) {
+				mu.Lock()
+				defer mu.Unlock()
+				capturedEvent = event
+			}
 			cfg := testConfig()
 			cfg.Middleware.Middlewares = []MiddlewareFunc{
-				AuditMiddlewareWithConfig(func(event AuditEvent) {
-					mu.Lock()
-					defer mu.Unlock()
-					capturedEvent = event
-				}, tt.config),
+				AuditMiddleware(auditCfg),
 			}
 
 			client, err := New(cfg)
@@ -718,17 +828,80 @@ func TestAuditMiddlewareWithConfig(t *testing.T) {
 	}
 }
 
+func TestAuditMiddlewareOnAuditInConfig(t *testing.T) {
+	var capturedEvent AuditEvent
+	var mu sync.Mutex
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer ts.Close()
+
+	cfg := testConfig()
+	auditCfg := DefaultAuditConfig()
+	auditCfg.OnAudit = func(event AuditEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		capturedEvent = event
+	}
+	cfg.Middleware.Middlewares = []MiddlewareFunc{
+		AuditMiddleware(auditCfg),
+	}
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	if _, err := client.Get(ts.URL); err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if capturedEvent.StatusCode != http.StatusCreated {
+		t.Errorf("expected status %d from config.OnAudit, got %d", http.StatusCreated, capturedEvent.StatusCode)
+	}
+}
+
+func TestAuditMiddlewareNoCallbackIsNoOp(t *testing.T) {
+	// No OnAudit callback set: the middleware is a no-op (unwrapped handler)
+	// and must not panic when a request runs through it.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	cfg := testConfig()
+	cfg.Middleware.Middlewares = []MiddlewareFunc{
+		AuditMiddleware(&AuditConfig{Format: "text"}),
+	}
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	if _, err := client.Get(ts.URL); err != nil {
+		t.Fatalf("no-op audit middleware caused request failure: %v", err)
+	}
+}
+
 func TestAuditMiddlewareWithError(t *testing.T) {
 	var capturedEvent AuditEvent
 	var mu sync.Mutex
 
 	cfg := testConfig()
+	auditCfg := DefaultAuditConfig()
+	auditCfg.OnAudit = func(event AuditEvent) {
+		mu.Lock()
+		defer mu.Unlock()
+		capturedEvent = event
+	}
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		AuditMiddleware(func(event AuditEvent) {
-			mu.Lock()
-			defer mu.Unlock()
-			capturedEvent = event
-		}),
+		AuditMiddleware(auditCfg),
 	}
 
 	client, err := New(cfg)
@@ -748,8 +921,8 @@ func TestAuditMiddlewareWithError(t *testing.T) {
 	}
 }
 
-func TestDefaultAuditMiddlewareConfig(t *testing.T) {
-	config := DefaultAuditMiddlewareConfig()
+func TestDefaultAuditConfig(t *testing.T) {
+	config := DefaultAuditConfig()
 
 	if config == nil {
 		t.Fatal("expected non-nil config")
@@ -763,9 +936,12 @@ func TestDefaultAuditMiddlewareConfig(t *testing.T) {
 	if len(config.MaskHeaders) == 0 {
 		t.Error("expected MaskHeaders to have values")
 	}
+	if !config.SanitizeError {
+		t.Error("expected SanitizeError to be true")
+	}
 }
 
-func TestRequestIDMiddleware_NilGenerator(t *testing.T) {
+func TestRequestIDMiddleware_NilConfig(t *testing.T) {
 	var receivedID string
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		receivedID = r.Header.Get("X-Request-ID")
@@ -774,9 +950,9 @@ func TestRequestIDMiddleware_NilGenerator(t *testing.T) {
 	defer ts.Close()
 
 	cfg := testConfig()
-	// Pass nil generator - should use default
+	// Nil config = defaults (X-Request-ID header, crypto/rand generator)
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		RequestIDMiddleware("X-Request-ID", nil),
+		RequestIDMiddleware(nil),
 	}
 
 	client, err := New(cfg)
@@ -805,7 +981,10 @@ func TestRequestIDMiddleware_ExistingHeader(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		RequestIDMiddleware("X-Request-ID", func() string { return "generated-id" }),
+		RequestIDMiddleware(&RequestIDConfig{
+			HeaderName: "X-Request-ID",
+			Generator:  func() string { return "generated-id" },
+		}),
 	}
 
 	client, err := New(cfg)
@@ -822,32 +1001,6 @@ func TestRequestIDMiddleware_ExistingHeader(t *testing.T) {
 
 	if receivedID != "explicit-id" {
 		t.Errorf("expected 'explicit-id', got: %s", receivedID)
-	}
-}
-
-func TestHeaderMiddleware_InvalidHeader(t *testing.T) {
-	cfg := testConfig()
-	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		HeaderMiddleware(map[string]string{
-			"X-Invalid": "value\r\nX-Injected: malicious", // CRLF injection attempt
-		}),
-	}
-
-	client, err := New(cfg)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	// Should fail due to invalid header
-	_, err = client.Get(ts.URL)
-	if err == nil {
-		t.Error("expected error for invalid header")
 	}
 }
 
@@ -982,7 +1135,7 @@ func TestSanitizeCallbackError(t *testing.T) {
 func TestMiddleware_BoundaryConditions(t *testing.T) {
 	t.Parallel()
 
-	t.Run("TimeoutMiddleware zero duration", func(t *testing.T) {
+	t.Run("TimeoutMiddleware nil config (disabled)", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -990,7 +1143,7 @@ func TestMiddleware_BoundaryConditions(t *testing.T) {
 
 		cfg := testConfig()
 		cfg.Middleware.Middlewares = []MiddlewareFunc{
-			TimeoutMiddleware(0),
+			TimeoutMiddleware(nil),
 		}
 		client, err := New(cfg)
 		if err != nil {
@@ -998,10 +1151,12 @@ func TestMiddleware_BoundaryConditions(t *testing.T) {
 		}
 		defer client.Close()
 
-		// Zero duration should apply immediately and return error
+		// Nil config = Duration 0 = pass-through
 		ctx := context.Background()
 		_, err = client.Request(ctx, "GET", ts.URL)
-		_ = err // zero duration behavior is implementation-defined
+		if err != nil {
+			t.Fatalf("nil-config timeout should pass through: %v", err)
+		}
 	})
 
 	t.Run("Chain with nil middleware slice", func(t *testing.T) {
@@ -1011,7 +1166,7 @@ func TestMiddleware_BoundaryConditions(t *testing.T) {
 		}
 	})
 
-	t.Run("MetricsMiddleware with nil callback", func(t *testing.T) {
+	t.Run("MetricsMiddleware with nil config", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 		}))
@@ -1029,7 +1184,7 @@ func TestMiddleware_BoundaryConditions(t *testing.T) {
 
 		_, err = client.Get(ts.URL)
 		if err != nil {
-			t.Fatalf("request should succeed with nil metrics callback: %v", err)
+			t.Fatalf("request should succeed with nil metrics config: %v", err)
 		}
 	})
 }

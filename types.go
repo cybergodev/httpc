@@ -4,14 +4,13 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"net/http"
-	"net/http/cookiejar"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/cybergodev/httpc/internal/engine"
+	"github.com/cybergodev/httpc/internal/proxypool"
 	"github.com/cybergodev/httpc/internal/types"
 	"github.com/cybergodev/httpc/internal/validation"
 )
@@ -65,6 +64,19 @@ type TimeoutConfig struct {
 	IdleConn time.Duration
 }
 
+// ProxyStrategy selects the algorithm for choosing a proxy from a proxy pool.
+// Alias for proxypool.Strategy to avoid importing the internal package.
+type ProxyStrategy = proxypool.Strategy
+
+const (
+	// ProxyStrategyRoundRobin cycles through proxies in order (default).
+	// Each selection advances to the next proxy, so a retry naturally lands on
+	// a different IP without any extra wiring.
+	ProxyStrategyRoundRobin = proxypool.StrategyRoundRobin
+	// ProxyStrategyRandom picks a healthy proxy uniformly at random.
+	ProxyStrategyRandom = proxypool.StrategyRandom
+)
+
 // ConnectionConfig configures connection pooling and proxy behavior.
 type ConnectionConfig struct {
 	// MaxIdleConns is the maximum number of idle connections across all hosts.
@@ -82,6 +94,43 @@ type ConnectionConfig struct {
 	// EnableSystemProxy enables automatic detection of system proxy settings.
 	// Default: false.
 	EnableSystemProxy bool
+
+	// ProxyPool specifies a list of proxy servers for rotation. When set,
+	// requests are distributed across the proxies using ProxyPoolStrategy.
+	// Connection failures (dial/TLS) to a proxy trigger passive circuit
+	// breaking: after ProxyFailureThreshold consecutive failures the proxy is
+	// temporarily removed from rotation and restored after ProxyCooldown.
+	//
+	// Priority: lower than ProxyURL, higher than EnableSystemProxy. If both
+	// ProxyURL and ProxyPool are set, ProxyURL wins (single-proxy mode).
+	// Default: nil (no proxy pool).
+	ProxyPool []string
+
+	// ProxyPoolStrategy selects how proxies are chosen from ProxyPool.
+	// Default: ProxyStrategyRoundRobin.
+	ProxyPoolStrategy ProxyStrategy
+
+	// ProxyFailureThreshold is the number of consecutive connection failures
+	// (dial/TLS) to a proxy before it is temporarily removed from rotation.
+	// Zero defaults to 3. HTTP status codes do NOT trigger this — use
+	// ProxyRotateOnStatus for status-based rotation.
+	ProxyFailureThreshold int
+
+	// ProxyCooldown is how long a circuit-broken proxy stays out of rotation
+	// before being retried (half-open probe). Zero defaults to 30s.
+	ProxyCooldown time.Duration
+
+	// ProxyRotateOnStatus specifies HTTP status codes that trigger a retry with
+	// a different proxy. When a response returns one of these codes and
+	// Retry.MaxRetries > 0, the request is retried; under round-robin or random
+	// strategy the retry naturally selects a different proxy IP.
+	//
+	// Typical use: []int{403} for CF/WAF IP-based blocking. Unlike
+	// connection failures, status-based rotation does NOT circuit-break the
+	// proxy — blocks are often target-specific (a proxy blocked on one site may
+	// work fine on another). Requires Retry.MaxRetries > 0 to take effect.
+	// Default: nil.
+	ProxyRotateOnStatus []int
 
 	// EnableHTTP2 enables HTTP/2 protocol support.
 	// Default: true.
@@ -200,24 +249,26 @@ type RetryConfig struct {
 	CustomPolicy RetryPolicy
 }
 
-// MiddlewareConfig configures the per-request defaults and the middleware chain
-// applied to every outgoing request. It groups two related concerns: the
-// middleware chain (Middlewares) and the request defaults — User-Agent, default
-// headers, and the redirect policy.
-//
-// Only Middlewares is strictly "middleware"; UserAgent, Headers, FollowRedirects,
-// and MaxRedirects are request defaults colocated here for historical reasons and
-// may move to a dedicated options struct in a future major version. Use
-// DefaultConfig() to obtain sensible values for all fields.
+// MiddlewareConfig configures the middleware chain applied to every outgoing
+// request. Request defaults (User-Agent, headers, redirect policy) live on
+// Config.Defaults (RequestDefaults).
 type MiddlewareConfig struct {
 	// Middlewares contains middleware functions for request/response interception.
 	// Default: nil.
 	Middlewares []MiddlewareFunc
+}
 
+// RequestDefaults configures per-request defaults applied to every outgoing
+// request: the User-Agent header, default headers, and the redirect policy.
+//
+// This is the canonical location for request defaults. Use DefaultConfig() to
+// obtain sensible values for all fields, then modify as needed.
+type RequestDefaults struct {
 	// UserAgent sets the User-Agent header. Default: "httpc/1.0".
 	UserAgent string
 
 	// Headers contains default headers added to every request.
+	// Default: empty (no default headers).
 	Headers map[string]string
 
 	// FollowRedirects controls automatic redirect following. Default: true.
@@ -239,11 +290,12 @@ type MiddlewareConfig struct {
 //	cfg.Connection.ProxyURL = "http://proxy:8080"
 //	client, err := httpc.New(cfg)
 type Config struct {
-	Timeouts   *TimeoutConfig
-	Connection *ConnectionConfig
-	Security   *SecurityConfig
-	Retry      *RetryConfig
-	Middleware *MiddlewareConfig
+	Timeouts   TimeoutConfig
+	Connection ConnectionConfig
+	Security   SecurityConfig
+	Retry      RetryConfig
+	Middleware MiddlewareConfig
+	Defaults   RequestDefaults
 
 	// parsedCIDRs caches parsed SSRFExemptCIDRs to avoid double parsing.
 	// Filled by parseSSRFExemptCIDRs; consumed by convertToEngineConfig.
@@ -354,16 +406,16 @@ const (
 // AllowPrivateIPs defaults to false, blocking connections to private/reserved IPs
 // (127.0.0.1, 10.x, 192.168.x, 169.254.x, etc.). Setting to true disables ALL SSRF
 // protection including localhost checks — use SSRFExemptCIDRs for selective allowlisting.
-func DefaultConfig() *Config {
-	return &Config{
-		Timeouts: &TimeoutConfig{
+func DefaultConfig() Config {
+	return Config{
+		Timeouts: TimeoutConfig{
 			Request:        180 * time.Second,
 			Dial:           10 * time.Second,
 			TLSHandshake:   10 * time.Second,
 			ResponseHeader: 0, // Disabled: rely on context timeout (Timeouts.Request / WithTimeout)
 			IdleConn:       90 * time.Second,
 		},
-		Connection: &ConnectionConfig{
+		Connection: ConnectionConfig{
 			MaxIdleConns:      50,
 			MaxConnsPerHost:   10,
 			ProxyURL:          "",
@@ -373,7 +425,7 @@ func DefaultConfig() *Config {
 			EnableDoH:         false,
 			DoHCacheTTL:       5 * time.Minute,
 		},
-		Security: &SecurityConfig{
+		Security: SecurityConfig{
 			TLSConfig:               nil,
 			MinTLSVersion:           tls.VersionTLS12,
 			MaxTLSVersion:           tls.VersionTLS13,
@@ -385,7 +437,7 @@ func DefaultConfig() *Config {
 			ValidateHeaders:         true,
 			StrictContentLength:     true,
 		},
-		Retry: &RetryConfig{
+		Retry: RetryConfig{
 			MaxRetries:    3,
 			Delay:         1 * time.Second,
 			BackoffFactor: 2.0,
@@ -393,21 +445,16 @@ func DefaultConfig() *Config {
 			MaxRetryDelay: 30 * time.Second,
 			CustomPolicy:  nil,
 		},
-		Middleware: &MiddlewareConfig{
-			Middlewares:     nil,
+		Middleware: MiddlewareConfig{
+			Middlewares: nil,
+		},
+		Defaults: RequestDefaults{
 			UserAgent:       "httpc/1.0",
 			Headers:         make(map[string]string),
 			FollowRedirects: true,
 			MaxRedirects:    10,
 		},
 	}
-}
-
-// newCookieJar creates a new cookie jar for cookie management.
-func newCookieJar() (http.CookieJar, error) {
-	return cookiejar.New(&cookiejar.Options{
-		PublicSuffixList: nil,
-	})
 }
 
 // validateDuration validates that a duration is within [0, max].
@@ -434,103 +481,100 @@ func ValidateConfig(cfg *Config) error {
 	}
 
 	// Validate timeouts
-	if cfg.Timeouts != nil {
-		for _, err := range []error{
-			validateDuration("Timeouts.Request", cfg.Timeouts.Request, maxTimeout),
-			validateDuration("Timeouts.Dial", cfg.Timeouts.Dial, maxTimeout),
-			validateDuration("Timeouts.TLSHandshake", cfg.Timeouts.TLSHandshake, maxTimeout),
-			validateDuration("Timeouts.ResponseHeader", cfg.Timeouts.ResponseHeader, maxTimeout),
-			validateDuration("Timeouts.IdleConn", cfg.Timeouts.IdleConn, maxTimeout),
-		} {
-			if err != nil {
-				return err
-			}
+	for _, err := range []error{
+		validateDuration("Timeouts.Request", cfg.Timeouts.Request, maxTimeout),
+		validateDuration("Timeouts.Dial", cfg.Timeouts.Dial, maxTimeout),
+		validateDuration("Timeouts.TLSHandshake", cfg.Timeouts.TLSHandshake, maxTimeout),
+		validateDuration("Timeouts.ResponseHeader", cfg.Timeouts.ResponseHeader, maxTimeout),
+		validateDuration("Timeouts.IdleConn", cfg.Timeouts.IdleConn, maxTimeout),
+	} {
+		if err != nil {
+			return err
 		}
 	}
 
 	// Validate connection settings
-	if cfg.Connection != nil {
-		for _, err := range []error{
-			validateRange("Connection.MaxIdleConns", cfg.Connection.MaxIdleConns, maxIdleConns),
-			validateRange("Connection.MaxConnsPerHost", cfg.Connection.MaxConnsPerHost, maxConnsPerHost),
-		} {
-			if err != nil {
-				return err
-			}
+	for _, err := range []error{
+		validateRange("Connection.MaxIdleConns", cfg.Connection.MaxIdleConns, maxIdleConns),
+		validateRange("Connection.MaxConnsPerHost", cfg.Connection.MaxConnsPerHost, maxConnsPerHost),
+	} {
+		if err != nil {
+			return err
 		}
-		if cfg.Connection.ProxyURL != "" {
-			// Delegate to the shared validator so the public Config layer and the
-			// internal connection pool enforce identical rules (scheme set, host
-			// presence). Previously these two layers drifted on socks5.
-			if _, err := validation.ValidateProxyURL(cfg.Connection.ProxyURL); err != nil {
-				return fmt.Errorf("%w: Connection.ProxyURL: %w", ErrInvalidConnection, err)
-			}
+	}
+	if cfg.Connection.ProxyURL != "" {
+		if _, err := validation.ValidateProxyURL(cfg.Connection.ProxyURL); err != nil {
+			return fmt.Errorf("%w: Connection.ProxyURL: %w", ErrInvalidConnection, err)
 		}
-		if cfg.Connection.DoHCacheTTL < 0 {
-			return fmt.Errorf("%w: Connection.DoHCacheTTL cannot be negative, got %v", ErrInvalidConnection, cfg.Connection.DoHCacheTTL)
+	}
+	for _, proxyURL := range cfg.Connection.ProxyPool {
+		if _, err := validation.ValidateProxyURL(proxyURL); err != nil {
+			return fmt.Errorf("%w: Connection.ProxyPool entry %q: %w", ErrInvalidConnection, proxyURL, err)
 		}
-		if cfg.Connection.MaxResponseHeaderBytes < 0 {
-			return fmt.Errorf("%w: Connection.MaxResponseHeaderBytes cannot be negative, got %d", ErrInvalidConnection, cfg.Connection.MaxResponseHeaderBytes)
+	}
+	if cfg.Connection.ProxyFailureThreshold < 0 {
+		return fmt.Errorf("%w: Connection.ProxyFailureThreshold cannot be negative, got %d", ErrInvalidConnection, cfg.Connection.ProxyFailureThreshold)
+	}
+	if cfg.Connection.ProxyCooldown < 0 || cfg.Connection.ProxyCooldown > maxTimeout {
+		return fmt.Errorf("%w: Connection.ProxyCooldown must be 0-%v, got %v", ErrInvalidConnection, maxTimeout, cfg.Connection.ProxyCooldown)
+	}
+	for _, code := range cfg.Connection.ProxyRotateOnStatus {
+		if code < 100 || code > 599 {
+			return fmt.Errorf("%w: Connection.ProxyRotateOnStatus contains invalid HTTP status code %d (must be 100-599)", ErrInvalidConnection, code)
 		}
+	}
+	if cfg.Connection.DoHCacheTTL < 0 {
+		return fmt.Errorf("%w: Connection.DoHCacheTTL cannot be negative, got %v", ErrInvalidConnection, cfg.Connection.DoHCacheTTL)
+	}
+	if cfg.Connection.MaxResponseHeaderBytes < 0 {
+		return fmt.Errorf("%w: Connection.MaxResponseHeaderBytes cannot be negative, got %d", ErrInvalidConnection, cfg.Connection.MaxResponseHeaderBytes)
 	}
 
 	// Validate security settings
-	if cfg.Security != nil {
-		if cfg.Security.MaxResponseBodySize < 0 || cfg.Security.MaxResponseBodySize > maxResponseBodySize {
-			return fmt.Errorf("%w: Security.MaxResponseBodySize must be 0-1GB, got %d", ErrInvalidSecurity, cfg.Security.MaxResponseBodySize)
+	if cfg.Security.MaxResponseBodySize < 0 || cfg.Security.MaxResponseBodySize > maxResponseBodySize {
+		return fmt.Errorf("%w: Security.MaxResponseBodySize must be 0-1GB, got %d", ErrInvalidSecurity, cfg.Security.MaxResponseBodySize)
+	}
+	if cfg.Security.MaxDecompressedBodySize < 0 || cfg.Security.MaxDecompressedBodySize > maxDecompressedBodySize {
+		return fmt.Errorf("%w: Security.MaxDecompressedBodySize must be 0-100MB, got %d", ErrInvalidSecurity, cfg.Security.MaxDecompressedBodySize)
+	}
+	if cfg.Security.MaxRequestBodySize < 0 || cfg.Security.MaxRequestBodySize > maxResponseBodySize {
+		return fmt.Errorf("%w: Security.MaxRequestBodySize must be 0-%d, got %d", ErrInvalidSecurity, maxResponseBodySize, cfg.Security.MaxRequestBodySize)
+	}
+	if cfg.Security.MinTLSVersion != 0 && cfg.Security.MaxTLSVersion != 0 {
+		if cfg.Security.MinTLSVersion > cfg.Security.MaxTLSVersion {
+			return fmt.Errorf("Security.MinTLSVersion (%d) must not exceed MaxTLSVersion (%d)", cfg.Security.MinTLSVersion, cfg.Security.MaxTLSVersion)
 		}
-		if cfg.Security.MaxDecompressedBodySize < 0 || cfg.Security.MaxDecompressedBodySize > maxDecompressedBodySize {
-			return fmt.Errorf("%w: Security.MaxDecompressedBodySize must be 0-100MB, got %d", ErrInvalidSecurity, cfg.Security.MaxDecompressedBodySize)
-		}
-		if cfg.Security.MaxRequestBodySize < 0 || cfg.Security.MaxRequestBodySize > maxResponseBodySize {
-			return fmt.Errorf("%w: Security.MaxRequestBodySize must be 0-%d, got %d", ErrInvalidSecurity, maxResponseBodySize, cfg.Security.MaxRequestBodySize)
-		}
-
-		// Validate TLS version ordering
-		if cfg.Security.MinTLSVersion != 0 && cfg.Security.MaxTLSVersion != 0 {
-			if cfg.Security.MinTLSVersion > cfg.Security.MaxTLSVersion {
-				return fmt.Errorf("Security.MinTLSVersion (%d) must not exceed MaxTLSVersion (%d)", cfg.Security.MinTLSVersion, cfg.Security.MaxTLSVersion)
-			}
-		}
-
-		// Validate CIDR format only — parsing deferred to parseSSRFExemptCIDRs
-		// to avoid mutating the caller's Config (parsedCIDRs field).
-		for _, cidr := range cfg.Security.SSRFExemptCIDRs {
-			if _, _, err := net.ParseCIDR(cidr); err != nil {
-				return fmt.Errorf("Security.SSRFExemptCIDRs: invalid CIDR %q: %w", cidr, err)
-			}
+	}
+	for _, cidr := range cfg.Security.SSRFExemptCIDRs {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("Security.SSRFExemptCIDRs: invalid CIDR %q: %w", cidr, err)
 		}
 	}
 
 	// Validate retry settings
-	if cfg.Retry != nil {
-		if cfg.Retry.MaxRetries < 0 || cfg.Retry.MaxRetries > maxRetryAttempts {
-			return fmt.Errorf("%w: Retry.MaxRetries must be 0-%d, got %d", ErrInvalidRetry, maxRetryAttempts, cfg.Retry.MaxRetries)
-		}
-		if cfg.Retry.Delay < 0 || cfg.Retry.Delay > maxTimeout {
-			return fmt.Errorf("%w: Retry.Delay must be 0-%v, got %v", ErrInvalidRetry, maxTimeout, cfg.Retry.Delay)
-		}
-		if cfg.Retry.BackoffFactor < minBackoffFactor || cfg.Retry.BackoffFactor > maxBackoffFactor {
-			return fmt.Errorf("%w: Retry.BackoffFactor must be %.1f-%.1f, got %.1f", ErrInvalidRetry, minBackoffFactor, maxBackoffFactor, cfg.Retry.BackoffFactor)
-		}
-		if cfg.Retry.MaxRetryDelay < 0 || cfg.Retry.MaxRetryDelay > maxTimeout {
-			return fmt.Errorf("%w: Retry.MaxRetryDelay must be 0-%v, got %v", ErrInvalidRetry, maxTimeout, cfg.Retry.MaxRetryDelay)
-		}
+	if cfg.Retry.MaxRetries < 0 || cfg.Retry.MaxRetries > maxRetryAttempts {
+		return fmt.Errorf("%w: Retry.MaxRetries must be 0-%d, got %d", ErrInvalidRetry, maxRetryAttempts, cfg.Retry.MaxRetries)
+	}
+	if cfg.Retry.Delay < 0 || cfg.Retry.Delay > maxTimeout {
+		return fmt.Errorf("%w: Retry.Delay must be 0-%v, got %v", ErrInvalidRetry, maxTimeout, cfg.Retry.Delay)
+	}
+	if cfg.Retry.BackoffFactor < minBackoffFactor || cfg.Retry.BackoffFactor > maxBackoffFactor {
+		return fmt.Errorf("%w: Retry.BackoffFactor must be %.1f-%.1f, got %.1f", ErrInvalidRetry, minBackoffFactor, maxBackoffFactor, cfg.Retry.BackoffFactor)
+	}
+	if cfg.Retry.MaxRetryDelay < 0 || cfg.Retry.MaxRetryDelay > maxTimeout {
+		return fmt.Errorf("%w: Retry.MaxRetryDelay must be 0-%v, got %v", ErrInvalidRetry, maxTimeout, cfg.Retry.MaxRetryDelay)
 	}
 
-	// Validate middleware settings
-	if cfg.Middleware != nil {
-		if cfg.Middleware.MaxRedirects < 0 || cfg.Middleware.MaxRedirects > maxRedirectLimit {
-			return fmt.Errorf("%w: Middleware.MaxRedirects must be 0-%d, got %d", ErrInvalidMiddleware, maxRedirectLimit, cfg.Middleware.MaxRedirects)
-		}
-		if len(cfg.Middleware.UserAgent) > maxUserAgentLen || !validation.IsValidHeaderString(cfg.Middleware.UserAgent) {
-			return fmt.Errorf("%w: Middleware.UserAgent invalid: max %d chars, no control characters", ErrInvalidMiddleware, maxUserAgentLen)
-		}
-
-		for key, value := range cfg.Middleware.Headers {
-			if err := validation.ValidateHeaderKeyValue(key, value); err != nil {
-				return fmt.Errorf("%w: %s: %w", ErrInvalidHeader, key, err)
-			}
+	// Validate request defaults
+	if cfg.Defaults.MaxRedirects < 0 || cfg.Defaults.MaxRedirects > maxRedirectLimit {
+		return fmt.Errorf("%w: Defaults.MaxRedirects must be 0-%d, got %d", ErrInvalidMiddleware, maxRedirectLimit, cfg.Defaults.MaxRedirects)
+	}
+	if len(cfg.Defaults.UserAgent) > maxUserAgentLen || !validation.IsValidHeaderString(cfg.Defaults.UserAgent) {
+		return fmt.Errorf("%w: Defaults.UserAgent invalid: max %d chars, no control characters", ErrInvalidMiddleware, maxUserAgentLen)
+	}
+	for key, value := range cfg.Defaults.Headers {
+		if err := validation.ValidateHeaderKeyValue(key, value); err != nil {
+			return fmt.Errorf("%w: %s: %w", ErrInvalidHeader, key, err)
 		}
 	}
 
@@ -540,7 +584,7 @@ func ValidateConfig(cfg *Config) error {
 // parseSSRFExemptCIDRs parses and caches CIDR networks from SSRFExemptCIDRs.
 // Called after deepCopyConfig to avoid mutating the caller's original Config.
 func (c *Config) parseSSRFExemptCIDRs() error {
-	if c.Security == nil || len(c.Security.SSRFExemptCIDRs) == 0 {
+	if len(c.Security.SSRFExemptCIDRs) == 0 {
 		return nil
 	}
 	c.parsedCIDRs = make([]*net.IPNet, 0, len(c.Security.SSRFExemptCIDRs))
@@ -574,75 +618,68 @@ func (c *Config) String() string {
 	var numBuf [20]byte
 
 	b.WriteString("Config{Timeouts:{Request: ")
-	if c.Timeouts != nil {
-		b.WriteString(c.Timeouts.Request.String())
-		b.WriteString(", Dial: ")
-		b.WriteString(c.Timeouts.Dial.String())
-		b.WriteString(", TLSHandshake: ")
-		b.WriteString(c.Timeouts.TLSHandshake.String())
-	} else {
-		b.WriteString("<nil>")
-	}
+	b.WriteString(c.Timeouts.Request.String())
+	b.WriteString(", Dial: ")
+	b.WriteString(c.Timeouts.Dial.String())
+	b.WriteString(", TLSHandshake: ")
+	b.WriteString(c.Timeouts.TLSHandshake.String())
 
 	b.WriteString("}, Connection:{MaxIdleConns: ")
-	if c.Connection != nil {
-		b.Write(strconv.AppendInt(numBuf[:0], int64(c.Connection.MaxIdleConns), 10))
-		b.WriteString(", MaxConnsPerHost: ")
-		b.Write(strconv.AppendInt(numBuf[:0], int64(c.Connection.MaxConnsPerHost), 10))
-		b.WriteString(", ProxyURL: ")
-		b.WriteString(maskProxyURL(c.Connection.ProxyURL))
-	} else {
-		b.WriteString("<nil>")
-	}
+	b.Write(strconv.AppendInt(numBuf[:0], int64(c.Connection.MaxIdleConns), 10))
+	b.WriteString(", MaxConnsPerHost: ")
+	b.Write(strconv.AppendInt(numBuf[:0], int64(c.Connection.MaxConnsPerHost), 10))
+	b.WriteString(", ProxyURL: ")
+	b.WriteString(maskProxyURL(c.Connection.ProxyURL))
+	b.WriteString(", ProxyPool: ")
+	b.Write(strconv.AppendInt(numBuf[:0], int64(len(c.Connection.ProxyPool)), 10))
 
 	b.WriteString("}, Security:{TLSConfig: ")
-	if c.Security != nil {
-		if c.Security.TLSConfig != nil {
-			b.WriteString("<configured>")
-		} else {
-			b.WriteString("<default>")
-		}
-		b.WriteString(", InsecureSkipVerify: ")
-		b.WriteString(strconv.FormatBool(c.Security.InsecureSkipVerify))
-		b.WriteString(", AllowPrivateIPs: ")
-		b.WriteString(strconv.FormatBool(c.Security.AllowPrivateIPs))
-		b.WriteString(", CertPinning: ")
-		if c.Security.CertificatePinner != nil {
-			b.WriteString("<configured>")
-		} else {
-			b.WriteString("<disabled>")
-		}
+	if c.Security.TLSConfig != nil {
+		b.WriteString("<configured>")
 	} else {
-		b.WriteString("<nil>")
+		b.WriteString("<default>")
+	}
+	b.WriteString(", InsecureSkipVerify: ")
+	b.WriteString(strconv.FormatBool(c.Security.InsecureSkipVerify))
+	b.WriteString(", AllowPrivateIPs: ")
+	b.WriteString(strconv.FormatBool(c.Security.AllowPrivateIPs))
+	b.WriteString(", CertPinning: ")
+	if c.Security.CertificatePinner != nil {
+		b.WriteString("<configured>")
+	} else {
+		b.WriteString("<disabled>")
 	}
 
 	b.WriteString("}, Retry:{MaxRetries: ")
-	if c.Retry != nil {
-		b.Write(strconv.AppendInt(numBuf[:0], int64(c.Retry.MaxRetries), 10))
-		b.WriteString(", BackoffFactor: ")
-		b.WriteString(strconv.FormatFloat(c.Retry.BackoffFactor, 'f', 1, 64))
-	} else {
-		b.WriteString("<nil>")
-	}
+	b.Write(strconv.AppendInt(numBuf[:0], int64(c.Retry.MaxRetries), 10))
+	b.WriteString(", BackoffFactor: ")
+	b.WriteString(strconv.FormatFloat(c.Retry.BackoffFactor, 'f', 1, 64))
 
-	b.WriteString("}, Middleware:{UserAgent: ")
-	if c.Middleware != nil {
-		ua := c.Middleware.UserAgent
-		if len(ua) > 50 {
-			ua = ua[:50] + "..."
-		}
-		b.WriteString(ua)
-		b.WriteString(", FollowRedirects: ")
-		b.WriteString(strconv.FormatBool(c.Middleware.FollowRedirects))
-	} else {
-		b.WriteString("<nil>")
+	b.WriteString("}, Middleware:{Middlewares: ")
+	b.Write(strconv.AppendInt(numBuf[:0], int64(len(c.Middleware.Middlewares)), 10))
+
+	b.WriteString("}, Defaults:{UserAgent: ")
+	ua := c.Defaults.UserAgent
+	if len(ua) > 50 {
+		ua = ua[:50] + "..."
 	}
+	b.WriteString(ua)
+	b.WriteString(", FollowRedirects: ")
+	b.WriteString(strconv.FormatBool(c.Defaults.FollowRedirects))
 
 	b.WriteString("}}")
 	result := b.String()
-	configBuilderPool.Put(b)
+	// Guard against retaining an oversized backing array in the pool — matches
+	// the cap guards on resultBuilderPool, formBuilderPool, and errorBuilderPool.
+	if b.Cap() <= maxConfigBuilderCap {
+		configBuilderPool.Put(b)
+	}
 	return result
 }
+
+// maxConfigBuilderCap bounds the backing array retained by configBuilderPool,
+// mirroring the cap guards on resultBuilderPool / formBuilderPool.
+const maxConfigBuilderCap = 1024
 
 // configBuilderPool reduces allocations for strings.Builder in Config.String().
 var configBuilderPool = sync.Pool{

@@ -43,7 +43,7 @@ func main() {
 func demonstrateBasicErrors() {
 	fmt.Println("--- Example 1: Basic Error Handling ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -70,7 +70,7 @@ func demonstrateBasicErrors() {
 func demonstrateHTTPErrors() {
 	fmt.Println("--- Example 2: HTTP Status Errors ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -121,7 +121,7 @@ func demonstrateHTTPErrors() {
 func demonstrateTimeoutErrors() {
 	fmt.Println("--- Example 3: Timeout Errors ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -151,7 +151,7 @@ func demonstrateTimeoutErrors() {
 func demonstrateContextCancellation() {
 	fmt.Println("--- Example 4: Context Cancellation ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -186,7 +186,7 @@ func demonstrateContextCancellation() {
 func demonstrateParsingErrors() {
 	fmt.Println("--- Example 5: Parsing Errors ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return
@@ -233,7 +233,7 @@ func demonstrateComprehensivePattern() {
 
 // fetchUserData demonstrates a function with comprehensive error handling
 func fetchUserData(userID int) (map[string]any, error) {
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create HTTP client: %w", err)
 	}
@@ -296,7 +296,7 @@ func fetchUserData(userID int) (map[string]any, error) {
 func demonstrateStructuredErrors() {
 	fmt.Println("--- Example 7: Structured Error Types ---")
 
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
 		return

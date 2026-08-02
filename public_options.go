@@ -306,7 +306,8 @@ var formBuilderPool = sync.Pool{
 
 // encodeFormFields encodes a map[string]string to url-encoded form string.
 // Uses a pooled strings.Builder to avoid the intermediate url.Values map allocation.
-// Optimized to use engine.queryEscape for consistent, pooled URL encoding.
+// Writes escaped keys/values straight into the builder via AppendQueryEscape,
+// avoiding the intermediate string allocations that QueryEscape would incur.
 func encodeFormFields(data map[string]string) string {
 	if len(data) == 0 {
 		return ""
@@ -324,9 +325,9 @@ func encodeFormFields(data map[string]string) string {
 			sb.WriteByte('&')
 		}
 		first = false
-		sb.WriteString(engine.QueryEscape(k))
+		engine.AppendQueryEscape(sb, k)
 		sb.WriteByte('=')
-		sb.WriteString(engine.QueryEscape(v))
+		engine.AppendQueryEscape(sb, v)
 	}
 
 	result := sb.String()
@@ -423,10 +424,12 @@ func setAutoDetectedBody(r *engine.Request, data any) (string, error) {
 		// auto-detected form body gets the same field validation as WithForm /
 		// WithBody(BodyForm). Previously this branch called encodeFormFields
 		// directly, skipping control-character and size validation.
+		// Returns "" because applyFormBody already sets the Content-Type header,
+		// avoiding a redundant SetHeader call by the caller.
 		if err := applyFormBody(r, v); err != nil {
 			return "", err
 		}
-		return "application/x-www-form-urlencoded", nil
+		return "", nil
 	default:
 		// Default to JSON for all other types
 		r.SetBody(data)
@@ -515,6 +518,8 @@ func validateFormInput(data any) error {
 				}
 			}
 		}
+	default:
+		return fmt.Errorf("form data must be map[string]string or url.Values, got %T", data)
 	}
 	return nil
 }
@@ -824,16 +829,14 @@ func WithCookieString(cookieString string) RequestOption {
 			return nil
 		}
 
-		existing := r.Cookies()
-		combined := make([]http.Cookie, len(existing), len(existing)+len(cookies))
-		copy(combined, existing)
+		existing := ensureCookieCapacity(r.Cookies(), len(cookies))
 		for i := range cookies {
 			if err := validation.ValidateCookie(&cookies[i]); err != nil {
 				return fmt.Errorf("invalid cookie %s: %w", cookies[i].Name, err)
 			}
-			combined = append(combined, cookies[i])
+			existing = append(existing, cookies[i])
 		}
-		r.SetCookies(combined)
+		r.SetCookies(existing)
 
 		return nil
 	}

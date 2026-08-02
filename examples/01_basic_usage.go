@@ -100,7 +100,7 @@ func useClientInstance() {
 	fmt.Println("--- Example 3: Using Client Instance ---")
 
 	// Create a client with default configuration
-	client, err := httpc.New()
+	client, err := httpc.NewDefault()
 	if err != nil {
 		fmt.Printf("Failed to create client: %v\n", err)
 		return
