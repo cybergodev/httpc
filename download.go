@@ -281,7 +281,9 @@ type downloadFields struct {
 }
 
 // extractDownloadFields extracts download-relevant fields from an engine Response.
-// Transfers body reader ownership to the caller. The caller must call
+// Transfers body reader and header ownership to the caller, avoiding Clone
+// allocations — ReleaseResponse will zero the Response afterward, so the
+// transferred maps are the sole surviving reference. The caller must call
 // engine.ReleaseResponse(engResp) after the body reader is no longer needed.
 func extractDownloadFields(engResp *engine.Response) downloadFields {
 	// Transfer body reader ownership; nil prevents ReleaseResponse from closing it.
@@ -293,14 +295,10 @@ func extractDownloadFields(engResp *engine.Response) downloadFields {
 		proto:           engResp.Proto(),
 		requestURL:      engResp.RequestURL(),
 		requestMethod:   engResp.RequestMethod(),
-		responseHeaders: engResp.Headers().Clone(),
+		responseHeaders: engResp.TransferHeaders(),
+		requestHeaders:  engResp.TransferRequestHeaders(),
 	}
 	engResp.SetRawBodyReader(nil)
-
-	// Clone request headers if present
-	if h := engResp.RequestHeaders(); h != nil {
-		df.requestHeaders = h.Clone()
-	}
 
 	return df
 }

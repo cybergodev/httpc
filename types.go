@@ -4,8 +4,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
-	"net/http"
-	"net/http/cookiejar"
 	"strconv"
 	"strings"
 	"sync"
@@ -251,24 +249,56 @@ type RetryConfig struct {
 	CustomPolicy RetryPolicy
 }
 
-// MiddlewareConfig configures the per-request defaults and the middleware chain
-// applied to every outgoing request. It groups two related concerns: the
-// middleware chain (Middlewares) and the request defaults — User-Agent, default
-// headers, and the redirect policy.
-//
-// Only Middlewares is strictly "middleware"; UserAgent, Headers, FollowRedirects,
-// and MaxRedirects are request defaults colocated here for historical reasons and
-// may move to a dedicated options struct in a future major version. Use
-// DefaultConfig() to obtain sensible values for all fields.
+// MiddlewareConfig configures the middleware chain applied to every outgoing
+// request. Only Middlewares belongs here; the request-default fields (UserAgent,
+// Headers, FollowRedirects, MaxRedirects) are deprecated — use Config.Defaults
+// (RequestDefaults) instead. When both are set, MiddlewareConfig values that
+// differ from their DefaultConfig defaults take precedence over Defaults, so
+// existing code that modifies cfg.Middleware.UserAgent continues to work
+// unchanged. The deprecated fields will be removed in a future major version.
 type MiddlewareConfig struct {
 	// Middlewares contains middleware functions for request/response interception.
 	// Default: nil.
 	Middlewares []MiddlewareFunc
 
 	// UserAgent sets the User-Agent header. Default: "httpc/1.0".
+	//
+	// Deprecated: Use Config.Defaults.UserAgent instead. This field will be
+	// removed in a future major version.
 	UserAgent string
 
 	// Headers contains default headers added to every request.
+	//
+	// Deprecated: Use Config.Defaults.Headers instead. This field will be
+	// removed in a future major version.
+	Headers map[string]string
+
+	// FollowRedirects controls automatic redirect following. Default: true.
+	//
+	// Deprecated: Use Config.Defaults.FollowRedirects instead. This field will
+	// be removed in a future major version.
+	FollowRedirects bool
+
+	// MaxRedirects limits automatic redirects. Default: 10.
+	//
+	// Deprecated: Use Config.Defaults.MaxRedirects instead. This field will be
+	// removed in a future major version.
+	MaxRedirects int
+}
+
+// RequestDefaults configures per-request defaults applied to every outgoing
+// request: the User-Agent header, default headers, and the redirect policy.
+//
+// This is the preferred location for request defaults. The same fields also exist
+// on MiddlewareConfig for backward compatibility; when both are set, values on
+// MiddlewareConfig that differ from their DefaultConfig defaults take precedence
+// over Defaults. Use DefaultConfig() to obtain sensible values for all fields.
+type RequestDefaults struct {
+	// UserAgent sets the User-Agent header. Default: "httpc/1.0".
+	UserAgent string
+
+	// Headers contains default headers added to every request.
+	// Default: empty (no default headers).
 	Headers map[string]string
 
 	// FollowRedirects controls automatic redirect following. Default: true.
@@ -295,6 +325,7 @@ type Config struct {
 	Security   *SecurityConfig
 	Retry      *RetryConfig
 	Middleware *MiddlewareConfig
+	Defaults   *RequestDefaults
 
 	// parsedCIDRs caches parsed SSRFExemptCIDRs to avoid double parsing.
 	// Filled by parseSSRFExemptCIDRs; consumed by convertToEngineConfig.
@@ -451,14 +482,13 @@ func DefaultConfig() *Config {
 			FollowRedirects: true,
 			MaxRedirects:    10,
 		},
+		Defaults: &RequestDefaults{
+			UserAgent:       "httpc/1.0",
+			Headers:         make(map[string]string),
+			FollowRedirects: true,
+			MaxRedirects:    10,
+		},
 	}
-}
-
-// newCookieJar creates a new cookie jar for cookie management.
-func newCookieJar() (http.CookieJar, error) {
-	return cookiejar.New(&cookiejar.Options{
-		PublicSuffixList: nil,
-	})
 }
 
 // validateDuration validates that a duration is within [0, max].
@@ -603,6 +633,22 @@ func ValidateConfig(cfg *Config) error {
 		}
 	}
 
+	// Validate request defaults
+	if cfg.Defaults != nil {
+		if cfg.Defaults.MaxRedirects < 0 || cfg.Defaults.MaxRedirects > maxRedirectLimit {
+			return fmt.Errorf("%w: Defaults.MaxRedirects must be 0-%d, got %d", ErrInvalidMiddleware, maxRedirectLimit, cfg.Defaults.MaxRedirects)
+		}
+		if len(cfg.Defaults.UserAgent) > maxUserAgentLen || !validation.IsValidHeaderString(cfg.Defaults.UserAgent) {
+			return fmt.Errorf("%w: Defaults.UserAgent invalid: max %d chars, no control characters", ErrInvalidMiddleware, maxUserAgentLen)
+		}
+
+		for key, value := range cfg.Defaults.Headers {
+			if err := validation.ValidateHeaderKeyValue(key, value); err != nil {
+				return fmt.Errorf("%w: %s: %w", ErrInvalidHeader, key, err)
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -709,11 +755,32 @@ func (c *Config) String() string {
 		b.WriteString("<nil>")
 	}
 
+	b.WriteString("}, Defaults:{UserAgent: ")
+	if c.Defaults != nil {
+		ua := c.Defaults.UserAgent
+		if len(ua) > 50 {
+			ua = ua[:50] + "..."
+		}
+		b.WriteString(ua)
+		b.WriteString(", FollowRedirects: ")
+		b.WriteString(strconv.FormatBool(c.Defaults.FollowRedirects))
+	} else {
+		b.WriteString("<nil>")
+	}
+
 	b.WriteString("}}")
 	result := b.String()
-	configBuilderPool.Put(b)
+	// Guard against retaining an oversized backing array in the pool — matches
+	// the cap guards on resultBuilderPool, formBuilderPool, and errorBuilderPool.
+	if b.Cap() <= maxConfigBuilderCap {
+		configBuilderPool.Put(b)
+	}
 	return result
 }
+
+// maxConfigBuilderCap bounds the backing array retained by configBuilderPool,
+// mirroring the cap guards on resultBuilderPool / formBuilderPool.
+const maxConfigBuilderCap = 1024
 
 // configBuilderPool reduces allocations for strings.Builder in Config.String().
 var configBuilderPool = sync.Pool{

@@ -873,6 +873,10 @@ func TestConvertToEngineConfig_PropagatesAllFields(t *testing.T) {
 		t.Fatalf("parseSSRFExemptCIDRs: %v", err)
 	}
 
+	// reconcileDefaults is called by prepareConfig in production; replicate
+	// it here so the conversion sees the reconciled Defaults values.
+	reconcileDefaults(cfg)
+
 	engCfg, err := convertToEngineConfig(cfg)
 	if err != nil {
 		t.Fatalf("convertToEngineConfig error: %v", err)

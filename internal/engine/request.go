@@ -65,16 +65,14 @@ func getMIMEHeader() *textproto.MIMEHeader {
 	return h
 }
 
-// putMIMEHeader returns a textproto.MIMEHeader to the pool
+// putMIMEHeader returns a textproto.MIMEHeader to the pool.
+// Keys are deleted to clear the map for reuse, matching the pattern used by
+// putHeadersMap / putQueryParamsMap / putHTTPHeader.
 func putMIMEHeader(h *textproto.MIMEHeader) {
 	if h == nil || len(*h) > 16 {
 		return // Don't pool large headers
 	}
-	// Clear values for GC and security
-	for k, v := range *h {
-		for i := range v {
-			v[i] = ""
-		}
+	for k := range *h {
 		delete(*h, k)
 	}
 	mimeHeaderPool.Put(h)
@@ -275,20 +273,22 @@ func hasSensitiveContent(rawURL string) bool {
 
 // evictRawIfNeeded removes stale raw cache entries when the map exceeds
 // rawCacheMaxSize. Must be called with c.mu held for writing.
+//
+// A "live" raw entry is one whose *url.URL pointer also appears in the entries
+// map — keeping it avoids a re-parse on the next access. Stale entries (pointer
+// no longer in entries) are discarded. The previous implementation scanned the
+// entries map for each raw entry — O(N×M), up to ~2M pointer comparisons under
+// a write lock. Building a pointer set once reduces this to O(N+M).
 func (c *urlCache) evictRawIfNeeded() {
 	if len(c.raw) < rawCacheMaxSize {
 		return
 	}
-	// Scan for raw entries pointing to URLs no longer in the entries map
+	live := make(map[*url.URL]bool, len(c.entries))
+	for _, u := range c.entries {
+		live[u] = true
+	}
 	for k, v := range c.raw {
-		found := false
-		for _, u := range c.entries {
-			if u == v {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if !live[v] {
 			delete(c.raw, k)
 		}
 		if len(c.raw) < rawCacheMaxSize/2 {

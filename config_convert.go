@@ -150,11 +150,11 @@ func convertToEngineConfig(cfg *Config) (*engine.Config, error) {
 		ExtraRetryableStatusCodes: cfg.Connection.ProxyRotateOnStatus,
 		CustomRetryPolicy:         cfg.Retry.CustomPolicy,
 
-		// Middleware settings
-		UserAgent:       cfg.Middleware.UserAgent,
-		Headers:         cfg.Middleware.Headers,
-		FollowRedirects: cfg.Middleware.FollowRedirects,
-		MaxRedirects:    cfg.Middleware.MaxRedirects,
+		// Request defaults (reconciled from Defaults and Middleware by reconcileDefaults)
+		UserAgent:       cfg.Defaults.UserAgent,
+		Headers:         cfg.Defaults.Headers,
+		FollowRedirects: cfg.Defaults.FollowRedirects,
+		MaxRedirects:    cfg.Defaults.MaxRedirects,
 	}
 
 	if len(cfg.Security.RedirectWhitelist) > 0 {

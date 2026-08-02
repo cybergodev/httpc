@@ -139,5 +139,36 @@
 // transport-level ResponseHeaderTimeout as defense-in-depth against slowloris
 // attacks.
 //
+// # Request Defaults (RequestDefaults)
+//
+// Per-request defaults — User-Agent, default headers, redirect policy — live on
+// Config.Defaults (RequestDefaults), populated by DefaultConfig():
+//
+//	cfg := httpc.DefaultConfig()
+//	cfg.Defaults.UserAgent = "myapp/2.0"
+//	cfg.Defaults.FollowRedirects = false
+//	cfg.Defaults.Headers["Authorization"] = "Bearer token"
+//	client, err := httpc.New(cfg)
+//
+// The same fields also exist on MiddlewareConfig for backward compatibility and
+// are deprecated. Existing code that sets cfg.Middleware.UserAgent continues to
+// work; when migrating, move those assignments to cfg.Defaults.*.
+//
+// # Middleware Configuration
+//
+// Middleware factories that accept multiple options have a Config variant:
+//
+//	mw := httpc.LoggingMiddlewareWithConfig(&httpc.LoggingConfig{
+//	    LogFunc: log.Printf,
+//	})
+//	mw := httpc.MetricsMiddlewareWithConfig(&httpc.MetricsConfig{
+//	    OnMetrics: func(method, url string, code int, d time.Duration, err error) { ... },
+//	})
+//	mw := httpc.RequestIDMiddlewareWithConfig(httpc.DefaultRequestIDConfig())
+//	mw := httpc.AuditMiddlewareWithConfig(onAudit, httpc.DefaultAuditMiddlewareConfig())
+//
+// The single-parameter convenience functions (LoggingMiddleware, MetricsMiddleware,
+// RequestIDMiddleware, AuditMiddleware) remain available for simple use cases.
+//
 // For more information, see https://github.com/cybergodev/httpc
 package httpc

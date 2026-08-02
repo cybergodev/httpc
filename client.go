@@ -6,6 +6,7 @@ import (
 	"maps"
 	"net"
 	"net/http"
+	"net/http/cookiejar"
 	"sync"
 	"sync/atomic"
 
@@ -143,7 +144,9 @@ func prepareConfig(in *Config) (*Config, error) {
 	if err := cfg.parseSSRFExemptCIDRs(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
-	return mergeNilSubConfigs(cfg), nil
+	cfg = mergeNilSubConfigs(cfg)
+	reconcileDefaults(cfg)
+	return cfg, nil
 }
 
 // newFromPreparedConfig creates a client from an already-validated and deep-copied config.
@@ -229,6 +232,16 @@ func deepCopyConfig(src *Config) *Config {
 		copy(dst.Middleware.Middlewares, src.Middleware.Middlewares)
 	}
 
+	// Deep copy request defaults
+	if src.Defaults != nil {
+		cp := *src.Defaults
+		dst.Defaults = &cp
+	}
+	if src.Defaults != nil && src.Defaults.Headers != nil {
+		dst.Defaults.Headers = make(map[string]string, len(src.Defaults.Headers))
+		maps.Copy(dst.Defaults.Headers, src.Defaults.Headers)
+	}
+
 	// Deep copy redirect whitelist
 	if src.Security != nil && len(src.Security.RedirectWhitelist) > 0 {
 		dst.Security.RedirectWhitelist = make([]string, len(src.Security.RedirectWhitelist))
@@ -306,7 +319,46 @@ func mergeNilSubConfigs(cfg *Config) *Config {
 		maps.Copy(cp.Headers, def.Middleware.Headers)
 		cfg.Middleware = &cp
 	}
+	if cfg.Defaults == nil {
+		cp := *def.Defaults
+		// Give each client its own headers map rather than aliasing the default's.
+		cp.Headers = make(map[string]string, len(def.Defaults.Headers))
+		maps.Copy(cp.Headers, def.Defaults.Headers)
+		cfg.Defaults = &cp
+	}
 	return cfg
+}
+
+// reconcileDefaults ensures Config.Defaults reflects the user's intent regardless
+// of whether they modified the old API (MiddlewareConfig's request-default fields)
+// or the new API (RequestDefaults). DefaultConfig populates both identically, so
+// this function only needs to detect Middleware modifications and propagate them
+// to Defaults — the conversion path reads from Defaults.
+//
+// Precedence: when both Middleware and Defaults are modified for the same field,
+// Middleware wins (backward compatibility). A Middleware field is considered
+// "modified" when it differs from its DefaultConfig value; this avoids overriding
+// Defaults with stale DefaultConfig values while correctly capturing old-API
+// modifications like cfg.Middleware.UserAgent = "myapp".
+//
+// Prerequisite: cfg.Defaults and cfg.Middleware must be non-nil (guaranteed by
+// mergeNilSubConfigs).
+func reconcileDefaults(cfg *Config) {
+	def := DefaultConfig()
+	mw := cfg.Middleware
+
+	if mw.UserAgent != def.Middleware.UserAgent {
+		cfg.Defaults.UserAgent = mw.UserAgent
+	}
+	if mw.MaxRedirects != def.Middleware.MaxRedirects {
+		cfg.Defaults.MaxRedirects = mw.MaxRedirects
+	}
+	if mw.FollowRedirects != def.Middleware.FollowRedirects {
+		cfg.Defaults.FollowRedirects = mw.FollowRedirects
+	}
+	// DefaultConfig creates an empty headers map, so any entry in Middleware.Headers
+	// is a user addition. Merge all into Defaults (Middleware wins on conflict).
+	maps.Copy(cfg.Defaults.Headers, mw.Headers)
 }
 
 // buildMiddlewareChain constructs a middleware chain from the provided middlewares.
@@ -339,7 +391,8 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 		var onRequest func(*engine.Request) error
 		var onResponse func(*engine.Response) error
 		var allowPrivateIPs *bool
-		if engReq, ok := req.(*engine.Request); ok {
+		engReq, isEngineReq := req.(*engine.Request)
+		if isEngineReq {
 			if cb := engReq.OnRequest(); cb != nil {
 				onRequest = cb
 			}
@@ -374,6 +427,19 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 				}
 				if onResponse != nil {
 					r.SetOnResponse(onResponse)
+				}
+				// Transfer ownership of pooled maps to the engine request to
+				// prevent double-pooling. r now holds the same headers/queryParams
+				// map pointers that engReq held; the engine's deferred putRequest
+				// will return them to headersMapPool/queryParamsPool. Nilling them
+				// on engReq here ensures the deferred releaseMiddlewareRequest
+				// (which calls putHeadersMap/putQueryParamsMap again) skips them —
+				// without this, the same map enters the pool twice and two
+				// concurrent goroutines can retrieve it simultaneously, causing a
+				// data race that leaks headers between unrelated requests.
+				if isEngineReq {
+					engReq.SetHeaders(nil)
+					engReq.SetQueryParams(nil)
 				}
 				return nil
 			})
@@ -770,7 +836,9 @@ func createCookieJar(enableCookies bool) (http.CookieJar, error) {
 	if !enableCookies {
 		return nil, nil
 	}
-	jar, err := newCookieJar()
+	jar, err := cookiejar.New(&cookiejar.Options{
+		PublicSuffixList: nil,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cookie jar: %w", err)
 	}

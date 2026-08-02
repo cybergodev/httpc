@@ -96,6 +96,54 @@ func DefaultAuditMiddlewareConfig() *AuditMiddlewareConfig {
 	}
 }
 
+// LoggingConfig configures the logging middleware.
+// Use DefaultLoggingConfig() as the starting point.
+type LoggingConfig struct {
+	// LogFunc receives formatted log messages (similar to log.Printf).
+	// If nil, logging is disabled.
+	LogFunc func(format string, args ...any)
+}
+
+// DefaultLoggingConfig returns a LoggingConfig with logging disabled.
+// Set LogFunc to enable logging.
+func DefaultLoggingConfig() *LoggingConfig {
+	return &LoggingConfig{}
+}
+
+// MetricsConfig configures the metrics middleware.
+// Use DefaultMetricsConfig() as the starting point.
+type MetricsConfig struct {
+	// OnMetrics is invoked with request metrics after each request completes.
+	// If nil, metrics collection is disabled.
+	OnMetrics func(method, url string, statusCode int, duration time.Duration, err error)
+}
+
+// DefaultMetricsConfig returns a MetricsConfig with metrics disabled.
+// Set OnMetrics to enable metrics collection.
+func DefaultMetricsConfig() *MetricsConfig {
+	return &MetricsConfig{}
+}
+
+// RequestIDConfig configures the request ID middleware.
+// Use DefaultRequestIDConfig() as the starting point.
+type RequestIDConfig struct {
+	// HeaderName is the HTTP header name for the request ID.
+	// Default: "X-Request-ID".
+	HeaderName string
+
+	// Generator produces the request ID string. If nil, a cryptographically
+	// secure random generator is used (crypto/rand, 16 bytes hex-encoded).
+	Generator func() string
+}
+
+// DefaultRequestIDConfig returns a RequestIDConfig with sensible defaults.
+// HeaderName defaults to "X-Request-ID"; Generator defaults to crypto/rand.
+func DefaultRequestIDConfig() *RequestIDConfig {
+	return &RequestIDConfig{
+		HeaderName: "X-Request-ID",
+	}
+}
+
 // auditContextKey is the type for context keys used in audit middleware.
 type auditContextKey string
 
@@ -118,10 +166,13 @@ func Chain(middlewares ...MiddlewareFunc) MiddlewareFunc {
 	}
 }
 
-// LoggingMiddleware creates a middleware that logs request and response information.
-// The log function receives formatted log messages (similar to log.Printf).
+// LoggingMiddlewareWithConfig creates a logging middleware with the given configuration.
 // SECURITY: URLs are sanitized to remove credentials before logging.
-func LoggingMiddleware(log func(format string, args ...any)) MiddlewareFunc {
+func LoggingMiddlewareWithConfig(config *LoggingConfig) MiddlewareFunc {
+	if config == nil {
+		config = DefaultLoggingConfig()
+	}
+	log := config.LogFunc
 	if log == nil {
 		log = func(string, ...any) {}
 	}
@@ -147,6 +198,15 @@ func LoggingMiddleware(log func(format string, args ...any)) MiddlewareFunc {
 			return resp, err
 		}
 	}
+}
+
+// LoggingMiddleware creates a middleware that logs request and response information.
+// The log function receives formatted log messages (similar to log.Printf).
+// SECURITY: URLs are sanitized to remove credentials before logging.
+//
+// This is a convenience wrapper around LoggingMiddlewareWithConfig.
+func LoggingMiddleware(log func(format string, args ...any)) MiddlewareFunc {
+	return LoggingMiddlewareWithConfig(&LoggingConfig{LogFunc: log})
 }
 
 // panicToError converts a recovered panic value into a descriptive error that
@@ -180,13 +240,20 @@ func RecoveryMiddleware() MiddlewareFunc {
 	}
 }
 
-// RequestIDMiddleware creates a middleware that adds a unique request ID to each request.
-// The request ID is added to the request headers with the specified header name.
-// If generator is nil, a cryptographically secure random ID generator is used.
+// RequestIDMiddlewareWithConfig creates a middleware that adds a unique request ID
+// to each request using the given configuration.
 //
-// SECURITY: The default generator uses crypto/rand to produce unpredictable request IDs,
-// preventing request ID guessing attacks in security-sensitive applications.
-func RequestIDMiddleware(headerName string, generator func() string) MiddlewareFunc {
+// SECURITY: When Generator is nil, the default uses crypto/rand to produce
+// unpredictable request IDs, preventing request ID guessing attacks.
+func RequestIDMiddlewareWithConfig(config *RequestIDConfig) MiddlewareFunc {
+	if config == nil {
+		config = DefaultRequestIDConfig()
+	}
+	headerName := config.HeaderName
+	if headerName == "" {
+		headerName = "X-Request-ID"
+	}
+	generator := config.Generator
 	if generator == nil {
 		generator = func() string {
 			// SECURITY: Use cryptographically secure random for unpredictable request IDs
@@ -208,6 +275,18 @@ func RequestIDMiddleware(headerName string, generator func() string) MiddlewareF
 			return next(ctx, req)
 		}
 	}
+}
+
+// RequestIDMiddleware creates a middleware that adds a unique request ID to each request.
+// The request ID is added to the request headers with the specified header name.
+// If generator is nil, a cryptographically secure random ID generator is used.
+//
+// SECURITY: The default generator uses crypto/rand to produce unpredictable request IDs,
+// preventing request ID guessing attacks in security-sensitive applications.
+//
+// This is a convenience wrapper around RequestIDMiddlewareWithConfig.
+func RequestIDMiddleware(headerName string, generator func() string) MiddlewareFunc {
+	return RequestIDMiddlewareWithConfig(&RequestIDConfig{HeaderName: headerName, Generator: generator})
 }
 
 // TimeoutMiddleware creates a middleware that enforces a maximum duration for requests.
@@ -283,9 +362,12 @@ func HeaderMiddleware(headers map[string]string) MiddlewareFunc {
 	}
 }
 
-// MetricsMiddleware creates a middleware that collects request metrics.
-// The onMetrics callback is invoked with metrics after each request completes.
-func MetricsMiddleware(onMetrics func(method, url string, statusCode int, duration time.Duration, err error)) MiddlewareFunc {
+// MetricsMiddlewareWithConfig creates a metrics middleware with the given configuration.
+func MetricsMiddlewareWithConfig(config *MetricsConfig) MiddlewareFunc {
+	if config == nil {
+		config = DefaultMetricsConfig()
+	}
+	onMetrics := config.OnMetrics
 	return func(next Handler) Handler {
 		return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
 			start := time.Now()
@@ -305,6 +387,14 @@ func MetricsMiddleware(onMetrics func(method, url string, statusCode int, durati
 			return resp, err
 		}
 	}
+}
+
+// MetricsMiddleware creates a middleware that collects request metrics.
+// The onMetrics callback is invoked with metrics after each request completes.
+//
+// This is a convenience wrapper around MetricsMiddlewareWithConfig.
+func MetricsMiddleware(onMetrics func(method, url string, statusCode int, duration time.Duration, err error)) MiddlewareFunc {
+	return MetricsMiddlewareWithConfig(&MetricsConfig{OnMetrics: onMetrics})
 }
 
 // sanitizeCallbackError prevents credential leakage in callback errors.

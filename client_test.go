@@ -600,6 +600,7 @@ func TestMergeNilSubConfigs(t *testing.T) {
 		{"Security nil", func(c *Config) { c.Security = nil }, func(c *Config) bool { return c.Security != nil && reflect.DeepEqual(c.Security, def.Security) }},
 		{"Retry nil", func(c *Config) { c.Retry = nil }, func(c *Config) bool { return c.Retry != nil && reflect.DeepEqual(c.Retry, def.Retry) }},
 		{"Middleware nil", func(c *Config) { c.Middleware = nil }, func(c *Config) bool { return c.Middleware != nil && reflect.DeepEqual(c.Middleware, def.Middleware) }},
+		{"Defaults nil", func(c *Config) { c.Defaults = nil }, func(c *Config) bool { return c.Defaults != nil && reflect.DeepEqual(c.Defaults, def.Defaults) }},
 	}
 
 	for _, tt := range tests {
@@ -615,7 +616,7 @@ func TestMergeNilSubConfigs(t *testing.T) {
 	t.Run("all nil", func(t *testing.T) {
 		got := mergeNilSubConfigs(&Config{})
 		if got.Timeouts == nil || got.Connection == nil || got.Security == nil ||
-			got.Retry == nil || got.Middleware == nil {
+			got.Retry == nil || got.Middleware == nil || got.Defaults == nil {
 			t.Error("mergeNilSubConfigs left a sub-config nil for an all-nil Config")
 		}
 	})
@@ -626,6 +627,98 @@ func TestMergeNilSubConfigs(t *testing.T) {
 		cfg.Timeouts = custom
 		if mergeNilSubConfigs(cfg).Timeouts != custom {
 			t.Error("mergeNilSubConfigs overwrote a non-nil sub-config")
+		}
+	})
+}
+
+// ----------------------------------------------------------------------------
+// reconcileDefaults — backward-compatibility sync from Middleware to Defaults
+// ----------------------------------------------------------------------------
+
+func TestReconcileDefaults(t *testing.T) {
+	def := DefaultConfig()
+
+	t.Run("old API: Middleware modifications synced to Defaults", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Middleware.UserAgent = "old-api/1.0"
+		cfg.Middleware.FollowRedirects = false
+		cfg.Middleware.MaxRedirects = 3
+		cfg.Middleware.Headers["X-Custom"] = "v1"
+
+		reconcileDefaults(cfg)
+
+		if cfg.Defaults.UserAgent != "old-api/1.0" {
+			t.Errorf("Defaults.UserAgent: got %q, want %q", cfg.Defaults.UserAgent, "old-api/1.0")
+		}
+		if cfg.Defaults.FollowRedirects != false {
+			t.Error("Defaults.FollowRedirects should be false")
+		}
+		if cfg.Defaults.MaxRedirects != 3 {
+			t.Errorf("Defaults.MaxRedirects: got %d, want 3", cfg.Defaults.MaxRedirects)
+		}
+		if cfg.Defaults.Headers["X-Custom"] != "v1" {
+			t.Error("Defaults.Headers should include Middleware headers")
+		}
+	})
+
+	t.Run("new API: Defaults modifications preserved", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Defaults.UserAgent = "new-api/2.0"
+		cfg.Defaults.FollowRedirects = false
+		cfg.Defaults.MaxRedirects = 5
+
+		reconcileDefaults(cfg)
+
+		if cfg.Defaults.UserAgent != "new-api/2.0" {
+			t.Errorf("Defaults.UserAgent: got %q, want %q", cfg.Defaults.UserAgent, "new-api/2.0")
+		}
+		if cfg.Defaults.FollowRedirects != false {
+			t.Error("Defaults.FollowRedirects should be false")
+		}
+		if cfg.Defaults.MaxRedirects != 5 {
+			t.Errorf("Defaults.MaxRedirects: got %d, want 5", cfg.Defaults.MaxRedirects)
+		}
+	})
+
+	t.Run("Middleware wins when both modified", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Middleware.UserAgent = "from-mw"
+		cfg.Defaults.UserAgent = "from-def"
+
+		reconcileDefaults(cfg)
+
+		if cfg.Defaults.UserAgent != "from-mw" {
+			t.Errorf("Middleware should win: got %q, want %q", cfg.Defaults.UserAgent, "from-mw")
+		}
+	})
+
+	t.Run("no modification: both stay at defaults", func(t *testing.T) {
+		cfg := DefaultConfig()
+		reconcileDefaults(cfg)
+
+		if cfg.Defaults.UserAgent != def.Defaults.UserAgent {
+			t.Errorf("Defaults.UserAgent: got %q, want %q", cfg.Defaults.UserAgent, def.Defaults.UserAgent)
+		}
+		if cfg.Defaults.FollowRedirects != def.Defaults.FollowRedirects {
+			t.Error("Defaults.FollowRedirects should match default")
+		}
+		if cfg.Defaults.MaxRedirects != def.Defaults.MaxRedirects {
+			t.Errorf("Defaults.MaxRedirects: got %d, want %d", cfg.Defaults.MaxRedirects, def.Defaults.MaxRedirects)
+		}
+	})
+
+	t.Run("headers merged from Middleware into Defaults", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.Defaults.Headers["X-Defaults"] = "keep"
+		cfg.Middleware.Headers["X-MW"] = "merge"
+
+		reconcileDefaults(cfg)
+
+		if cfg.Defaults.Headers["X-Defaults"] != "keep" {
+			t.Error("existing Defaults header should be preserved")
+		}
+		if cfg.Defaults.Headers["X-MW"] != "merge" {
+			t.Error("Middleware header should be merged into Defaults")
 		}
 	})
 }
