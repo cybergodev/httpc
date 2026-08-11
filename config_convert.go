@@ -70,7 +70,7 @@ func calculateMaxRetryDelay(cfg *Config) time.Duration {
 func calculateMaxRetries(cfg *Config) int {
 	maxRetries := cfg.Retry.MaxRetries
 
-	if len(cfg.Connection.ProxyRotateOnStatus) > 0 && len(cfg.Connection.ProxyPool) > 1 {
+	if (len(cfg.Connection.ProxyRotateOnStatus) > 0 || cfg.Connection.ProxyRotatePerRequest) && len(cfg.Connection.ProxyPool) > 1 {
 		needed := len(cfg.Connection.ProxyPool) - 1 // retries beyond the initial attempt
 		if needed > maxRetries {
 			if needed > maxRetryAttempts {
@@ -115,6 +115,7 @@ func convertToEngineConfig(cfg *Config) (*engine.Config, error) {
 		ProxyPoolStrategy:      cfg.Connection.ProxyPoolStrategy,
 		ProxyFailureThreshold:  cfg.Connection.ProxyFailureThreshold,
 		ProxyCooldown:          cfg.Connection.ProxyCooldown,
+		ProxyRotatePerRequest:  cfg.Connection.ProxyRotatePerRequest,
 		EnableHTTP2:            cfg.Connection.EnableHTTP2,
 		CookieJar:              cookieJar,
 		EnableCookies:          cfg.Connection.EnableCookies,

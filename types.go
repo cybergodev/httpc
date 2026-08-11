@@ -120,6 +120,19 @@ type ConnectionConfig struct {
 	// before being retried (half-open probe). Zero defaults to 30s.
 	ProxyCooldown time.Duration
 
+	// ProxyRotatePerRequest ensures each independent request (e.g., each
+	// Get/Post call) uses a different proxy from the pool. Without this,
+	// HTTP connection reuse causes consecutive requests to the same host to
+	// reuse the previous request's proxy tunnel, bypassing Proxy() selection.
+	//
+	// When enabled, idle connections are closed at the start of each request
+	// so the transport re-evaluates the proxy pool. This adds a small
+	// overhead (no connection reuse) but guarantees per-request rotation.
+	//
+	// Requires ProxyPool to be set. Has no effect with ProxyURL or when no
+	// proxy pool is configured. Default: false.
+	ProxyRotatePerRequest bool
+
 	// ProxyRotateOnStatus specifies HTTP status codes that trigger a retry with
 	// a different proxy. When a response returns one of these codes and
 	// Retry.MaxRetries > 0, the request is retried; under round-robin or random

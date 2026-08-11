@@ -28,6 +28,18 @@ import (
 // this condition with errors.Is(err, connection.ErrPoolExhausted).
 var ErrPoolExhausted = fmt.Errorf("connection pool exhausted")
 
+// ErrProxyConnectionFailed wraps errors that occur while connecting to a
+// proxy server (dial failure, invalid address, refused connection, etc.).
+// The retry engine checks for this sentinel when proxy rotation is active
+// to decide whether to retry with the next proxy in the pool.
+var ErrProxyConnectionFailed = errors.New("proxy connection failed")
+
+// httpcDebug caches the HTTPC_DEBUG environment-variable check to avoid a
+// syscall per proxy selection. Evaluated once at first use via sync.OnceValue.
+var httpcDebug = sync.OnceValue(func() bool {
+	return os.Getenv("HTTPC_DEBUG") != ""
+})
+
 // hostConnMaxAge is the maximum age for a hostStats entry before it is
 // eligible for eviction. Stale entries (no recent connections) are removed
 // during periodic cleanup to prevent unbounded map growth.
@@ -262,13 +274,13 @@ func NewPoolManager(config *Config) (*PoolManager, error) {
 		transport.Proxy = func(req *http.Request) (*url.URL, error) {
 			if attempt, ok := ProxyAttemptFromContext(req.Context()); ok {
 				u := pool.SelectIndex(attempt)
-				if os.Getenv("HTTPC_DEBUG") != "" {
+				if httpcDebug() {
 					fmt.Fprintf(os.Stderr, "[httpc] proxy SelectIndex(%d) → %s\n", attempt, u.Host)
 				}
 				return u, nil
 			}
 			u, err := pool.Select(req)
-			if os.Getenv("HTTPC_DEBUG") != "" && err == nil {
+			if httpcDebug() && err == nil {
 				fmt.Fprintf(os.Stderr, "[httpc] proxy Select(round-robin) → %s\n", u.Host)
 			}
 			return u, err
@@ -346,7 +358,7 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 				if pm.config.MaxTotalConns > 0 {
 					atomic.AddInt64(&pm.totalConns, -1)
 				}
-				return nil, fmt.Errorf("proxy connection failed: %w", err)
+				return nil, fmt.Errorf("%w: %w", ErrProxyConnectionFailed, err)
 			}
 
 			if pm.proxyPool != nil {

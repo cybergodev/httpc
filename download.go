@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -107,16 +108,6 @@ type DownloadResult struct {
 	RequestHeaders http.Header
 }
 
-// doPackageDownload is a helper for package-level download functions.
-// It obtains the default client and delegates to the provided function.
-func doPackageDownload(fn func(Client) (*DownloadResult, error)) (*DownloadResult, error) {
-	client, err := getDefaultClient()
-	if err != nil {
-		return nil, err
-	}
-	return fn(client)
-}
-
 // Download downloads a file from url to the path specified in cfg, using the
 // default client with the given context and request options.
 //
@@ -132,9 +123,11 @@ func Download(ctx context.Context, url string, cfg *DownloadConfig, options ...R
 	if cfg == nil {
 		return nil, fmt.Errorf("download config cannot be nil")
 	}
-	return doPackageDownload(func(c Client) (*DownloadResult, error) {
-		return c.Download(ctx, url, cfg, options...)
-	})
+	client, err := getDefaultClient()
+	if err != nil {
+		return nil, err
+	}
+	return client.Download(ctx, url, cfg, options...)
 }
 
 // Download downloads a file from url to the path specified in cfg, using the
@@ -170,9 +163,7 @@ func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *Downloa
 	}
 
 	// Use streaming mode to avoid buffering the entire response body into memory.
-	streamOptions := make([]RequestOption, len(options), len(options)+1)
-	copy(streamOptions, options)
-	streamOptions = append(streamOptions, WithStreamBody(true))
+	streamOptions := append(slices.Clone(options), WithStreamBody(true))
 
 	rawResp, err := c.executeRequest(ctx, "GET", url, streamOptions)
 	if err != nil {

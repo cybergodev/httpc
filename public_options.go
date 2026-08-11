@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -147,6 +148,10 @@ func WithQueryMap(params map[string]any) RequestOption {
 // FormatFloat) would incur. The value is formatted again later during encoding,
 // so computing the length this way removes a redundant per-WithQuery allocation.
 // The returned length is identical to len(FormatQueryParam(v)) for all inputs.
+//
+// MAINTENANCE: This type switch mirrors engine.FormatQueryParam (request.go)
+// and engine.writeQueryParamValue (pools.go). If a new type is added to one,
+// add it to all three so validation and encoding stay consistent.
 func queryValueLength(v any) int {
 	switch val := v.(type) {
 	case nil:
@@ -308,10 +313,22 @@ var formBuilderPool = sync.Pool{
 // Uses a pooled strings.Builder to avoid the intermediate url.Values map allocation.
 // Writes escaped keys/values straight into the builder via AppendQueryEscape,
 // avoiding the intermediate string allocations that QueryEscape would incur.
+//
+// Keys are sorted alphabetically before encoding, producing deterministic output
+// for the same input — matching url.Values.Encode() semantics. This ensures
+// consistent wire format across calls, which is important for test determinism,
+// request signing/HMAC, and caching.
 func encodeFormFields(data map[string]string) string {
 	if len(data) == 0 {
 		return ""
 	}
+	// Sort keys for deterministic encoding (matches url.Values.Encode behavior).
+	keys := make([]string, 0, len(data))
+	for k := range data {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+
 	sb, ok := formBuilderPool.Get().(*strings.Builder)
 	if !ok || sb == nil {
 		sb = &strings.Builder{}
@@ -319,15 +336,13 @@ func encodeFormFields(data map[string]string) string {
 	sb.Reset()
 	sb.Grow(len(data) * 32)
 
-	first := true
-	for k, v := range data {
-		if !first {
+	for i, k := range keys {
+		if i > 0 {
 			sb.WriteByte('&')
 		}
-		first = false
 		engine.AppendQueryEscape(sb, k)
 		sb.WriteByte('=')
-		engine.AppendQueryEscape(sb, v)
+		engine.AppendQueryEscape(sb, data[k])
 	}
 
 	result := sb.String()
@@ -496,16 +511,23 @@ func validateFormField(key, value string) error {
 
 // validateFormInput validates all fields in form input data.
 // Handles both map[string]string and url.Values to ensure consistent
-// validation regardless of the input type used.
+// validation regardless of the input type used. Rejects nil inputs so that
+// validation (not encoding) is the single gatekeeper for invalid data.
 func validateFormInput(data any) error {
 	switch v := data.(type) {
 	case map[string]string:
+		if v == nil {
+			return fmt.Errorf("form data cannot be nil")
+		}
 		for k, val := range v {
 			if err := validateFormField(k, val); err != nil {
 				return err
 			}
 		}
 	case url.Values:
+		if v == nil {
+			return fmt.Errorf("form data cannot be nil")
+		}
 		for k, vals := range v {
 			// Validate the key once (covers the case of a key with no values,
 			// which the per-value loop below would skip).

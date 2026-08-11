@@ -15,8 +15,8 @@ func main() {
 	// Example 1: Automatic gzip decompression
 	demonstrateGzipDecompression()
 
-	// Example 2: Gzip from another server
-	demonstrateGzipFromServer()
+	// Example 2: Automatic deflate decompression
+	demonstrateDeflateDecompression()
 
 	// Example 3: Without compression
 	demonstrateNoCompression()
@@ -50,15 +50,15 @@ func demonstrateGzipDecompression() {
 	fmt.Printf("   Body preview: %.200s...\n\n", body)
 }
 
-// demonstrateGzipFromServer shows gzip decompression from another server
-func demonstrateGzipFromServer() {
-	fmt.Println("2. Testing with another gzip endpoint:")
+// demonstrateDeflateDecompression shows automatic deflate decompression
+func demonstrateDeflateDecompression() {
+	fmt.Println("2. Automatic deflate decompression:")
 	headers := map[string]string{
 		"Accept-Encoding": "gzip, deflate",
 		"User-Agent":      "httpc-example/1.0",
 	}
 
-	resp, err := httpc.Get("https://www.github.com", httpc.WithHeaderMap(headers))
+	resp, err := httpc.Get("https://httpbin.org/deflate", httpc.WithHeaderMap(headers))
 	if err != nil {
 		log.Printf("Request failed: %v\n", err)
 		return
@@ -68,7 +68,7 @@ func demonstrateGzipFromServer() {
 	fmt.Printf("   Content-Encoding: %s\n", resp.Response.Headers.Get("Content-Encoding"))
 	body := resp.Body()
 	fmt.Printf("   Decompressed body length: %d bytes\n", len(body))
-	fmt.Printf("   Body preview: \n%.200s...\n\n", body)
+	fmt.Printf("   Body preview: %.200s...\n\n", body)
 }
 
 // demonstrateNoCompression shows response without compression

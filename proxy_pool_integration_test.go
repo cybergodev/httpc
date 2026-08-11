@@ -88,6 +88,208 @@ func TestProxyPool_EndToEndRotation(t *testing.T) {
 	}
 }
 
+// TestProxyPool_RotatePerRequest_NoRetries verifies that ProxyRotatePerRequest
+// ensures each independent request uses a different proxy even when retries are
+// disabled (MaxRetries=0, the fast path). Without ProxyRotatePerRequest the fast
+// path skips all proxy rotation wiring.
+func TestProxyPool_RotatePerRequest_NoRetries(t *testing.T) {
+	// Target echoes which proxy forwarded the request.
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(r.Header.Get("X-Proxy-ID")))
+	}))
+	defer target.Close()
+
+	ids := []string{"proxy-A", "proxy-B", "proxy-C"}
+	proxyURLs := make([]string, len(ids))
+	for i, id := range ids {
+		p := forwardProxy(id)
+		defer p.Close()
+		proxyURLs[i] = p.URL
+	}
+
+	cfg := DefaultConfig()
+	cfg.Connection.ProxyPool = proxyURLs
+	cfg.Connection.ProxyRotatePerRequest = true
+	cfg.Retry.MaxRetries = 0 // fast path — previously had no rotation wiring
+	cfg.Security.AllowPrivateIPs = true
+	cfg.Timeouts.Request = 5 * time.Second
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer client.Close()
+
+	seen := make(map[string]int)
+	for i := 0; i < 3; i++ {
+		result, err := client.Get(target.URL)
+		if err != nil {
+			t.Fatalf("Request %d failed: %v", i, err)
+		}
+		body := strings.TrimSpace(result.Body())
+		seen[body]++
+		t.Logf("Request %d: proxy=%s, status=%d", i, body, result.StatusCode())
+	}
+
+	if len(seen) != 3 {
+		t.Errorf("expected 3 distinct proxies with ProxyRotatePerRequest, got %d: %v", len(seen), seen)
+	}
+}
+
+// TestProxyPool_RotatePerRequest_HTTPS verifies per-request rotation through
+// HTTPS CONNECT tunnels with ProxyRotatePerRequest. Connection reuse between
+// requests is prevented by CloseIdleConnections, guaranteeing each request
+// opens a fresh tunnel through a different proxy.
+func TestProxyPool_RotatePerRequest_HTTPS(t *testing.T) {
+	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(r.RemoteAddr))
+	}))
+	defer target.Close()
+
+	targetAddr := strings.TrimPrefix(target.URL, "https://")
+
+	var connectCounts [3]int64
+	proxyURLs := make([]string, 3)
+	for i := range proxyURLs {
+		idx := i
+		proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodConnect {
+				http.Error(w, "only CONNECT supported", http.StatusBadRequest)
+				return
+			}
+			atomic.AddInt64(&connectCounts[idx], 1)
+
+			dst, err := net.Dial("tcp", targetAddr)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+				return
+			}
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				dst.Close()
+				http.Error(w, "hijack not supported", http.StatusInternalServerError)
+				return
+			}
+			clientConn, bufrw, err := hj.Hijack()
+			if err != nil {
+				dst.Close()
+				return
+			}
+			defer clientConn.Close()
+			defer dst.Close()
+
+			bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+			bufrw.Flush()
+
+			go func() {
+				io.Copy(dst, bufrw)
+				dst.Close()
+			}()
+			io.Copy(clientConn, dst)
+		}))
+		defer proxy.Close()
+		proxyURLs[i] = proxy.URL
+	}
+
+	cfg := DefaultConfig()
+	cfg.Connection.ProxyPool = proxyURLs
+	cfg.Connection.ProxyRotatePerRequest = true
+	cfg.Security.AllowPrivateIPs = true
+	cfg.Security.InsecureSkipVerify = true
+	cfg.Timeouts.Request = 5 * time.Second
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer client.Close()
+
+	for i := 0; i < 3; i++ {
+		result, err := client.Get(target.URL)
+		if err != nil {
+			t.Fatalf("Request %d failed: %v", i, err)
+		}
+		t.Logf("Request %d: RemoteAddr=%s, status=%d", i,
+			strings.TrimSpace(result.Body()), result.StatusCode())
+	}
+
+	// Each request should open a new CONNECT tunnel through a distinct proxy.
+	usedCount := 0
+	for i := range connectCounts {
+		if atomic.LoadInt64(&connectCounts[i]) > 0 {
+			usedCount++
+		}
+	}
+	if usedCount != 3 {
+		t.Errorf("expected all 3 CONNECT proxies used exactly once with ProxyRotatePerRequest, "+
+			"but only %d were used (tunnel counts: %v)", usedCount, connectCounts)
+	}
+}
+
+// TestProxyPool_RotatePerRequest_SkipsBadProxy verifies that when
+// ProxyRotatePerRequest is active and the rotation lands on a permanently
+// broken proxy (connection refused), the engine automatically retries with
+// the next healthy proxy instead of returning an error.
+func TestProxyPool_RotatePerRequest_SkipsBadProxy(t *testing.T) {
+	// Target echoes which proxy forwarded the request.
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(r.Header.Get("X-Proxy-ID")))
+	}))
+	defer target.Close()
+
+	// Two healthy proxies + one dead proxy (random unused port).
+	deadProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "should not be reached", http.StatusInternalServerError)
+	}))
+	deadProxy.Close() // close immediately so connections are refused
+
+	proxyA := forwardProxy("proxy-A")
+	defer proxyA.Close()
+	proxyB := forwardProxy("proxy-B")
+	defer proxyB.Close()
+
+	// Put the dead proxy FIRST so the first attempt always hits it.
+	cfg := DefaultConfig()
+	cfg.Connection.ProxyPool = []string{deadProxy.URL, proxyA.URL, proxyB.URL}
+	cfg.Connection.ProxyRotatePerRequest = true
+	cfg.Security.AllowPrivateIPs = true
+	cfg.Retry.MaxRetries = 3
+	cfg.Retry.Delay = 10 * time.Millisecond
+	cfg.Timeouts.Request = 10 * time.Second
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer client.Close()
+
+	// Make enough requests that the round-robin rotation wraps around to
+	// the dead proxy at least once. With 3 proxies, every 3rd request's
+	// first attempt hits index 0 (the dead proxy).
+	skippedCount := 0
+	for i := 0; i < 6; i++ {
+		result, err := client.Get(target.URL)
+		if err != nil {
+			t.Fatalf("Request %d failed (should have skipped dead proxy): %v", i, err)
+		}
+		body := strings.TrimSpace(result.Body())
+		t.Logf("Request %d: proxy=%s, status=%d, attempts=%d",
+			i, body, result.StatusCode(), result.Meta.Attempts)
+
+		if result.StatusCode() != 200 {
+			t.Errorf("Request %d: expected status 200, got %d", i, result.StatusCode())
+		}
+		if result.Meta.Attempts >= 2 {
+			skippedCount++
+		}
+	}
+
+	// At least one request must have needed a retry (hit the dead proxy).
+	if skippedCount == 0 {
+		t.Error("expected at least one request to skip the dead proxy (attempts >= 2), but none did")
+	}
+}
+
 // TestProxyPool_RotateOn403 verifies that a 403 response triggers a retry
 // through a different proxy (status-based rotation via ProxyRotateOnStatus).
 func TestProxyPool_RotateOn403(t *testing.T) {

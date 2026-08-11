@@ -209,9 +209,17 @@ func (p *responseProcessor) Process(httpResp *http.Response) (*Response, error) 
 		return nil, fmt.Errorf("HTTP response is nil")
 	}
 
-	wasCompressed := httpResp.Header.Get("Content-Encoding") != ""
+	// Direct map lookup with pre-canonicalized key avoids the
+	// textproto.CanonicalMIMEHeaderKey overhead of Header.Get on every
+	// response. The encoding string is passed to readBody so it doesn't
+	// need to repeat this lookup.
+	encoding := ""
+	if vals := httpResp.Header[hdrContentEncoding]; len(vals) > 0 && vals[0] != "" {
+		encoding = vals[0]
+	}
+	wasCompressed := encoding != ""
 
-	body, err := p.readBody(httpResp)
+	body, err := p.readBody(httpResp, encoding)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
@@ -257,6 +265,8 @@ func (p *responseProcessor) Process(httpResp *http.Response) (*Response, error) 
 
 // readBody reads and optionally decompresses the response body with size limits.
 // Uses buffer and limit reader pools to reduce heap allocations.
+// The encoding parameter (from the Content-Encoding header, read once by the
+// caller) controls decompression — passing it avoids a second Header.Get call.
 //
 // # SECURITY CONTRACT
 //
@@ -264,7 +274,7 @@ func (p *responseProcessor) Process(httpResp *http.Response) (*Response, error) 
 // The returned slice must not be retained by any other reference (pool or shared buffer).
 //
 // SECURITY: Implements protection against decompression bomb attacks.
-func (p *responseProcessor) readBody(httpResp *http.Response) ([]byte, error) {
+func (p *responseProcessor) readBody(httpResp *http.Response, encoding string) ([]byte, error) {
 	if httpResp.Body == nil {
 		return nil, nil
 	}
@@ -275,7 +285,7 @@ func (p *responseProcessor) readBody(httpResp *http.Response) ([]byte, error) {
 	var decompressedLr *pooledLimitReader
 	var decompressor io.ReadCloser // Track decompressor for cleanup
 
-	if encoding := httpResp.Header.Get("Content-Encoding"); encoding != "" {
+	if encoding != "" {
 		isCompressed = true
 		var err error
 		// SECURITY: Limit compressed data size before decompression to prevent zip bombs

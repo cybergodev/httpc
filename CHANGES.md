@@ -4,7 +4,36 @@ All notable changes to the cybergodev/httpc library will be documented in this f
 
 ---
 
-## v2.0.0 - API Unification, Proxy Pool & Performance (2026-08-03)
+## v1.6.2- Per-Request Proxy Rotation, Performance & Bug Fixes (2026-08-12)
+
+### Added
+- `ProxyRotatePerRequest` field on `ConnectionConfig` — each independent request (Get/Post/etc.) uses a different proxy from the pool
+- `ErrProxyConnectionFailed` sentinel error wrapping all proxy dial failures, enabling `errors.Is` detection by the retry engine
+- Retry engine integration: fast path (MaxRetries=0) reserves unique proxy index; slow path force-retries on `ErrProxyConnectionFailed` to auto-skip dead proxies
+- `calculateMaxRetries` raises retry budget for `ProxyRotatePerRequest` so all proxies in the pool are tried
+- New example `examples/22_streaming_bodies.go` — zero-buffer streaming upload, `io.Pipe` concurrent generate-and-upload, `LimitReader` protection
+- Example 7 in `examples/13_proxy_configuration.go` demonstrating `ProxyRotatePerRequest`
+- `internal/connection/pool_coverage_test.go` — comprehensive pool.go path coverage (connection package coverage to 90.4%)
+
+### Fixed
+- Proxy env-var caching bug: `detectFromEnvironment` now reads env vars directly instead of `http.ProxyFromEnvironment` (cached process-wide via `sync.Once`), fixing 6 test failures and stale proxy detection
+- `validateFormInput` now rejects nil `map[string]string` and nil `url.Values` at validation time (previously passed silently, caught later in `convertToForm`)
+
+### Changed
+- `encodeFormFields` now sorts keys alphabetically before encoding, producing deterministic output matching `url.Values.Encode()` semantics
+- Proxy dial error wrapping changed to include `ErrProxyConnectionFailed` sentinel (same user-facing message, adds `errors.Is` support)
+- `internal/proxy/proxy_test.go` rewritten as comprehensive table-driven tests (7 suites, 60+ subtests)
+- `download.go` inlined `doPackageDownload` (single-call-site wrapper eliminated) and simplified `streamOptions` construction
+
+### Performance
+- Cached `HTTPC_DEBUG` env-var check via `sync.OnceValue`, eliminating per-retry/per-proxy `os.Getenv` syscalls on 4 hot-path call sites
+- `httpRequestPool` (`sync.Pool` for `*http.Request`) eliminates 1 heap allocation (~400B) per request
+- `Content-Encoding` header read via pre-canonicalized key with direct map lookup, replacing `Header.Get` + `textproto.CanonicalMIMEHeaderKey` on every response
+- `examples/15_middleware.go`: reduced metrics middleware demo from 5× `/delay/1` (5s+) to 3× `/get` for faster example execution
+
+---
+
+## v1.6.1 - API Unification, Proxy Pool & Performance (2026-08-03)
 
 ### Breaking
 - Config sub-configs changed from pointer types (`*TimeoutConfig`) to value types (`TimeoutConfig`); `DefaultConfig()` returns `Config` (value) not `*Config`

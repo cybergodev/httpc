@@ -23,6 +23,7 @@ A fast, secure HTTP client library for Go with sensible defaults, minimal depend
 - [Response Handling](#response-handling)
 - [Context & Cancellation](#context--cancellation)
 - [File Download](#file-download)
+- [Streaming Bodies](#streaming-bodies)
 - [Domain Client (Session Management)](#domain-client-session-management)
 - [Session Manager](#session-manager)
 - [Configuration](#configuration)
@@ -49,6 +50,7 @@ A fast, secure HTTP client library for Go with sensible defaults, minimal depend
 | **Minimal Dependencies** | 1 dependency (golang.org/x/sys), pure Go stdlib |
 | **Cookie Management** | Full cookie jar support with security validation |
 | **File Operations** | Secure file download with progress tracking and resume support |
+| **Streaming** | `io.Reader` request bodies, zero-copy `io.Pipe` uploads, disk-streaming downloads |
 
 ---
 
@@ -242,11 +244,14 @@ httpc.WithFile("file", "document.pdf", fileBytes)
 httpc.WithBody([]byte("raw data"))
 httpc.WithBody(data, httpc.BodyJSON) // explicit BodyKind
 
+// io.Reader body (streamed upload; set Content-Type explicitly)
+httpc.WithBody(fileReader)
+
 // BodyKind constants: BodyAuto, BodyJSON, BodyXML, BodyForm, BodyBinary, BodyMultipart
 
 httpc.WithBinary(binaryData, "application/pdf")
 
-// Stream body (for large request bodies)
+// Stream response body (effective only with Download; see Streaming Bodies)
 httpc.WithStreamBody(true)
 ```
 
@@ -521,6 +526,63 @@ result, _ := httpc.Download(ctx, url, opts,
 
 ---
 
+## Streaming Bodies
+
+For large payloads, HTTPC avoids buffering entire bodies in memory.
+
+### Streaming Request Body (Upload)
+
+`WithBody` accepts `io.Reader` directly. Content-Type is **not** auto-detected
+for readers, so set it explicitly:
+
+```go
+// Stream from a file or any io.Reader
+result, err := httpc.Post("https://example.com/upload",
+    httpc.WithBody(file),
+    httpc.WithHeader("Content-Type", "application/octet-stream"),
+)
+```
+
+Zero-copy streaming with `io.Pipe` — the producer goroutine writes while the
+HTTP transport consumes concurrently:
+
+```go
+pr, pw := io.Pipe()
+go func() {
+    defer pw.Close()
+    // Write chunks to pw ...
+}()
+
+result, err := httpc.Post("https://example.com/upload",
+    httpc.WithBody(pr),
+    httpc.WithHeader("Content-Type", "application/octet-stream"),
+)
+```
+
+> **Security:** `WithBody(io.Reader)` **bypasses request-body-size validation**.
+> Wrap untrusted readers with `io.LimitReader` to enforce a cap:
+> ```go
+> httpc.WithBody(io.LimitReader(reader, 10<<20)) // 10 MB cap
+> ```
+
+### Streaming Response Body (Download)
+
+`Download()` streams the response body directly to disk — it never buffers the
+full body. `WithStreamBody(true)` is applied automatically:
+
+```go
+result, _ := httpc.Download(ctx,
+    "https://example.com/large.zip",
+    &httpc.DownloadConfig{FilePath: "downloads/large.zip"},
+)
+```
+
+> **Note:** Regular `Get` / `Post` / etc. **always buffer the full response body**
+> into memory. `WithStreamBody` has no effect on these methods — use `Download`
+> for large responses. See [File Download](#file-download) for details.
+
+---
+
 ## Domain Client (Session Management)
 
 For multiple requests to the same domain with automatic cookie and header management:
@@ -746,6 +808,7 @@ fmt.Println(config.String())
 | `Connection.ProxyFailureThreshold` | `int` | `3` | Consecutive connection failures before circuit-breaking a proxy |
 | `Connection.ProxyCooldown` | `time.Duration` | `30s` | How long a circuit-broken proxy stays out of rotation |
 | `Connection.ProxyRotateOnStatus` | `[]int` | `nil` | HTTP status codes that trigger proxy rotation (e.g., `[]int{403}`) |
+| `Connection.ProxyRotatePerRequest` | `bool` | `false` | Close idle connections before each request so the transport re-evaluates the proxy pool, guaranteeing per-request rotation (adds overhead: no connection reuse). Requires ProxyPool; no effect with ProxyURL |
 | `Connection.EnableHTTP2` | `bool` | `true` | Enable HTTP/2 |
 | `Connection.EnableCookies` | `bool` | `false` | Enable cookie jar |
 | `Connection.EnableDoH` | `bool` | `false` | Enable DNS-over-HTTPS |
@@ -923,6 +986,22 @@ config.Connection.ProxyCooldown = 60 * time.Second
 config.Connection.ProxyRotateOnStatus = []int{403}
 config.Retry.MaxRetries = 3
 ```
+
+### Per-Request Proxy Rotation
+
+By default, HTTP connection reuse causes consecutive requests to the same host
+to reuse the previous proxy tunnel, bypassing pool selection. Enable
+`ProxyRotatePerRequest` to guarantee each independent `Get`/`Post` call routes
+through a different proxy:
+
+```go
+config.Connection.ProxyRotatePerRequest = true
+```
+
+This closes idle connections at the start of each request so the transport
+re-evaluates the proxy pool. It adds a small overhead (no connection reuse) but
+is essential for scraping or fingerprint-rotation use cases. Requires
+`ProxyPool`; has no effect with `ProxyURL`.
 
 **Priority:** `ProxyURL` > `ProxyPool` > `EnableSystemProxy` > direct.
 
@@ -1240,12 +1319,12 @@ func (m *MockClient) Get(url string, options ...httpc.RequestOption) (*httpc.Res
 
 ### Example Code
 
-21 runnable examples covering all features, ordered from basic to advanced.
+22 runnable examples covering all features, ordered from basic to advanced.
 Each example is a standalone `package main` guarded by a `//go:build examples`
 tag (so it stays out of the normal build), so run them one at a time:
 
 ```bash
-go run examples/01_basic_usage.go
+go run -tags examples examples/01_basic_usage.go
 ```
 
 > Examples that call live endpoints (`httpbin.org`, `example.com`) require
@@ -1259,6 +1338,7 @@ go run examples/01_basic_usage.go
 | **Stateful Clients** | [11_session](examples/11_session.go), [12_domain_client](examples/12_domain_client.go), [13_proxy_configuration](examples/13_proxy_configuration.go), [14_doh](examples/14_doh.go) |
 | **Advanced** | [15_middleware](examples/15_middleware.go), [16_concurrent_requests](examples/16_concurrent_requests.go), [17_file_operations](examples/17_file_operations.go), [18_rest_api_client](examples/18_rest_api_client.go), [19_advanced_patterns](examples/19_advanced_patterns.go) |
 | **Security** | [20_certificate_pinning](examples/20_certificate_pinning.go), [21_ssrf_protection](examples/21_ssrf_protection.go) |
+| **Streaming** | [22_streaming_bodies](examples/22_streaming_bodies.go) |
 
 ---
 

@@ -31,6 +31,9 @@ func main() {
 	// Example 6: Status-based proxy rotation (CF/WAF evasion)
 	demonstrateStatusRotation()
 
+	// Example 7: Per-request proxy rotation
+	demonstratePerRequestRotation()
+
 	// Summary
 	printSummary()
 
@@ -249,6 +252,35 @@ func demonstrateStatusRotation() {
 	fmt.Println("Requires Retry.MaxRetries > 0 to take effect.\n ")
 }
 
+// demonstratePerRequestRotation shows how to ensure each independent request
+// uses a different proxy from the pool, even without status-based rotation.
+func demonstratePerRequestRotation() {
+	fmt.Println("--- Example 7: Per-Request Proxy Rotation ---")
+
+	config := httpc.DefaultConfig()
+	config.Connection.ProxyPool = []string{
+		"http://127.0.0.1:7890",
+		"http://127.0.0.1:7891",
+		"http://127.0.0.1:7892",
+	}
+	// ProxyRotatePerRequest closes idle connections at the start of each
+	// request so the transport re-evaluates the proxy pool, guaranteeing
+	// each Get/Post call routes through a different proxy.
+	config.Connection.ProxyRotatePerRequest = true
+	config.Timeouts.Request = 10 * time.Second
+
+	client, err := httpc.New(config)
+	if err != nil {
+		log.Printf("Failed to create client: %v\n", err)
+		return
+	}
+	defer client.Close()
+
+	fmt.Println("ProxyRotatePerRequest: true")
+	fmt.Println("Each client.Get() call uses a different proxy IP.")
+	fmt.Println("Idle connections are closed between requests (no reuse).\n ")
+}
+
 // printSummary shows configuration summary and common use cases
 func printSummary() {
 	fmt.Println("=== Configuration Priority ===")
@@ -268,6 +300,7 @@ func printSummary() {
 	fmt.Println("Corporate network           | ProxyURL: \"http://proxy.company.com:8080\"")
 	fmt.Println("VPN software (Clash/V2Ray)  | ProxyURL: \"http://127.0.0.1:7890\"")
 	fmt.Println("Proxy pool / scraping       | ProxyPool: [\"http://p1:8080\", \"http://p2:8080\"]")
+	fmt.Println("Per-request rotation        | ProxyPool + ProxyRotatePerRequest: true")
 	fmt.Println("CF/WAF evasion              | ProxyPool + ProxyRotateOnStatus: [403]")
 	fmt.Println("System proxy (Windows/Mac)  | EnableSystemProxy: true")
 	fmt.Println("Development (no proxy)      | Default (no configuration needed)")

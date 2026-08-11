@@ -433,6 +433,23 @@ resp, err := client.Get(url,
 )
 ```
 
+### Multiple Cookies (Batch)
+
+Use `WithCookies` to add several cookies in a single option — more efficient
+than chaining `WithCookie` calls, as it pre-allocates and validates in one pass:
+
+```go
+cookies := []http.Cookie{
+    {Name: "session_id", Value: "abc123"},
+    {Name: "user_pref", Value: "dark_mode"},
+    {Name: "lang", Value: "en"},
+}
+
+resp, err := client.Get(url,
+    httpc.WithCookies(cookies),
+)
+```
+
 ### Cookie Map
 
 Convenient way to set multiple simple cookies from a map:

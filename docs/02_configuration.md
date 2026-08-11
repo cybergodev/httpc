@@ -418,11 +418,12 @@ client, err := httpc.New(config)
 | `Connection.MaxConnsPerHost`       | `int`           | 10      | Max connections per host                     |
 | `Connection.ProxyURL`              | `string`        | ""      | Proxy server URL                             |
 | `Connection.EnableSystemProxy`     | `bool`          | false   | Use system proxy settings                    |
-| `Connection.ProxyPool`             | `[]string`      | nil     | Proxy server URLs for rotation (lower priority than ProxyURL) |
+| `Connection.ProxyPool`             | `[]string`      | nil     | Proxy server URLs for rotation (priority: lower than ProxyURL, higher than EnableSystemProxy) |
 | `Connection.ProxyPoolStrategy`     | `ProxyStrategy` | RoundRobin | Strategy for selecting proxies from pool |
 | `Connection.ProxyFailureThreshold` | `int`           | 0 (defaults to 3) | Consecutive connection failures before circuit-breaking a proxy |
 | `Connection.ProxyCooldown`         | `time.Duration` | 0 (defaults to 30s) | How long a circuit-broken proxy stays out of rotation |
 | `Connection.ProxyRotateOnStatus`   | `[]int`         | nil     | HTTP status codes that trigger proxy rotation |
+| `Connection.ProxyRotatePerRequest` | `bool`          | false   | Close idle connections before each request so the transport re-evaluates the proxy pool, guaranteeing per-request rotation (adds overhead: no connection reuse). Requires ProxyPool; no effect with ProxyURL |
 | `Connection.EnableHTTP2`           | `bool`          | true    | Enable HTTP/2                                |
 | `Connection.EnableCookies`         | `bool`          | false   | Enable automatic cookie jar                  |
 | `Connection.EnableDoH`             | `bool`          | false   | Enable DNS-over-HTTPS resolution             |

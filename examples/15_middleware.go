@@ -145,8 +145,8 @@ func demonstrateMetricsMiddleware() {
 	defer client.Close()
 
 	// Make multiple requests
-	for i := 1; i <= 5; i++ {
-		_, err := client.Get("https://httpbin.org/delay/1")
+	for i := 1; i <= 3; i++ {
+		_, err := client.Get("https://httpbin.org/get")
 		if err != nil {
 			_ = err // error details captured by metrics middleware above
 		}
