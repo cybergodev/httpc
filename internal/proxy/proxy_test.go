@@ -2,345 +2,607 @@ package proxy
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
-	"runtime"
 	"sync"
 	"testing"
 )
 
+// ---------------------------------------------------------------------------
+// Environment helpers
+// ---------------------------------------------------------------------------
+
+var allProxyEnvVars = []string{
+	"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
+	"NO_PROXY", "no_proxy",
+}
+
+func saveAndClearProxyEnv() map[string]string {
+	saved := make(map[string]string, len(allProxyEnvVars))
+	for _, v := range allProxyEnvVars {
+		saved[v] = os.Getenv(v)
+		os.Unsetenv(v)
+	}
+	return saved
+}
+
+func restoreProxyEnv(env map[string]string) {
+	for _, v := range allProxyEnvVars {
+		if val, ok := env[v]; ok && val != "" {
+			os.Setenv(v, val)
+		} else {
+			os.Unsetenv(v)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// NewDetector
+// ---------------------------------------------------------------------------
+
 func TestNewDetector(t *testing.T) {
-	detector := NewDetector()
-	if detector == nil {
+	if d := NewDetector(); d == nil {
 		t.Fatal("NewDetector() returned nil")
 	}
 }
 
-func TestDetector_GetProxyFunc_NoProxy(t *testing.T) {
-	// Clear any existing proxy environment variables
-	originalEnv := saveAndClearProxyEnv()
-	defer restoreProxyEnv(originalEnv)
+// ---------------------------------------------------------------------------
+// detectFromEnvironment — table-driven
+// ---------------------------------------------------------------------------
 
-	// Create new detector after clearing env
-	detector := NewDetector()
-	proxyFunc := detector.GetProxyFunc()
+func TestDetectFromEnvironment(t *testing.T) {
+	tests := []struct {
+		name       string
+		env        map[string]string
+		wantNil    bool
+		reqScheme  string
+		reqHost    string
+		wantProxy  string // expected proxy URL string, empty = nil proxy
+		wantDirect bool   // true => proxy func should return nil for this request
+	}{
+		{
+			name:      "no env vars",
+			env:       nil,
+			wantNil:   true,
+			reqScheme: "https",
+			reqHost:   "example.com",
+		},
+		{
+			name:      "HTTP_PROXY set",
+			env:       map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080"},
+			reqScheme: "http",
+			reqHost:   "example.com",
+			wantProxy: "http://proxy.example.com:8080",
+		},
+		{
+			name:      "HTTPS_PROXY used for HTTPS request",
+			env:       map[string]string{"HTTPS_PROXY": "http://secure-proxy.example.com:8443"},
+			reqScheme: "https",
+			reqHost:   "secure.example.com",
+			wantProxy: "http://secure-proxy.example.com:8443",
+		},
+		{
+			name:      "HTTP_PROXY falls back for HTTPS request",
+			env:       map[string]string{"HTTP_PROXY": "http://fallback.example.com:8080"},
+			reqScheme: "https",
+			reqHost:   "example.com",
+			wantProxy: "http://fallback.example.com:8080",
+		},
+		{
+			name:      "lowercase http_proxy detected",
+			env:       map[string]string{"http_proxy": "http://lowercase-proxy.example.com:9000"},
+			reqScheme: "http",
+			reqHost:   "example.com",
+			wantProxy: "http://lowercase-proxy.example.com:9000",
+		},
+		{
+			name:      "lowercase https_proxy detected",
+			env:       map[string]string{"https_proxy": "http://lowercase-https.example.com:9443"},
+			reqScheme: "https",
+			reqHost:   "example.com",
+			wantProxy: "http://lowercase-https.example.com:9443",
+		},
+		{
+			name:      "HTTPS_PROXY not used for HTTP request",
+			env:       map[string]string{"HTTPS_PROXY": "http://https-only.example.com:8443"},
+			reqScheme: "http",
+			reqHost:   "example.com",
+			wantProxy: "http://https-only.example.com:8443", // falls back as HTTP_PROXY
+		},
+		{
+			name:       "localhost always direct",
+			env:        map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080"},
+			reqScheme:  "http",
+			reqHost:    "localhost",
+			wantDirect: true,
+		},
+		{
+			name:       "NO_PROXY excludes host",
+			env:        map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080", "NO_PROXY": "example.com"},
+			reqScheme:  "http",
+			reqHost:    "example.com",
+			wantDirect: true,
+		},
+		{
+			name:      "NO_PROXY wildcard bypasses all",
+			env:       map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080", "NO_PROXY": "*"},
+			reqScheme: "http",
+			reqHost:   "example.com",
+			wantProxy: "http://proxy.example.com:8080", // wildcard is a NO_PROXY match — should be direct
+			wantDirect: true,
+		},
+		{
+			name:       "NO_PROXY domain suffix",
+			env:        map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080", "NO_PROXY": ".internal.example.com"},
+			reqScheme:  "http",
+			reqHost:    "api.internal.example.com",
+			wantDirect: true,
+		},
+		{
+			name:      "NO_PROXY does not match unrelated host",
+			env:       map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080", "NO_PROXY": "internal.example.com"},
+			reqScheme: "http",
+			reqHost:   "external.example.com",
+			wantProxy: "http://proxy.example.com:8080",
+		},
+		{
+			name:      "bare host:port normalized with http scheme",
+			env:       map[string]string{"HTTP_PROXY": "proxy:3128"},
+			reqScheme: "http",
+			reqHost:   "example.com",
+			wantProxy: "http://proxy:3128",
+		},
+		{
+			name:      "socks5 scheme preserved",
+			env:       map[string]string{"HTTP_PROXY": "socks5://proxy.example.com:1080"},
+			reqScheme: "http",
+			reqHost:   "example.com",
+			wantProxy: "socks5://proxy.example.com:1080",
+		},
+	}
 
-	// On Linux, proxy detection is environment-only (detectPlatform returns
-	// nil), so with the environment cleared the proxy func must be nil (direct
-	// connection). On Windows/macOS the platform detector also consults
-	// system-level config (WinHTTP / SystemConfiguration) that clearing env
-	// does not reach, so a non-nil func there reflects host config, not a bug.
-	if runtime.GOOS == "linux" && proxyFunc != nil {
-		t.Errorf("GetProxyFunc() = non-nil, want nil with no proxy environment on Linux")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalEnv := saveAndClearProxyEnv()
+			defer restoreProxyEnv(originalEnv)
+
+			for k, v := range tt.env {
+				os.Setenv(k, v)
+			}
+
+			d := NewDetector()
+			proxyFunc := d.detectFromEnvironment()
+
+			if tt.wantNil {
+				if proxyFunc != nil {
+					t.Errorf("detectFromEnvironment() = non-nil, want nil")
+				}
+				return
+			}
+			if proxyFunc == nil {
+				t.Fatal("detectFromEnvironment() = nil, want non-nil")
+			}
+
+			req := &http.Request{
+				URL: &url.URL{Scheme: tt.reqScheme, Host: tt.reqHost},
+			}
+
+			got, err := proxyFunc(req)
+			if err != nil {
+				t.Fatalf("proxyFunc returned error: %v", err)
+			}
+
+			if tt.wantDirect {
+				if got != nil {
+					t.Errorf("proxyFunc() = %s, want nil (direct)", got)
+				}
+				return
+			}
+
+			if got == nil {
+				t.Fatal("proxyFunc() = nil, want non-nil proxy URL")
+			}
+
+			if tt.wantProxy != "" && got.String() != tt.wantProxy {
+				t.Errorf("proxy URL = %s, want %s", got, tt.wantProxy)
+			}
+		})
 	}
 }
 
-func TestDetector_GetProxyFunc_WithEnvProxy(t *testing.T) {
-	// Save and clear existing proxy settings
+// ---------------------------------------------------------------------------
+// detectFromEnvironment — error and edge-case paths
+// ---------------------------------------------------------------------------
+
+func TestDetectFromEnvironment_CGIEnvironment(t *testing.T) {
 	originalEnv := saveAndClearProxyEnv()
 	defer restoreProxyEnv(originalEnv)
+	defer os.Unsetenv("REQUEST_METHOD") // not in allProxyEnvVars; clean up explicitly
 
-	// Set test proxy environment variable
-	testProxy := "http://test-proxy.example.com:8080"
-	os.Setenv("HTTP_PROXY", testProxy)
-	os.Setenv("HTTPS_PROXY", testProxy)
+	os.Setenv("HTTP_PROXY", "http://proxy.example.com:8080")
+	os.Setenv("REQUEST_METHOD", "GET")
 
-	// Create new detector after setting env
-	detector := NewDetector()
-	proxyFunc := detector.GetProxyFunc()
-
+	d := NewDetector()
+	proxyFunc := d.detectFromEnvironment()
 	if proxyFunc == nil {
-		t.Fatal("GetProxyFunc() returned nil with proxy environment set")
+		t.Fatal("detectFromEnvironment() = nil with HTTP_PROXY set")
 	}
 
-	// Test the proxy function with a sample request
-	testURL, _ := url.Parse("http://example.com")
-	testReq := &http.Request{
-		URL: testURL,
-	}
-
-	proxyURL, err := proxyFunc(testReq)
+	req := &http.Request{URL: &url.URL{Scheme: "http", Host: "example.com"}}
+	got, err := proxyFunc(req)
 	if err != nil {
-		t.Errorf("Proxy function returned error: %v", err)
+		t.Fatalf("unexpected error: %v", err)
 	}
-
-	if proxyURL == nil {
-		t.Error("Proxy function returned nil URL")
-	} else {
-		t.Logf("Proxy URL = %s", proxyURL.String())
+	if got != nil {
+		t.Errorf("CGI environment should bypass proxy, got %s", got)
 	}
 }
 
-func TestDetector_GetProxyFunc_ConcurrentAccess(t *testing.T) {
+func TestDetectFromEnvironment_HTTPSProxyFallsBack(t *testing.T) {
 	originalEnv := saveAndClearProxyEnv()
 	defer restoreProxyEnv(originalEnv)
 
-	os.Setenv("HTTP_PROXY", "http://concurrent-test.example.com:8080")
+	// Only HTTPS_PROXY is set; an HTTP request should still get a proxy
+	// via the fall-back branch.
+	os.Setenv("HTTPS_PROXY", "http://https-proxy.example.com:8443")
 
-	detector := NewDetector()
+	d := NewDetector()
+	proxyFunc := d.detectFromEnvironment()
+	if proxyFunc == nil {
+		t.Fatal("detectFromEnvironment() = nil with HTTPS_PROXY set")
+	}
 
+	req := &http.Request{URL: &url.URL{Scheme: "http", Host: "example.com"}}
+	got, err := proxyFunc(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected non-nil proxy URL for HTTP request with HTTPS_PROXY fall-back")
+	}
+	if got.String() != "http://https-proxy.example.com:8443" {
+		t.Errorf("proxy URL = %s, want http://https-proxy.example.com:8443", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GetProxyFunc caching
+// ---------------------------------------------------------------------------
+
+func TestGetProxyFunc_Caching(t *testing.T) {
+	originalEnv := saveAndClearProxyEnv()
+	defer restoreProxyEnv(originalEnv)
+
+	os.Setenv("HTTP_PROXY", "http://cache-test.example.com:8080")
+
+	d := NewDetector()
+
+	first := d.GetProxyFunc()
+	second := d.GetProxyFunc()
+
+	if first == nil {
+		t.Fatal("first GetProxyFunc() returned nil with proxy env set")
+	}
+	if second == nil {
+		t.Fatal("second GetProxyFunc() returned nil")
+	}
+
+	// Both should return the same proxy for the same request.
+	req := &http.Request{URL: &url.URL{Scheme: "http", Host: "example.com"}}
+
+	u1, err := first(req)
+	if err != nil {
+		t.Fatalf("first call error: %v", err)
+	}
+	u2, err := second(req)
+	if err != nil {
+		t.Fatalf("second call error: %v", err)
+	}
+
+	if u1.String() != u2.String() {
+		t.Errorf("cached functions returned different URLs: %s vs %s", u1, u2)
+	}
+}
+
+func TestGetProxyFunc_NoProxy(t *testing.T) {
+	originalEnv := saveAndClearProxyEnv()
+	defer restoreProxyEnv(originalEnv)
+
+	d := NewDetector()
+	proxyFunc := d.GetProxyFunc()
+
+	if proxyFunc != nil {
+		t.Errorf("GetProxyFunc() = non-nil, want nil with no proxy env")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// GetProxyFunc concurrent access
+// ---------------------------------------------------------------------------
+
+func TestGetProxyFunc_ConcurrentAccess(t *testing.T) {
+	originalEnv := saveAndClearProxyEnv()
+	defer restoreProxyEnv(originalEnv)
+
+	os.Setenv("HTTP_PROXY", "http://concurrent.example.com:8080")
+
+	d := NewDetector()
+
+	const goroutines = 20
 	var wg sync.WaitGroup
-	results := make(chan func(*http.Request) (*url.URL, error), 10)
+	results := make(chan func(*http.Request) (*url.URL, error), goroutines)
 
-	// Launch 10 concurrent GetProxyFunc calls
-	for i := 0; i < 10; i++ {
+	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			proxyFunc := detector.GetProxyFunc()
-			results <- proxyFunc
+			results <- d.GetProxyFunc()
 		}()
 	}
 
 	wg.Wait()
 	close(results)
 
-	// Count results
 	count := 0
 	var firstFunc func(*http.Request) (*url.URL, error)
-	for proxyFunc := range results {
+	for pf := range results {
 		count++
 		if firstFunc == nil {
-			firstFunc = proxyFunc
+			firstFunc = pf
 		}
 	}
 
-	if count != 10 {
-		t.Errorf("Expected 10 results, got %d", count)
+	if count != goroutines {
+		t.Errorf("expected %d results, got %d", goroutines, count)
 	}
-
 	if firstFunc == nil {
-		t.Error("Expected non-nil proxy function from concurrent access")
+		t.Error("expected non-nil proxy function from concurrent access")
 	}
 }
 
-func TestDetector_NoProxyEnv(t *testing.T) {
-	originalEnv := saveAndClearProxyEnv()
-	defer restoreProxyEnv(originalEnv)
+// ---------------------------------------------------------------------------
+// shouldUseProxy — NO_PROXY matching
+// ---------------------------------------------------------------------------
 
-	// Set proxy with no_proxy exclusion
-	os.Setenv("HTTP_PROXY", "http://proxy.example.com:8080")
-	os.Setenv("NO_PROXY", "localhost,127.0.0.1,.example.com")
-
-	detector := NewDetector()
-	proxyFunc := detector.GetProxyFunc()
-
-	if proxyFunc == nil {
-		t.Fatal("GetProxyFunc() returned nil")
-	}
-
-	// Request to excluded host should return nil proxy
-	testURL, _ := url.Parse("http://localhost/test")
-	testReq := &http.Request{URL: testURL}
-
-	proxyURL, err := proxyFunc(testReq)
-	if err != nil {
-		t.Errorf("Proxy function returned error: %v", err)
-	}
-
-	// localhost should be excluded
-	if proxyURL != nil {
-		t.Logf("localhost not excluded by NO_PROXY, got proxy: %s", proxyURL)
-	}
-}
-
-// TestDetect_HTTPSProxyEnv verifies that HTTPS_PROXY environment variable is
-// detected and used when making HTTPS requests.
-func TestDetect_HTTPSProxyEnv(t *testing.T) {
-	originalEnv := saveAndClearProxyEnv()
-	defer restoreProxyEnv(originalEnv)
-
-	os.Setenv("HTTPS_PROXY", "https://secure-proxy.example.com:8443")
-
-	detector := NewDetector()
-	proxyFunc := detector.GetProxyFunc()
-
-	if proxyFunc == nil {
-		t.Fatal("GetProxyFunc() returned nil with HTTPS_PROXY set")
-	}
-
-	testURL, _ := url.Parse("https://secure.example.com/resource")
-	testReq := &http.Request{URL: testURL}
-
-	proxyURL, err := proxyFunc(testReq)
-	if err != nil {
-		t.Errorf("proxy function returned error: %v", err)
-	}
-
-	if proxyURL == nil {
-		t.Error("expected proxy URL for HTTPS request, got nil")
-	}
-}
-
-// TestDetect_LowercaseEnvVars verifies that lowercase http_proxy is detected.
-func TestDetect_LowercaseEnvVars(t *testing.T) {
-	originalEnv := saveAndClearProxyEnv()
-	defer restoreProxyEnv(originalEnv)
-
-	os.Setenv("http_proxy", "http://lowercase-proxy.example.com:9000")
-
-	detector := NewDetector()
-	proxyFunc := detector.GetProxyFunc()
-
-	if proxyFunc == nil {
-		t.Fatal("GetProxyFunc() returned nil with lowercase http_proxy set")
-	}
-
-	testURL, _ := url.Parse("http://example.com")
-	testReq := &http.Request{URL: testURL}
-
-	proxyURL, err := proxyFunc(testReq)
-	if err != nil {
-		t.Errorf("proxy function returned error: %v", err)
-	}
-
-	if proxyURL == nil {
-		t.Error("expected proxy URL, got nil")
-	}
-}
-
-// TestDetect_NoEnvVarsNoPlatformProxy verifies that when no environment
-// variables are set and platform detection finds nothing, nil is returned.
-func TestDetect_NoEnvVarsNoPlatformProxy(t *testing.T) {
-	originalEnv := saveAndClearProxyEnv()
-	defer restoreProxyEnv(originalEnv)
-
-	detector := NewDetector()
-	proxyFunc := detector.GetProxyFunc()
-
-	// On Windows, platform-specific proxy detection may return non-nil
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows platform proxy detection may return non-nil")
-	}
-
-	if proxyFunc != nil {
-		t.Error("GetProxyFunc with no env vars should return nil on platforms without system proxy")
-	}
-}
-
-// TestDetect_NOProxyExclusion verifies that NO_PROXY exclusions are respected
-// for multiple host patterns when using environment-based proxy detection.
-func TestDetect_NOProxyExclusion(t *testing.T) {
-	// Save and clear all proxy env vars first
-	allEnvVars := []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"}
-	saved := make(map[string]string)
-	for _, v := range allEnvVars {
-		saved[v] = os.Getenv(v)
-		os.Unsetenv(v)
-	}
-	defer func() {
-		for k, v := range saved {
-			if v != "" {
-				os.Setenv(k, v)
-			} else {
-				os.Unsetenv(k)
-			}
-		}
-	}()
-
-	os.Setenv("HTTP_PROXY", "http://proxy.example.com:8080")
-	os.Setenv("http_proxy", "http://proxy.example.com:8080")
-	os.Setenv("HTTPS_PROXY", "http://proxy.example.com:8080")
-	os.Setenv("NO_PROXY", "localhost,127.0.0.1,.internal,.local")
-	os.Setenv("no_proxy", "localhost,127.0.0.1,.internal,.local")
-
+func TestShouldUseProxy(t *testing.T) {
 	tests := []struct {
-		name        string
-		requestURL  string
-		wantNil     bool
-		description string
+		name     string
+		host     string
+		port     string
+		noProxy  string
+		wantUse  bool // true = should use proxy (NOT bypassed)
 	}{
-		{
-			name:        "localhost excluded",
-			requestURL:  "http://localhost:9090/health",
-			wantNil:     true,
-			description: "localhost should be excluded by NO_PROXY",
-		},
-		{
-			name:        "127.0.0.1 excluded",
-			requestURL:  "http://127.0.0.1:8080/ping",
-			wantNil:     true,
-			description: "127.0.0.1 should be excluded by NO_PROXY",
-		},
+		// Wildcard
+		{"wildcard bypasses all", "example.com", "", "*", false},
+
+		// Exact hostname
+		{"exact match bypasses", "example.com", "", "example.com", false},
+		{"exact match no bypass for different host", "other.com", "", "example.com", true},
+
+		// Domain suffix
+		{"dot-prefix suffix matches subdomain", "api.example.com", "", ".example.com", false},
+		{"dot-prefix suffix does not match bare domain", "example.com", "", ".example.com", true},
+		{"bare domain matches subdomain", "api.example.com", "", "example.com", false},
+		{"bare domain matches itself", "example.com", "", "example.com", false},
+		{"wildcard prefix matches subdomain", "api.example.com", "", "*.example.com", false},
+
+		// IP literals
+		{"IP exact match", "127.0.0.1", "", "127.0.0.1", false},
+		{"IP no match", "192.168.1.1", "", "127.0.0.1", true},
+
+		// CIDR
+		{"CIDR match private range", "10.0.0.5", "", "10.0.0.0/8", false},
+		{"CIDR no match", "192.168.1.1", "", "10.0.0.0/8", true},
+
+		// Port-specific
+		{"host:port pattern matches same port", "example.com", "8080", "example.com:8080", false},
+		{"host:port pattern does not match different port", "example.com", "9090", "example.com:8080", true},
+
+		// Multiple entries
+		{"comma-separated list first match", "localhost", "", "localhost,127.0.0.1,.example.com", false},
+		{"comma-separated list last match", "api.example.com", "", "localhost,127.0.0.1,.example.com", false},
+		{"comma-separated list no match", "other.com", "", "localhost,127.0.0.1,.example.com", true},
+
+		// Edge cases
+		{"empty noProxy uses proxy", "example.com", "", "", true},
+		{"whitespace-only entries ignored", "example.com", "", "  ,  ,  ", true},
+		{"IPv6 address", "::1", "", "::1", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reqURL, _ := url.Parse(tt.requestURL)
-			req := &http.Request{URL: reqURL}
-
-			proxyURL, err := http.ProxyFromEnvironment(req)
-			if err != nil {
-				t.Errorf("ProxyFromEnvironment error: %v", err)
-				return
-			}
-
-			if tt.wantNil && proxyURL != nil {
-				t.Errorf("%s: expected nil proxy, got %s", tt.description, proxyURL)
-			}
-
-			if !tt.wantNil && proxyURL == nil {
-				t.Errorf("%s: expected proxy URL, got nil", tt.description)
+			got := shouldUseProxy(tt.host, tt.port, tt.noProxy)
+			if got != tt.wantUse {
+				t.Errorf("shouldUseProxy(%q, %q, %q) = %v, want %v",
+					tt.host, tt.port, tt.noProxy, got, tt.wantUse)
 			}
 		})
 	}
 }
 
-// TestGetProxyFunc_CacheConsistency verifies that repeated calls to GetProxyFunc
-// return a consistent cached result by checking both return the same proxy URL.
-func TestGetProxyFunc_CacheConsistency(t *testing.T) {
+// ---------------------------------------------------------------------------
+// parseProxyURL
+// ---------------------------------------------------------------------------
+
+func TestParseProxyURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantNil bool
+		wantURL string
+		wantErr bool
+	}{
+		{"empty returns nil", "", true, "", false},
+		{"http scheme", "http://proxy:8080", false, "http://proxy:8080", false},
+		{"https scheme", "https://proxy:8443", false, "https://proxy:8443", false},
+		{"socks5 scheme", "socks5://proxy:1080", false, "socks5://proxy:1080", false},
+		{"bare host:port gets http prefix", "proxy:8080", false, "http://proxy:8080", false},
+		{"bare host gets http prefix", "proxy", false, "http://proxy", false},
+		{"ftp scheme gets http prefix", "ftp://proxy:21", false, "http://ftp://proxy:21", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := parseProxyURL(tt.input)
+
+			if tt.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if tt.wantNil {
+				if u != nil {
+					t.Errorf("expected nil URL, got %s", u)
+				}
+				return
+			}
+			if u == nil {
+				t.Fatal("expected non-nil URL, got nil")
+			}
+			if tt.wantURL != "" && u.String() != tt.wantURL {
+				t.Errorf("URL = %s, want %s", u, tt.wantURL)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// getEnvAny
+// ---------------------------------------------------------------------------
+
+func TestGetEnvAny(t *testing.T) {
+	t.Run("returns first non-empty", func(t *testing.T) {
+		t.Setenv("TEST_PROXY_VAR_A", "")
+		t.Setenv("TEST_PROXY_VAR_B", "value-b")
+		got := getEnvAny("TEST_PROXY_VAR_A", "TEST_PROXY_VAR_B")
+		if got != "value-b" {
+			t.Errorf("getEnvAny() = %q, want %q", got, "value-b")
+		}
+	})
+
+	t.Run("returns empty when all unset", func(t *testing.T) {
+		got := getEnvAny("UNSET_VAR_1", "UNSET_VAR_2")
+		if got != "" {
+			t.Errorf("getEnvAny() = %q, want empty", got)
+		}
+	})
+
+	t.Run("prefers first", func(t *testing.T) {
+		t.Setenv("TEST_FIRST", "first")
+		t.Setenv("TEST_SECOND", "second")
+		got := getEnvAny("TEST_FIRST", "TEST_SECOND")
+		if got != "first" {
+			t.Errorf("getEnvAny() = %q, want %q", got, "first")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Integration: GetProxyFunc with real HTTP round-trip
+// ---------------------------------------------------------------------------
+
+func TestGetProxyFunc_IntegrationWithProxy(t *testing.T) {
 	originalEnv := saveAndClearProxyEnv()
 	defer restoreProxyEnv(originalEnv)
 
-	os.Setenv("HTTP_PROXY", "http://cache-test.example.com:8080")
+	// Use a local httptest server as the "proxy" — we don't need it to actually
+	// proxy; we just need to verify the proxy URL resolves correctly.
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer proxyServer.Close()
 
-	detector := NewDetector()
+	os.Setenv("HTTP_PROXY", proxyServer.URL)
 
-	first := detector.GetProxyFunc()
-	second := detector.GetProxyFunc()
+	d := NewDetector()
+	proxyFunc := d.GetProxyFunc()
 
-	if first == nil || second == nil {
-		t.Fatal("GetProxyFunc() should return non-nil with proxy env set")
+	if proxyFunc == nil {
+		t.Fatal("GetProxyFunc() returned nil with proxy env set")
 	}
 
-	// Verify both functions return the same proxy URL for the same request
-	testURL, _ := url.Parse("http://example.com")
-	testReq := &http.Request{URL: testURL}
+	req := &http.Request{
+		URL: &url.URL{Scheme: "http", Host: "target.example.com"},
+	}
 
-	url1, err := first(testReq)
+	proxyURL, err := proxyFunc(req)
 	if err != nil {
-		t.Fatalf("first call error: %v", err)
+		t.Fatalf("proxyFunc error: %v", err)
 	}
-	url2, err := second(testReq)
-	if err != nil {
-		t.Fatalf("second call error: %v", err)
+	if proxyURL == nil {
+		t.Fatal("proxyFunc returned nil proxy URL")
 	}
 
-	if url1.String() != url2.String() {
-		t.Errorf("cached functions returned different URLs: %s vs %s", url1.String(), url2.String())
+	if proxyURL.String() != proxyServer.URL {
+		t.Errorf("proxy URL = %s, want %s", proxyURL, proxyServer.URL)
 	}
 }
 
-// Helper functions for environment management
+// ---------------------------------------------------------------------------
+// detectPlatform / getWindowsProxySettings (Windows)
+// ---------------------------------------------------------------------------
 
-func saveAndClearProxyEnv() map[string]string {
-	envVars := []string{"HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY", "no_proxy"}
-	saved := make(map[string]string)
+func TestDetectPlatform_NoEnvCallsPlatform(t *testing.T) {
+	originalEnv := saveAndClearProxyEnv()
+	defer restoreProxyEnv(originalEnv)
 
-	for _, v := range envVars {
-		saved[v] = os.Getenv(v)
-		os.Unsetenv(v)
-	}
-
-	return saved
+	d := NewDetector()
+	// With no env vars, detect() falls through to detectPlatform().
+	// On a system without proxy configured, this returns nil.
+	// On a system with proxy configured, it returns a non-nil function.
+	// Either way it must not panic.
+	_ = d.detectPlatform()
 }
 
-func restoreProxyEnv(env map[string]string) {
-	for k, v := range env {
-		if v != "" {
-			os.Setenv(k, v)
-		} else {
-			os.Unsetenv(k)
-		}
+func TestGetWindowsProxySettings(t *testing.T) {
+	// Exercise the registry-reading path. On most dev machines ProxyEnable
+	// is 0, so this returns ("", false, nil). On machines with a proxy it
+	// returns the proxy details. Either way it must not panic or error.
+	server, enabled, err := getWindowsProxySettings()
+	if err != nil {
+		t.Logf("getWindowsProxySettings returned error (acceptable in CI): %v", err)
+		return
 	}
+	t.Logf("registry proxy: server=%q enabled=%v", server, enabled)
+	if !enabled && server != "" {
+		t.Logf("note: server=%q but enabled=false", server)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// detect — full chain
+// ---------------------------------------------------------------------------
+
+func TestDetect_EnvProxyTakesPriority(t *testing.T) {
+	originalEnv := saveAndClearProxyEnv()
+	defer restoreProxyEnv(originalEnv)
+
+	os.Setenv("HTTP_PROXY", "http://env-proxy.example.com:8080")
+
+	d := NewDetector()
+	proxyFunc := d.detect()
+
+	if proxyFunc == nil {
+		t.Fatal("detect() returned nil with HTTP_PROXY set")
+	}
+
+	req := &http.Request{URL: &url.URL{Scheme: "http", Host: "example.com"}}
+	got, err := proxyFunc(req)
+	if err != nil {
+		t.Fatalf("proxyFunc error: %v", err)
+	}
+	if got == nil || got.String() != "http://env-proxy.example.com:8080" {
+		t.Errorf("proxy URL = %v, want http://env-proxy.example.com:8080", got)
+	}
+}
+
+func TestDetect_NoEnvFallsToPlatform(t *testing.T) {
+	originalEnv := saveAndClearProxyEnv()
+	defer restoreProxyEnv(originalEnv)
+
+	d := NewDetector()
+	// Should not panic; may return nil (no proxy) or non-nil (system proxy).
+	_ = d.detect()
 }

@@ -103,8 +103,8 @@ config := httpc.DefaultConfig()
 config.Defaults.MaxRedirects = 50  // Maximum allowed
 
 // Invalid values will fail validation
-config.Defaults.MaxRedirects = -1  // Error: Defaults.MaxRedirects must be 0-50, got -1
-config.Defaults.MaxRedirects = 51  // Error: Defaults.MaxRedirects must be 0-50, got 51
+config.Defaults.MaxRedirects = -1  // Error: invalid middleware configuration: Defaults.MaxRedirects must be 0-50, got -1
+config.Defaults.MaxRedirects = 51  // Error: invalid middleware configuration: Defaults.MaxRedirects must be 0-50, got 51
 ```
 
 ## Per-Request Control

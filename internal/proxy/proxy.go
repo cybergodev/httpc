@@ -2,8 +2,11 @@
 package proxy
 
 import (
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"strings"
 	"sync"
 )
 
@@ -66,20 +69,164 @@ func (d *Detector) detect() func(*http.Request) (*url.URL, error) {
 	return d.detectPlatform()
 }
 
-// detectFromEnvironment checks environment variables for proxy settings
+// detectFromEnvironment checks environment variables for proxy settings.
+// It reads the environment directly rather than calling http.ProxyFromEnvironment,
+// which caches values process-wide via sync.Once and cannot reflect later changes.
 func (d *Detector) detectFromEnvironment() func(*http.Request) (*url.URL, error) {
-	// Use Go's built-in function which reads:
-	// HTTP_PROXY, HTTPS_PROXY, NO_PROXY, etc.
-	// Test if any proxy environment variable is set
-	testURL, _ := url.Parse("https://www.example.com")
-	testReq := &http.Request{
-		URL: testURL,
+	httpProxy := getEnvAny("HTTP_PROXY", "http_proxy")
+	httpsProxy := getEnvAny("HTTPS_PROXY", "https_proxy")
+	noProxy := getEnvAny("NO_PROXY", "no_proxy")
+
+	if httpProxy == "" && httpsProxy == "" {
+		return nil
 	}
 
-	// http.ProxyFromEnvironment is a function, not a pointer - it's never nil
-	// Test if it returns a valid proxy for our test request
-	if u, err := http.ProxyFromEnvironment(testReq); err == nil && u != nil {
-		return http.ProxyFromEnvironment
+	// Pre-parse and normalize proxy URLs at detection time.
+	httpURL, httpErr := parseProxyURL(httpProxy)
+	httpsURL, httpsErr := parseProxyURL(httpsProxy)
+
+	return func(req *http.Request) (*url.URL, error) {
+		// Don't use proxies in a CGI environment, matching net/http behavior.
+		if os.Getenv("REQUEST_METHOD") != "" {
+			return nil, nil
+		}
+
+		host := req.URL.Hostname()
+
+		// localhost is always direct, matching net/http behavior.
+		if host == "localhost" {
+			return nil, nil
+		}
+
+		// Check NO_PROXY exclusions.
+		if noProxy != "" && !shouldUseProxy(host, req.URL.Port(), noProxy) {
+			return nil, nil
+		}
+
+		// Select proxy URL, matching net/http's resolution order:
+		// HTTPS requests prefer HTTPS_PROXY, falling back to HTTP_PROXY.
+		// Other requests use HTTP_PROXY only.
+		if req.URL.Scheme == "https" && httpsURL != nil {
+			if httpsErr != nil {
+				return nil, httpsErr
+			}
+			return httpsURL, nil
+		}
+		if httpURL != nil {
+			if httpErr != nil {
+				return nil, httpErr
+			}
+			return httpURL, nil
+		}
+		// Fall back to HTTPS proxy for non-HTTPS requests.
+		if httpsURL != nil {
+			if httpsErr != nil {
+				return nil, httpsErr
+			}
+			return httpsURL, nil
+		}
+
+		return nil, nil
 	}
-	return nil
+}
+
+// getEnvAny returns the first non-empty value from the given env var names.
+func getEnvAny(names ...string) string {
+	for _, n := range names {
+		if v := os.Getenv(n); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// parseProxyURL parses a proxy URL string, normalizing bare host:port values
+// by prepending "http://" when no recognizable scheme is present.
+func parseProxyURL(proxy string) (*url.URL, error) {
+	if proxy == "" {
+		return nil, nil
+	}
+	u, err := url.Parse(proxy)
+	if err == nil && u != nil {
+		if strings.HasPrefix(u.Scheme, "http") || strings.HasPrefix(u.Scheme, "socks") {
+			return u, nil
+		}
+	}
+	// Fall back to prepending "http://" for bare host:port values.
+	return url.Parse("http://" + proxy)
+}
+
+// shouldUseProxy reports whether requests to the given host should use a proxy,
+// according to the NO_PROXY environment variable. It supports hostname suffix
+// matching, IP addresses, CIDR notation, and the "*" wildcard, following the
+// same conventions as net/http's httpproxy package.
+func shouldUseProxy(host, port, noProxy string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		return true
+	}
+
+	ip := net.ParseIP(host)
+
+	for _, pattern := range strings.Split(noProxy, ",") {
+		pattern = strings.ToLower(strings.TrimSpace(pattern))
+		if pattern == "" {
+			continue
+		}
+
+		if pattern == "*" {
+			return false // bypass all hosts
+		}
+
+		// CIDR match (e.g., 10.0.0.0/8).
+		if _, pnet, err := net.ParseCIDR(pattern); err == nil {
+			if ip != nil && pnet.Contains(ip) {
+				return false
+			}
+			continue
+		}
+
+		// Split optional host:port in pattern.
+		phost, pport := pattern, ""
+		if h, p, err := net.SplitHostPort(pattern); err == nil {
+			phost, pport = h, p
+		}
+
+		// IP literal match.
+		if net.ParseIP(phost) != nil {
+			if host == phost && (pport == "" || pport == port) {
+				return false
+			}
+			continue
+		}
+
+		if phost == "" {
+			continue
+		}
+
+		// Domain suffix match (e.g., ".example.com" or "example.com").
+		if strings.HasPrefix(phost, "*.") {
+			phost = phost[1:] // "*.example.com" -> ".example.com"
+		}
+		matchHost := false
+		if !strings.HasPrefix(phost, ".") {
+			matchHost = true
+			phost = "." + phost
+		}
+
+		if ip == nil {
+			if strings.HasSuffix(host, phost) {
+				if pport == "" || pport == port {
+					return false
+				}
+			}
+			if matchHost && host == phost[1:] {
+				if pport == "" || pport == port {
+					return false
+				}
+			}
+		}
+	}
+
+	return true
 }

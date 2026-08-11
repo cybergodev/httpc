@@ -351,6 +351,36 @@ if err != nil {
 }
 ```
 
+**Managing the Default Client**
+
+Package-level functions (`httpc.Get`, `httpc.Post`, `httpc.Request`, etc.) use a
+shared default client created lazily on first use. Two functions control its
+lifecycle:
+
+```go
+// Replace the default client with a custom-configured one.
+// The previous default is closed automatically.
+config := httpc.DefaultConfig()
+config.Timeouts.Request = 60 * time.Second
+customClient, err := httpc.New(config)
+if err != nil {
+    log.Fatal(err)
+}
+if err := httpc.SetDefaultClient(customClient); err != nil {
+    log.Fatal(err)
+}
+
+// Close the default client and reset it (next package-level call
+// creates a fresh one).
+if err := httpc.CloseDefaultClient(); err != nil {
+    log.Fatal(err)
+}
+```
+
+> **Note:** `SetDefaultClient` only accepts clients created by `httpc.New` or
+> `httpc.NewDefault` (type `*clientImpl`). For long-running services, prefer
+> holding an explicit `Client` instance over relying on the default.
+
 ### Error Handling Pattern
 
 ```go

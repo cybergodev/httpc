@@ -619,6 +619,13 @@ func (r *pooledJSONBuffer) release() {
 	jsonBufferWrapperPool.Put(r)
 }
 
+// httpRequestPool reduces allocations for the per-request *http.Request used
+// as a template before WithContext. The template is returned to the pool
+// immediately after WithContext creates the actual request.
+var httpRequestPool = sync.Pool{
+	New: func() any { return &http.Request{} },
+}
+
 // Pre-canonicalized forms of the header keys set on every request. Computing
 // these once at init time avoids a per-request http.CanonicalHeaderKey
 // allocation (which allocates even for already-canonical input) on the hot
@@ -630,6 +637,10 @@ var (
 	hdrCookie         = http.CanonicalHeaderKey("Cookie")
 	hdrContentLength  = http.CanonicalHeaderKey("Content-Length")
 	hdrHost           = http.CanonicalHeaderKey("Host")
+
+	// hdrContentEncoding is used by responseProcessor — defined here alongside
+	// the other pre-canonicalized keys to keep them in one place.
+	hdrContentEncoding = http.CanonicalHeaderKey("Content-Encoding")
 )
 
 type requestProcessor struct {
@@ -802,7 +813,16 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 
 	method := req.Method()
 	ctx := req.Context()
-	httpReq := &http.Request{
+
+	// Use a pooled template for the initial http.Request to avoid one heap
+	// allocation. WithContext creates a shallow copy (new *http.Request) and
+	// sets the unexported ctx field — the only public API to set context.
+	// After WithContext returns, the template's fields are stale but harmless:
+	// the copy owns its own field values (shallow-copied pointers), and the
+	// template is zeroed on next use (*tmpl = http.Request{...}). The template
+	// is returned to the pool immediately, keeping it warm for the next call.
+	tmpl := httpRequestPool.Get().(*http.Request)
+	*tmpl = http.Request{
 		Method:     method,
 		URL:        parsedURL,
 		Proto:      "HTTP/1.1",
@@ -812,7 +832,8 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 		Body:       bodyRC,
 		Host:       parsedURL.Host,
 	}
-	httpReq = httpReq.WithContext(ctx)
+	httpReq := tmpl.WithContext(ctx)
+	httpRequestPool.Put(tmpl)
 
 	// Set Content-Length from known body types
 	p.setContentLength(httpReq, body)

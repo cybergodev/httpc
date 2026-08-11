@@ -23,6 +23,7 @@
 - [响应处理](#响应处理)
 - [Context 与取消](#context-与取消)
 - [文件下载](#文件下载)
+- [流式传输](#流式传输)
 - [域名客户端 (会话管理)](#域名客户端-会话管理)
 - [会话管理器](#会话管理器)
 - [配置](#配置)
@@ -49,6 +50,7 @@
 | **极简依赖** | 1 个直接依赖 (golang.org/x/sys)，纯 Go 实现 |
 | **Cookie 管理** | 完整的 Cookie Jar 支持，带安全验证 |
 | **文件操作** | 安全的文件下载，支持进度跟踪和断点续传 |
+| **流式传输** | `io.Reader` 请求体、零拷贝 `io.Pipe` 上传、磁盘流式下载 |
 
 ---
 
@@ -242,11 +244,14 @@ httpc.WithFile("file", "document.pdf", fileBytes)
 httpc.WithBody([]byte("raw data"))
 httpc.WithBody(data, httpc.BodyJSON) // 显式指定 BodyKind
 
+// io.Reader 请求体 (流式上传；需显式设置 Content-Type)
+httpc.WithBody(fileReader)
+
 // BodyKind 常量: BodyAuto, BodyJSON, BodyXML, BodyForm, BodyBinary, BodyMultipart
 
 httpc.WithBinary(binaryData, "application/pdf")
 
-// 流式请求体 (用于大型请求体)
+// 流式响应体 (仅对 Download 有效；见流式传输)
 httpc.WithStreamBody(true)
 ```
 
@@ -520,6 +525,60 @@ result, _ := httpc.Download(ctx, url, opts,
 
 ---
 
+## 流式传输
+
+对于大型数据，HTTPC 支持流式传输以避免将整个数据缓冲到内存中。
+
+### 流式请求体 (上传)
+
+`WithBody` 直接接受 `io.Reader`。对于 Reader，Content-Type **不会**被自动检测，需显式设置：
+
+```go
+// 从文件或任何 io.Reader 流式传输
+result, err := httpc.Post("https://example.com/upload",
+    httpc.WithBody(file),
+    httpc.WithHeader("Content-Type", "application/octet-stream"),
+)
+```
+
+使用 `io.Pipe` 实现零拷贝流式传输 — 生产者 goroutine 写入数据，HTTP 传输层并发消费：
+
+```go
+pr, pw := io.Pipe()
+go func() {
+    defer pw.Close()
+    // 向 pw 写入数据块 ...
+}()
+
+result, err := httpc.Post("https://example.com/upload",
+    httpc.WithBody(pr),
+    httpc.WithHeader("Content-Type", "application/octet-stream"),
+)
+```
+
+> **安全提示：** `WithBody(io.Reader)` **绕过请求体大小验证**。
+> 使用 `io.LimitReader` 包裹不受信任的 Reader 以强制限制：
+> ```go
+> httpc.WithBody(io.LimitReader(reader, 10<<20)) // 限制 10 MB
+> ```
+
+### 流式响应体 (下载)
+
+`Download()` 将响应体直接流式写入磁盘 — 不会缓冲完整数据。
+`WithStreamBody(true)` 会自动应用：
+
+```go
+result, _ := httpc.Download(ctx,
+    "https://example.com/large.zip",
+    &httpc.DownloadConfig{FilePath: "downloads/large.zip"},
+)
+```
+
+> **注意：** 常规的 `Get` / `Post` 等方法**始终将完整响应体缓冲到内存中**。
+> `WithStreamBody` 对这些方法无效 — 请使用 `Download` 处理大型响应。详见[文件下载](#文件下载)。
+
+---
+
 ## 域名客户端 (会话管理)
 
 用于对同一域名发起多次请求，自动管理 Cookie 和请求头：
@@ -745,6 +804,7 @@ fmt.Println(config.String())
 | `Connection.ProxyFailureThreshold` | `int` | `3` | 触发熔断前的连续连接失败次数 |
 | `Connection.ProxyCooldown` | `time.Duration` | `30s` | 被熔断的代理退出轮换的时长 |
 | `Connection.ProxyRotateOnStatus` | `[]int` | `nil` | 触发代理轮换的 HTTP 状态码（如 `[]int{403}`） |
+| `Connection.ProxyRotatePerRequest` | `bool` | `false` | 每次请求前关闭空闲连接，使传输层重新评估代理池，保证逐请求轮换（增加开销：无连接复用）。需要 ProxyPool；对 ProxyURL 无效 |
 | `Connection.EnableHTTP2` | `bool` | `true` | 启用 HTTP/2 |
 | `Connection.EnableCookies` | `bool` | `false` | 启用 Cookie Jar |
 | `Connection.EnableDoH` | `bool` | `false` | 启用 DNS-over-HTTPS |
@@ -920,6 +980,20 @@ config.Connection.ProxyCooldown = 60 * time.Second
 config.Connection.ProxyRotateOnStatus = []int{403}
 config.Retry.MaxRetries = 3
 ```
+
+### 逐请求代理轮换
+
+默认情况下，HTTP 连接复用会导致对同一主机的连续请求复用上次的代理隧道，
+跳过代理池选择。启用 `ProxyRotatePerRequest` 可保证每个独立的 `Get`/`Post`
+调用通过不同的代理路由：
+
+```go
+config.Connection.ProxyRotatePerRequest = true
+```
+
+这会在每次请求开始时关闭空闲连接，使传输层重新评估代理池。它会增加少量开销
+（无连接复用），但对于爬虫或指纹轮换场景必不可少。需要 `ProxyPool`；
+对 `ProxyURL` 无效。
 
 **优先级：** `ProxyURL` > `ProxyPool` > `EnableSystemProxy` > 直连。
 
@@ -1233,11 +1307,11 @@ func (m *MockClient) Get(url string, options ...httpc.RequestOption) (*httpc.Res
 
 ### 示例代码
 
-21 个可运行的示例覆盖所有功能，按从基础到高级排序。
+22 个可运行的示例覆盖所有功能，按从基础到高级排序。
 每个示例都是独立的 `package main`，并带有 `//go:build examples` 构建标签（因此不会进入常规构建），需逐个运行：
 
 ```bash
-go run examples/01_basic_usage.go
+go run -tags examples examples/01_basic_usage.go
 ```
 
 > 调用真实端点（`httpbin.org`、`example.com`）的示例需要网络访问。
@@ -1250,6 +1324,7 @@ go run examples/01_basic_usage.go
 | **有状态客户端** | [11_session](examples/11_session.go), [12_domain_client](examples/12_domain_client.go), [13_proxy_configuration](examples/13_proxy_configuration.go), [14_doh](examples/14_doh.go) |
 | **高级** | [15_middleware](examples/15_middleware.go), [16_concurrent_requests](examples/16_concurrent_requests.go), [17_file_operations](examples/17_file_operations.go), [18_rest_api_client](examples/18_rest_api_client.go), [19_advanced_patterns](examples/19_advanced_patterns.go) |
 | **安全** | [20_certificate_pinning](examples/20_certificate_pinning.go), [21_ssrf_protection](examples/21_ssrf_protection.go) |
+| **流式传输** | [22_streaming_bodies](examples/22_streaming_bodies.go) |
 
 ---
 

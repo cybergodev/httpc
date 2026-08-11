@@ -279,10 +279,14 @@ if err != nil {
 }
 
 // Set cookies in the session
-session.SetCookie(&http.Cookie{Name: "session", Value: "abc123"})
-session.SetCookies([]*http.Cookie{
+if err := session.SetCookie(&http.Cookie{Name: "session", Value: "abc123"}); err != nil {
+    log.Fatal(err)
+}
+if err := session.SetCookies([]*http.Cookie{
     {Name: "token", Value: "xyz789"},
-})
+}); err != nil {
+    log.Fatal(err)
+}
 
 // Retrieve cookies
 allCookies := session.GetCookies()
