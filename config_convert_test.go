@@ -7,11 +7,11 @@ import (
 
 func TestCalculateMaxRetries(t *testing.T) {
 	tests := []struct {
-		name             string
-		retryMaxRetries  int
-		proxyPool        []string
-		rotateOnStatus   []int
-		expectedRetries  int
+		name            string
+		retryMaxRetries int
+		proxyPool       []string
+		rotateOnStatus  []int
+		expectedRetries int
 	}{
 		{
 			name:            "no proxy pool, no rotation",

@@ -3,48 +3,26 @@ package httpc
 import (
 	"net/http"
 	"strings"
-	"sync"
 )
 
-// cookieSlicePool reduces allocations for cookie slices
-var cookieSlicePool = sync.Pool{
-	New: func() any {
-		slice := make([]*http.Cookie, 0, 8)
-		return &slice
-	},
-}
-
-// getCookiesSlice retrieves a cookie slice from the pool
-func getCookiesSlice() *[]*http.Cookie {
-	slice, ok := cookieSlicePool.Get().(*[]*http.Cookie)
-	if !ok || slice == nil {
-		s := make([]*http.Cookie, 0, 8)
-		return &s
-	}
-	*slice = (*slice)[:0]
-	return slice
-}
-
-// putCookiesSlice returns a cookie slice to the pool
-func putCookiesSlice(slice *[]*http.Cookie) {
-	if cap(*slice) > 64 {
-		return // Don't pool large slices
-	}
-	*slice = (*slice)[:0]
-	cookieSlicePool.Put(slice)
-}
-
 // parseCookieHeader parses a Cookie header value into http.Cookie slice.
-// Optimized to minimize string allocations by using index-based trimming.
-// SECURITY: Returns a newly allocated slice to avoid pool reuse issues.
+// Optimized to minimize allocations by using index-based trimming and a single
+// contiguous backing array for all cookie structs (capacity sized by a
+// semicolon count, mirroring SessionManager.GetCookies) instead of one heap
+// object per cookie.
+// SECURITY: Returns newly allocated slices — never backed by shared or pooled
+// memory — so the result cannot alias another request's cookies.
 func parseCookieHeader(cookieHeader string) []*http.Cookie {
 	if cookieHeader == "" {
 		return nil
 	}
 
-	// Use pooled slice for intermediate parsing
-	cookiesPtr := getCookiesSlice()
-	cookies := *cookiesPtr
+	// One allocation holds every parsed cookie. The semicolon count sizes the
+	// capacity exactly for well-formed headers, clamped so a hostile header of
+	// pure separators (legal within the 8KB value limit) cannot amplify into a
+	// ~1MB allocation — headers with more than 16 real cookies grow via append.
+	capHint := min(strings.Count(cookieHeader, ";")+1, 16)
+	backing := make([]http.Cookie, 0, capHint)
 
 	headerLen := len(cookieHeader)
 	start := 0
@@ -63,7 +41,7 @@ func parseCookieHeader(cookieHeader string) []*http.Cookie {
 						valueStart, valueEnd := trimSpaceIndices(pair, idx+1, len(pair))
 
 						if nameStart < nameEnd {
-							cookies = append(cookies, &http.Cookie{
+							backing = append(backing, http.Cookie{
 								Name:  pair[nameStart:nameEnd],
 								Value: pair[valueStart:valueEnd],
 							})
@@ -75,16 +53,14 @@ func parseCookieHeader(cookieHeader string) []*http.Cookie {
 		}
 	}
 
-	if len(cookies) == 0 {
-		putCookiesSlice(cookiesPtr)
+	if len(backing) == 0 {
 		return nil
 	}
 
-	// SECURITY: Copy to new slice before returning pooled buffer
-	// This prevents the returned slice from being reused by another request
-	result := make([]*http.Cookie, len(cookies))
-	copy(result, cookies)
-	putCookiesSlice(cookiesPtr)
+	result := make([]*http.Cookie, len(backing))
+	for i := range backing {
+		result[i] = &backing[i]
+	}
 	return result
 }
 

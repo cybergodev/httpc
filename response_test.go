@@ -507,35 +507,23 @@ func TestResult_String_Comprehensive(t *testing.T) {
 		}
 	})
 
-	t.Run("body truncation", func(t *testing.T) {
-		longBody := strings.Repeat("x", 201)
+	t.Run("body content never included", func(t *testing.T) {
+		// SECURITY: bodies often carry tokens — String() must show size only.
+		longBody := strings.Repeat("x", 500)
 		r := &Result{
 			Response: &ResponseInfo{
 				StatusCode:    200,
 				Status:        "OK",
-				ContentLength: 201,
+				ContentLength: 500,
 				Body:          longBody,
 			},
 		}
 		s := r.String()
-		if !strings.Contains(s, "...[truncated]") {
-			t.Error("Body should be truncated")
+		if !strings.Contains(s, "Body: [500 bytes omitted]") {
+			t.Errorf("String should report body size only, got: %s", s)
 		}
-	})
-
-	t.Run("body no truncation at 200 chars", func(t *testing.T) {
-		body := strings.Repeat("x", 200)
-		r := &Result{
-			Response: &ResponseInfo{
-				StatusCode:    200,
-				Status:        "OK",
-				ContentLength: 200,
-				Body:          body,
-			},
-		}
-		s := r.String()
-		if strings.Contains(s, "...[truncated]") {
-			t.Error("Body should NOT be truncated at exactly 200 chars")
+		if strings.Contains(s, "xxxxx") {
+			t.Error("Body content must not leak into String()")
 		}
 	})
 }

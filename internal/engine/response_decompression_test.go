@@ -93,11 +93,21 @@ func TestResponseProcessor_Decompression(t *testing.T) {
 			wantErr:  false,
 		},
 		{
-			name:     "Unknown encoding",
-			encoding: "unknown-encoding",
-			content:  "Data with unknown encoding",
-			wantBody: "Data with unknown encoding",
-			wantErr:  false,
+			name:        "Unknown encoding",
+			encoding:    "unknown-encoding",
+			content:     "Data with unknown encoding",
+			wantBody:    "",
+			wantErr:     true,
+			errContains: "unsupported Content-Encoding",
+		},
+		{
+			// TrimSpace in createDecompressor tolerates padded header values.
+			name:        "Padded gzip header value",
+			encoding:    " gzip ",
+			content:     "Data behind a space-padded Content-Encoding",
+			wantBody:    "Data behind a space-padded Content-Encoding",
+			wantErr:     false,
+			errContains: "",
 		},
 		{
 			name:     "Identity encoding",
@@ -115,7 +125,7 @@ func TestResponseProcessor_Decompression(t *testing.T) {
 
 			// Compress content if encoding requires it
 			switch tt.encoding {
-			case "gzip":
+			case "gzip", " gzip ":
 				var buf bytes.Buffer
 				gzipWriter := gzip.NewWriter(&buf)
 				_, err := gzipWriter.Write([]byte(tt.content))
@@ -278,49 +288,9 @@ func TestResponseProcessor_DecompressionWithSizeLimit(t *testing.T) {
 	}
 }
 
-func TestResponseProcessor_MultipleEncodings(t *testing.T) {
-	config := &Config{
-		Timeout:             30 * time.Second,
-		MaxResponseBodySize: 50 * 1024 * 1024,
-	}
-
-	processor := newResponseProcessor(config)
-
-	// Test with multiple encodings - HTTP spec says they should be listed in order applied
-	// So "gzip, deflate" means data was first deflated, then gzipped
-	// We only handle single encoding currently, so this tests that behavior
-	originalData := "Test data for multiple encodings"
-
-	var buf bytes.Buffer
-	gzipWriter := gzip.NewWriter(&buf)
-	_, err := gzipWriter.Write([]byte(originalData))
-	if err != nil {
-		t.Fatalf("Failed to write gzip data: %v", err)
-	}
-	if err := gzipWriter.Close(); err != nil {
-		t.Fatalf("Failed to close gzip writer: %v", err)
-	}
-
-	httpResponse := &http.Response{
-		StatusCode: 200,
-		Status:     "200 OK",
-		Header: http.Header{
-			"Content-Type":     []string{"text/plain"},
-			"Content-Encoding": []string{"gzip"}, // Single encoding
-		},
-		Body:    io.NopCloser(&buf),
-		Request: &http.Request{},
-	}
-
-	resp, err := processor.Process(httpResponse)
-	if err != nil {
-		t.Fatalf("Failed to process response: %v", err)
-	}
-
-	if resp.Body() != originalData {
-		t.Errorf("Expected body '%s', got '%s'", originalData, resp.Body())
-	}
-}
+// TestResponseProcessor_MultipleEncodings was removed: despite the name it
+// used a single "gzip" Content-Encoding — the identical round-trip is the
+// "Gzip simple compressed text" case of TestResponseProcessor_Decompression.
 
 func TestResponseProcessor_CaseInsensitiveEncoding(t *testing.T) {
 	config := &Config{
@@ -399,7 +369,7 @@ func BenchmarkResponseProcessor_GzipDecompression(b *testing.B) {
 	originalData := strings.Repeat("The quick brown fox jumps over the lazy dog. ", 100)
 	var buf bytes.Buffer
 	gzipWriter := gzip.NewWriter(&buf)
-	gzipWriter.Write([]byte(originalData))
+	_, _ = gzipWriter.Write([]byte(originalData)) // fixed test input
 	gzipWriter.Close()
 	compressedData := buf.Bytes()
 
@@ -436,7 +406,7 @@ func BenchmarkResponseProcessor_DeflateDecompression(b *testing.B) {
 	originalData := strings.Repeat("The quick brown fox jumps over the lazy dog. ", 100)
 	var buf bytes.Buffer
 	deflateWriter, _ := flate.NewWriter(&buf, flate.DefaultCompression)
-	deflateWriter.Write([]byte(originalData))
+	_, _ = deflateWriter.Write([]byte(originalData)) // fixed test input
 	deflateWriter.Close()
 	compressedData := buf.Bytes()
 
@@ -479,7 +449,8 @@ func TestCreateDecompressor_UnsupportedEncodings(t *testing.T) {
 		{"x-compress rejected", "x-compress", true, "LZW"},
 		{"identity pass-through", "identity", false, ""},
 		{"empty encoding pass-through", "", false, ""},
-		{"unknown encoding pass-through", "zstd", false, ""},
+		{"unknown encoding rejected", "zstd", true, `unsupported Content-Encoding "zstd"`},
+		{"multi-token encoding rejected", "gzip, br", true, `unsupported Content-Encoding "gzip, br"`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -503,4 +474,67 @@ func TestCreateDecompressor_UnsupportedEncodings(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ============================================================================
+// POOL REGRESSION TESTS (P-001)
+// ============================================================================
+
+// TestGzipReaderPoolNewUsable pins the gzipReaderPool.New contract: it must
+// return a non-nil *gzip.Reader that Reset can (re)initialize. The original
+// implementation built it via gzip.NewReader(bytes.NewReader(nil)), which
+// fails header parsing on the empty stream and returns (nil, io.EOF) — the
+// discarded error silently produced a nil New that disabled the pool, so
+// every compressed response allocated a fresh decompressor stack. A plain
+// functional test cannot catch this regression (the fallback path is
+// behaviorally identical, only slower), so the pool object is asserted
+// directly.
+func TestGzipReaderPoolNewUsable(t *testing.T) {
+	raw, ok := gzipReaderPool.New().(*gzip.Reader)
+	if !ok || raw == nil {
+		t.Fatalf("gzipReaderPool.New must return a non-nil *gzip.Reader, got %T (%v)", raw, raw)
+	}
+
+	var buf bytes.Buffer
+	gw := gzip.NewWriter(&buf)
+	if _, err := gw.Write([]byte("pool reuse payload")); err != nil {
+		t.Fatalf("seed gzip data: %v", err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatalf("close seed writer: %v", err)
+	}
+
+	if err := raw.Reset(bytes.NewReader(buf.Bytes())); err != nil {
+		t.Fatalf("Reset on a pool-fresh reader must succeed on valid gzip data: %v", err)
+	}
+	body, err := io.ReadAll(raw)
+	if err != nil {
+		t.Fatalf("read through pool-fresh reader: %v", err)
+	}
+	if string(body) != "pool reuse payload" {
+		t.Fatalf("unexpected decompressed body %q", body)
+	}
+}
+
+// TestBufioReaderPoolRoundtrip verifies that a recycled *bufio.Reader reads
+// only from its new source: stale buffered bytes from the previous response
+// must be unreachable after putBufioReader's Reset.
+func TestBufioReaderPoolRoundtrip(t *testing.T) {
+	br := getBufioReader(strings.NewReader("first-response-bytes"))
+	if _, err := io.ReadAll(br); err != nil {
+		t.Fatalf("drain first reader: %v", err)
+	}
+	putBufioReader(br)
+
+	// Whether the pool hands back the same object or a fresh one, the next
+	// reader must expose only the new source's bytes.
+	br2 := getBufioReader(strings.NewReader("second"))
+	got, err := io.ReadAll(br2)
+	if err != nil {
+		t.Fatalf("read recycled reader: %v", err)
+	}
+	if string(got) != "second" {
+		t.Fatalf("recycled bufio leaked stale bytes: got %q, want %q", got, "second")
+	}
+	putBufioReader(br2)
 }

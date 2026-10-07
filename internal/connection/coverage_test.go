@@ -4,66 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
-	"net/http"
-	"net/http/httptest"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
-
-// TestUpdateConnectionMetrics verifies per-host connection statistics tracking.
-// Successful dials increment TotalConns/ActiveConns, and every update records
-// the host. (Per-host latency and failed-connection counts were removed —
-// GetMetrics reports aggregate pool counters instead — so the weighted-average
-// and FailedConns assertions were retired with them.)
-func TestUpdateConnectionMetrics(t *testing.T) {
-	tests := []struct {
-		name            string
-		host            string
-		successes       int
-		recordFailure   bool // additionally record one failed update
-		wantTotalConns  int64
-		wantActiveConns int64
-	}{
-		{name: "single success", host: "api.example.com", successes: 1, wantTotalConns: 1, wantActiveConns: 1},
-		{name: "repeated success", host: "api.example.com", successes: 3, wantTotalConns: 3, wantActiveConns: 3},
-		{name: "failed only tracks host without counting", host: "fail.example.com", recordFailure: true, wantTotalConns: 0, wantActiveConns: 0},
-		{name: "mixed success and failure", host: "mixed.example.com", successes: 1, recordFailure: true, wantTotalConns: 1, wantActiveConns: 1},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pm, err := NewPoolManager(nil)
-			if err != nil {
-				t.Fatalf("NewPoolManager() error: %v", err)
-			}
-			defer func() { _ = pm.Close() }()
-
-			var stats *hostStats
-			for i := 0; i < tt.successes; i++ {
-				stats = pm.updateConnectionMetrics(tt.host, true)
-			}
-			if tt.recordFailure {
-				stats = pm.updateConnectionMetrics(tt.host, false)
-			}
-
-			if stats == nil {
-				t.Fatal("updateConnectionMetrics() returned nil stats")
-			}
-
-			if got := atomic.LoadInt64(&stats.TotalConns); got != tt.wantTotalConns {
-				t.Errorf("TotalConns = %d, want %d", got, tt.wantTotalConns)
-			}
-			if got := atomic.LoadInt64(&stats.ActiveConns); got != tt.wantActiveConns {
-				t.Errorf("ActiveConns = %d, want %d", got, tt.wantActiveConns)
-			}
-			if _, ok := pm.hostConns.Load(tt.host); !ok {
-				t.Errorf("host %q not tracked after update", tt.host)
-			}
-		})
-	}
-}
 
 // TestTrackedConn_Lifecycle verifies that trackedConn properly tracks
 // active connection counts on creation, decrement on Close, and handles
@@ -75,42 +19,23 @@ func TestTrackedConn_Lifecycle(t *testing.T) {
 	}
 	defer func() { _ = pm.Close() }()
 
-	// Simulate the state that createDialer sets up
-	var initialActive int64 = 0
-	atomic.StoreInt64(&pm.activeConns, initialActive)
-
-	// Create stats entry for the host
-	stats := pm.updateConnectionMetrics("test.example.com:443", true)
-
-	if stats == nil {
-		t.Fatal("updateConnectionMetrics returned nil stats")
-	}
-
-	// Verify stats show one active connection
-	if got := atomic.LoadInt64(&stats.ActiveConns); got != 1 {
-		t.Errorf("ActiveConns after creation = %d, want 1", got)
-	}
-
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
-		t.Errorf("pool activeConns after metrics update = %d, want 0 (not yet incremented in pool)", got)
-	}
+	// Simulate the state that createDialer sets up: active gauge at zero.
+	pm.activeConns.Store(0)
 
 	// Simulate what createDialer does: increment pool active conns
-	atomic.AddInt64(&pm.activeConns, 1)
+	pm.activeConns.Add(1)
 
 	// Create a trackedConn wrapping a fake connection
 	server, client := net.Pipe()
 	defer func() { _ = server.Close() }()
 
 	tc := &trackedConn{
-		Conn:  client,
-		pm:    pm,
-		host:  "test.example.com:443",
-		stats: stats,
+		Conn: client,
+		pm:   pm,
 	}
 
 	// Verify active count before close
-	if got := atomic.LoadInt64(&pm.activeConns); got != 1 {
+	if got := pm.activeConns.Load(); got != 1 {
 		t.Errorf("pool activeConns before close = %d, want 1", got)
 	}
 
@@ -121,12 +46,8 @@ func TestTrackedConn_Lifecycle(t *testing.T) {
 	}
 
 	// Verify active count decremented
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
+	if got := pm.activeConns.Load(); got != 0 {
 		t.Errorf("pool activeConns after close = %d, want 0", got)
-	}
-
-	if got := atomic.LoadInt64(&stats.ActiveConns); got != 0 {
-		t.Errorf("stats ActiveConns after close = %d, want 0", got)
 	}
 
 	// Double close should not double-decrement
@@ -135,13 +56,10 @@ func TestTrackedConn_Lifecycle(t *testing.T) {
 		t.Errorf("Second Close() error: %v", err)
 	}
 
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
+	if got := pm.activeConns.Load(); got != 0 {
 		t.Errorf("pool activeConns after double close = %d, want 0 (no double-decrement)", got)
 	}
 
-	if got := atomic.LoadInt64(&stats.ActiveConns); got != 0 {
-		t.Errorf("stats ActiveConns after double close = %d, want 0 (no double-decrement)", got)
-	}
 }
 
 // TestTrackedConn_ConcurrentClose verifies that concurrent Close calls on a
@@ -153,17 +71,14 @@ func TestTrackedConn_ConcurrentClose(t *testing.T) {
 	}
 	defer func() { _ = pm.Close() }()
 
-	stats := pm.updateConnectionMetrics("concurrent.example.com:443", true)
-	atomic.AddInt64(&pm.activeConns, 1)
+	pm.activeConns.Add(1)
 
 	server, client := net.Pipe()
 	defer func() { _ = server.Close() }()
 
 	tc := &trackedConn{
-		Conn:  client,
-		pm:    pm,
-		host:  "concurrent.example.com:443",
-		stats: stats,
+		Conn: client,
+		pm:   pm,
 	}
 
 	var wg sync.WaitGroup
@@ -180,13 +95,10 @@ func TestTrackedConn_ConcurrentClose(t *testing.T) {
 	wg.Wait()
 
 	// Despite 10 Close calls, activeConns should only be decremented once
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
+	if got := pm.activeConns.Load(); got != 0 {
 		t.Errorf("pool activeConns after concurrent close = %d, want 0", got)
 	}
 
-	if got := atomic.LoadInt64(&stats.ActiveConns); got != 0 {
-		t.Errorf("stats ActiveConns after concurrent close = %d, want 0", got)
-	}
 }
 
 // TestCreateTLSConfig_Default verifies that the default TLS configuration has
@@ -394,14 +306,14 @@ func TestCreateDialer_AllowPrivateIPs(t *testing.T) {
 	}
 
 	// Verify active connection tracking
-	if got := atomic.LoadInt64(&pm.activeConns); got != 1 {
+	if got := pm.activeConns.Load(); got != 1 {
 		t.Errorf("activeConns = %d, want 1", got)
 	}
 
 	// Close the tracked connection
 	_ = tc.Close()
 
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
+	if got := pm.activeConns.Load(); got != 0 {
 		t.Errorf("activeConns after close = %d, want 0", got)
 	}
 }
@@ -481,6 +393,27 @@ func TestResolveAndValidateAddress(t *testing.T) {
 			address: "169.254.1.1:443",
 			wantErr: true,
 		},
+		// IPv6 boundaries (IP literals — no DNS/network needed)
+		{
+			name:    "Public IPv6 with port",
+			address: "[2001:4860:4860::8888]:443",
+			wantErr: false,
+		},
+		{
+			name:    "IPv6 loopback",
+			address: "[::1]:8080",
+			wantErr: true,
+		},
+		{
+			name:    "IPv4-mapped IPv6 loopback",
+			address: "[::ffff:127.0.0.1]:8080",
+			wantErr: true,
+		},
+		{
+			name:    "Private IP without port",
+			address: "127.0.0.1",
+			wantErr: true,
+		},
 		// Unresolvable domain
 		{
 			name:    "Domain resolution failure",
@@ -515,11 +448,14 @@ func TestResolveAndValidateAddress(t *testing.T) {
 
 				var lastErr error
 				for _, domain := range domains {
-					result, resolveErr := pm.resolveAndValidateAddress(context.Background(), domain)
+					results, resolveErr := pm.resolveAndValidateAddress(context.Background(), domain)
 					if resolveErr == nil {
-						host, port, splitErr := net.SplitHostPort(result)
+						if len(results) == 0 {
+							t.Fatalf("expected at least one validated address for %s", domain)
+						}
+						host, port, splitErr := net.SplitHostPort(results[0])
 						if splitErr != nil {
-							t.Fatalf("result %q is not a valid host:port: %v", result, splitErr)
+							t.Fatalf("result %q is not a valid host:port: %v", results[0], splitErr)
 						}
 						if port != "443" {
 							t.Errorf("port = %q, want %q", port, "443")
@@ -552,77 +488,16 @@ func TestResolveAndValidateAddress(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			if tt.want != "" && result != tt.want {
-				t.Errorf("result = %q, want %q", result, tt.want)
+			if tt.want != "" && (len(result) == 0 || result[0] != tt.want) {
+				t.Errorf("result = %v, want first candidate %q", result, tt.want)
 			}
 		})
 	}
 }
 
-// TestTrackedConn_NilStats verifies that trackedConn handles nil stats gracefully.
-func TestTrackedConn_NilStats(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	atomic.AddInt64(&pm.activeConns, 1)
-
-	server, client := net.Pipe()
-	defer func() { _ = server.Close() }()
-
-	tc := &trackedConn{
-		Conn:  client,
-		pm:    pm,
-		host:  "nilstats.example.com:443",
-		stats: nil,
-	}
-
-	// Close should not panic with nil stats
-	err = tc.Close()
-	if err != nil {
-		t.Errorf("Close() error: %v", err)
-	}
-
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
-		t.Errorf("activeConns after close = %d, want 0", got)
-	}
-}
-
-// TestCreateDialer_Integration verifies the full dialer path through an HTTP request,
-// exercising SSRF validation, connection tracking, and metrics updates.
-func TestCreateDialer_Integration(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	config := DefaultConfig()
-	config.AllowPrivateIPs = true
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	client := &http.Client{
-		Transport: pm.GetTransport(),
-		Timeout:   5 * time.Second,
-	}
-
-	resp, err := client.Get(server.URL)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	_ = resp.Body.Close()
-
-	// Verify connection metrics were tracked
-	metrics := pm.GetMetrics()
-	if metrics.TotalConnections < 1 {
-		t.Errorf("TotalConnections = %d, want at least 1", metrics.TotalConnections)
-	}
-}
+// The full dialer path through a live HTTP request (SSRF validation,
+// connection tracking, metric updates) is asserted by
+// TestPoolManager_ConnectionMetrics in pool_test.go — no duplicate here.
 
 // TestCreateDialer_SSRFRejectsPrivateIP verifies that the dialer function
 // rejects connections to private IPs by calling it directly.
@@ -700,111 +575,13 @@ func TestCreateDialer_ConnectionFailure(t *testing.T) {
 	}
 }
 
-// TestUpdateConnectionMetrics_InvalidType verifies the defensive nil check
-// when LoadOrStore returns a value that is not *hostStats.
-func TestUpdateConnectionMetrics_InvalidType(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	pm.hostConns.Store("bad-type.example.com", "not a hostStats")
-
-	result := pm.updateConnectionMetrics("bad-type.example.com", true)
-	if result != nil {
-		t.Errorf("expected nil result for invalid type, got %v", result)
-	}
-}
-
-// TestUpdateConnectionMetrics_NilValue verifies the defensive nil check
-// when LoadOrStore returns a nil *hostStats.
-func TestUpdateConnectionMetrics_NilValue(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	var nilStats *hostStats = nil
-	pm.hostConns.Store("nil-value.example.com", nilStats)
-
-	result := pm.updateConnectionMetrics("nil-value.example.com", true)
-	if result != nil {
-		t.Errorf("expected nil result for nil value, got %v", result)
-	}
-}
-
 // TestClose_WithDoHResolver verifies that Close properly cleans up the DoH resolver.
-func TestClose_WithDoHResolver(t *testing.T) {
-	config := &Config{
-		EnableDoH:       true,
-		AllowPrivateIPs: true,
-	}
-
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-
-	if pm.dohResolver == nil {
-		t.Fatal("DoH resolver should be initialized")
-	}
-
-	err = pm.Close()
-	if err != nil {
-		t.Errorf("Close() error: %v", err)
-	}
-}
-
-// TestCreateDialer_SSRFSuccessPath verifies that when SSRF protection is enabled
-// and the target resolves to a public IP, the validated address is used.
-func TestCreateDialer_SSRFSuccessPath(t *testing.T) {
-	// Create a local listener
-	listener, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer func() { _ = listener.Close() }()
-
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr == nil {
-			_ = conn.Close()
-		}
-	}()
-
-	// Use AllowPrivateIPs=false but set up the address as a validated public IP
-	// We test this by calling createDialer directly and using a public address
-	config := &Config{
-		AllowPrivateIPs: false,
-		DialTimeout:     2 * time.Second,
-		KeepAlive:       30 * time.Second,
-	}
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	dialFn := pm.createDialer()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Dial 8.8.8.8:443 — public IP, SSRF should allow
-	conn, dialErr := dialFn(ctx, "tcp", "8.8.8.8:443")
-	if dialErr != nil {
-		// Network may be unavailable — this test is best-effort
-		t.Logf("Could not connect to 8.8.8.8:443 (network may be restricted): %v", dialErr)
-		return
-	}
-	defer func() { _ = conn.Close() }()
-
-	// Verify it's a tracked connection
-	if _, ok := conn.(*trackedConn); !ok {
-		t.Error("expected trackedConn wrapper")
-	}
-}
+// TestClose_WithDoHResolver and TestCreateDialer_SSRFSuccessPath were removed:
+// - Close-with-DoH is covered by TestPoolManager_CloseWithDoHResolver
+//   (pool_coverage_test.go), which also varies DoHCacheTTL.
+// - The SSRF success path dialed the real host 8.8.8.8:443 and silently
+//   passed offline; the local public-IP dial path is covered by
+//   TestCreateDialer_AllowPrivateIPs and the ProxyAddr tests.
 
 // TestGetMetrics_HitRateCalculation verifies that the connection hit rate is
 // correctly calculated from total and rejected connection counts.
@@ -821,14 +598,19 @@ func TestGetMetrics_HitRateCalculation(t *testing.T) {
 		t.Errorf("initial hit rate = %f, want 0", m.ConnectionHitRate)
 	}
 
-	// Set some values to test hit rate calculation
-	atomic.StoreInt64(&pm.totalConns, 80)
-	atomic.StoreInt64(&pm.rejectedConns, 20)
+	// Set the real inputs of the hit-rate formula: cumulative accepted
+	// connections and rejected attempts (totalConns is a live gauge and no
+	// longer feeds the rate).
+	pm.acceptedConns.Store(80)
+	pm.rejectedConns.Store(20)
 
 	m = pm.GetMetrics()
 	wantHitRate := float64(80) / float64(80+20) // 0.8
 	if m.ConnectionHitRate != wantHitRate {
 		t.Errorf("hit rate = %f, want %f", m.ConnectionHitRate, wantHitRate)
+	}
+	if m.TotalConnections != 80 {
+		t.Errorf("TotalConnections = %d, want 80 (cumulative accepted)", m.TotalConnections)
 	}
 }
 
@@ -841,7 +623,7 @@ func TestGetMetrics_ActiveConnections(t *testing.T) {
 	}
 	defer func() { _ = pm.Close() }()
 
-	atomic.StoreInt64(&pm.activeConns, 42)
+	pm.activeConns.Store(42)
 
 	m := pm.GetMetrics()
 	if m.ActiveConnections != 42 {
@@ -853,50 +635,11 @@ func TestGetMetrics_ActiveConnections(t *testing.T) {
 	}
 }
 
-// TestCreateDialer_DoHPath exercises the DoH resolver path in createDialer
-// by enabling DoH and making an HTTP request to a local test server.
-func TestCreateDialer_DoHPath(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping DoH integration test in short mode")
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	config := DefaultConfig()
-	config.AllowPrivateIPs = true
-	config.EnableDoH = true
-
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	if pm.dohResolver == nil {
-		t.Skip("DoH resolver not available")
-	}
-
-	client := &http.Client{
-		Transport: pm.GetTransport(),
-		Timeout:   10 * time.Second,
-	}
-
-	resp, err := client.Get(server.URL)
-	if err != nil {
-		// DoH resolution may fail in restricted networks
-		t.Logf("DoH path request failed (expected in restricted networks): %v", err)
-		return
-	}
-	_ = resp.Body.Close()
-
-	metrics := pm.GetMetrics()
-	t.Logf("DoH path metrics: Total=%d, Active=%d, Rejected=%d, HitRate=%.2f",
-		metrics.TotalConnections, metrics.ActiveConnections,
-		metrics.RejectedConnections, metrics.ConnectionHitRate)
-}
+// TestCreateDialer_DoHPath was removed: it issued a request through the DoH
+// resolver but only logged the resulting metrics (no assertion) and silently
+// returned on network failure. The DoH dialer path with real assertions lives
+// in TestCreateDialer_DoHResolutionFailure (pool_coverage_test.go) and
+// TestCreateDialer_DoHPath_SSRFBlock below.
 
 // TestCreateDialer_DoHPath_SSRFBlock verifies that the DoH path blocks
 // connections to private IPs when SSRF protection is enabled.

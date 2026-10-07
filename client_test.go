@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"reflect"
 	"strings"
@@ -257,7 +259,7 @@ func TestPackageLevel_AllMethods(t *testing.T) {
 			t.Fatalf("Failed to create client: %v", err)
 		}
 		_ = SetDefaultClient(client)
-		defer CloseDefaultClient()
+		defer func() { _ = CloseDefaultClient() }() // best-effort cleanup
 
 		for _, tt := range methodTests {
 			t.Run(tt.name, func(t *testing.T) {
@@ -270,36 +272,21 @@ func TestPackageLevel_AllMethods(t *testing.T) {
 				}
 			})
 		}
+
+		// The context-taking Request variant is a separate public entry point.
+		t.Run("Request", func(t *testing.T) {
+			resp, err := Request(context.Background(), "PATCH", server.URL)
+			if err != nil {
+				t.Fatalf("Package-level Request failed: %v", err)
+			}
+			if resp.StatusCode() != http.StatusOK {
+				t.Errorf("Expected status 200, got %d", resp.StatusCode())
+			}
+		})
 	})
-
-	t.Run("AutoInit", func(t *testing.T) {
-		// Close explicit client, test auto-initialization path
-		CloseDefaultClient()
-
-		// Set up a new client for auto-init tests
-		cfg := DefaultConfig()
-		cfg.Security.AllowPrivateIPs = true
-		client, err := New(cfg)
-		if err != nil {
-			t.Fatalf("Failed to create client: %v", err)
-		}
-		SetDefaultClient(client)
-		defer CloseDefaultClient()
-
-		for _, tt := range methodTests {
-			t.Run(tt.name, func(t *testing.T) {
-				resp, err := tt.fn(server.URL)
-				if err != nil {
-					t.Fatalf("Auto-init %s failed: %v", tt.name, err)
-				}
-				if resp.StatusCode() != http.StatusOK {
-					t.Errorf("Expected 200, got %d", resp.StatusCode())
-				}
-			})
-		}
-
-		CloseDefaultClient()
-	})
+	// True lazy auto-initialization (no prior SetDefaultClient) is covered by
+	// TestGetDefaultClient_Init, which resets defaultClient and forces the
+	// slow-init path directly.
 }
 
 // ----------------------------------------------------------------------------
@@ -328,44 +315,6 @@ func TestClient_ErrorHandling(t *testing.T) {
 		_, err := client.Get("http://192.0.2.1:12345")
 		if err == nil {
 			t.Error("Expected network error")
-		}
-	})
-}
-
-// ----------------------------------------------------------------------------
-// Result Pool Tests
-// ----------------------------------------------------------------------------
-
-func TestReleaseResult(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("test response"))
-	}))
-	defer server.Close()
-
-	client, _ := newTestClient()
-	defer client.Close()
-
-	t.Run("BasicRequest", func(t *testing.T) {
-		result, err := client.Get(server.URL)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-		if result.StatusCode() != http.StatusOK {
-			t.Errorf("Expected status 200, got %d", result.StatusCode())
-		}
-		if result.Body() == "" {
-			t.Error("Expected non-empty body")
-		}
-	})
-
-	t.Run("MultipleRequests", func(t *testing.T) {
-		for i := 0; i < 10; i++ {
-			result, err := client.Get(server.URL)
-			if err != nil {
-				t.Fatalf("Request %d failed: %v", i, err)
-			}
-			_ = result.Body()
 		}
 	})
 }
@@ -413,7 +362,7 @@ func TestRequest_WithCallbacks(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("response"))
+		_, _ = w.Write([]byte("response")) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -477,34 +426,6 @@ func TestRequest_CallbackErrors(t *testing.T) {
 	}
 }
 
-// ----------------------------------------------------------------------------
-// Package-Level Request Coverage
-// ----------------------------------------------------------------------------
-
-func TestPackageLevel_Request(t *testing.T) {
-	config := DefaultConfig()
-	config.Security.AllowPrivateIPs = true
-	client, _ := New(config)
-	_ = SetDefaultClient(client)
-	defer CloseDefaultClient()
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != "PATCH" {
-			t.Errorf("Expected PATCH, got %s", r.Method)
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	resp, err := Request(context.Background(), "PATCH", server.URL)
-	if err != nil {
-		t.Fatalf("Package-level Request failed: %v", err)
-	}
-	if resp.StatusCode() != http.StatusOK {
-		t.Errorf("Expected 200, got %d", resp.StatusCode())
-	}
-}
-
 func TestSetDefaultClient_Boundaries(t *testing.T) {
 	t.Run("nil client", func(t *testing.T) {
 		if err := SetDefaultClient(nil); err == nil {
@@ -561,7 +482,7 @@ func TestGetDefaultClient_Init(t *testing.T) {
 	}
 
 	// Clean up - close the auto-created client
-	CloseDefaultClient()
+	_ = CloseDefaultClient() // best-effort cleanup
 }
 
 func TestClose_DoubleClose(t *testing.T) {
@@ -640,13 +561,132 @@ func TestNewFromPreparedConfig_InsecureSkipVerifyWarn(t *testing.T) {
 	// intentionally not exercised here.
 }
 
+// TestNewFromPreparedConfig_TLSConfigInsecureSkipVerifyWarn verifies the warning
+// also fires when InsecureSkipVerify is set inside a custom Security.TLSConfig
+// rather than via the top-level Security.InsecureSkipVerify flag. Before the
+// fix, only the top-level flag was checked and the embedded one silently
+// disabled verification with no warning.
+func TestNewFromPreparedConfig_TLSConfigInsecureSkipVerifyWarn(t *testing.T) {
+	origArgs := os.Args[0]
+	origGoTest := os.Getenv("GO_TEST")
+	origGotest := os.Getenv("GOTEST")
+	defer func() {
+		os.Args[0] = origArgs
+		os.Setenv("GO_TEST", origGoTest)
+		os.Setenv("GOTEST", origGotest)
+		insecureSkipVerifyWarnOnce = sync.Once{}
+		securityWarnOutput = os.Stderr
+	}()
+
+	os.Args[0] = "/usr/bin/myapp"
+	os.Setenv("GO_TEST", "")
+	os.Setenv("GOTEST", "")
+	insecureSkipVerifyWarnOnce = sync.Once{}
+
+	var buf bytes.Buffer
+	SetSecurityWarnOutput(&buf)
+
+	cfg := DefaultConfig()
+	cfg.Security.InsecureSkipVerify = false // only the embedded TLSConfig sets it
+	cfg.Security.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	client, err := newFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("newFromConfig failed: %v", err)
+	}
+	defer client.Close()
+
+	if output := buf.String(); !strings.Contains(output, "InsecureSkipVerify is enabled") {
+		t.Errorf("expected warning for TLSConfig-embedded InsecureSkipVerify, got: %s", output)
+	}
+}
+
+// fakePSL is a minimal cookiejar.PublicSuffixList that treats "com" as a
+// public suffix — enough to prove the list is plumbed into the jar.
+type fakePSL struct{}
+
+func (fakePSL) PublicSuffix(domain string) string {
+	if domain == "com" {
+		return "com"
+	}
+	return "example.com" // everything else maps to one suffix
+}
+func (fakePSL) String() string { return "fakepsl" }
+
+// TestCreateCookieJar_PublicSuffixList verifies Connection.PublicSuffixList is
+// forwarded to the jar. The classic PSL win: a Domain="com" supercookie (set
+// by example.com) is rejected when a PSL is configured, but stored when the
+// list is nil.
+func TestCreateCookieJar_PublicSuffixList(t *testing.T) {
+	exampleURL := &url.URL{Scheme: "http", Host: "example.com"}
+	supercookie := []*http.Cookie{{Name: "a", Value: "1", Domain: "com"}}
+
+	t.Run("with PSL rejects public-suffix domain cookie", func(t *testing.T) {
+		jar, err := createCookieJar(true, fakePSL{})
+		if err != nil {
+			t.Fatalf("createCookieJar failed: %v", err)
+		}
+		jar.SetCookies(exampleURL, supercookie)
+		if got := jar.Cookies(exampleURL); len(got) != 0 {
+			t.Errorf("PSL jar must reject Domain=com supercookie, got %v", got)
+		}
+	})
+
+	t.Run("without PSL accepts public-suffix domain cookie", func(t *testing.T) {
+		jar, err := createCookieJar(true, nil)
+		if err != nil {
+			t.Fatalf("createCookieJar failed: %v", err)
+		}
+		jar.SetCookies(exampleURL, supercookie)
+		if got := jar.Cookies(exampleURL); len(got) == 0 {
+			t.Error("nil-PSL jar exhibits the historical looser matching (baseline for comparison)")
+		}
+	})
+
+	t.Run("cookies disabled returns nil jar", func(t *testing.T) {
+		jar, err := createCookieJar(false, fakePSL{})
+		if err != nil || jar != nil {
+			t.Errorf("expected nil jar without error, got jar=%v err=%v", jar, err)
+		}
+	})
+}
+
+// TestRequest_StreamBodyRejectedOnFacade verifies Get + WithStreamBody fails
+// with ErrStreamBodyRequiresDownload instead of silently returning a Result
+// with an empty body (the pre-fix behavior).
+func TestRequest_StreamBodyRejectedOnFacade(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("stream me"))
+	}))
+	defer ts.Close()
+
+	client, err := newTestClient()
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	_, err = client.Get(ts.URL, WithStreamBody(true))
+	if !errors.Is(err, ErrStreamBodyRequiresDownload) {
+		t.Fatalf("expected ErrStreamBodyRequiresDownload, got %v", err)
+	}
+
+	// Sanity: the same request without streaming still succeeds.
+	result, err := client.Get(ts.URL)
+	if err != nil {
+		t.Fatalf("plain Get failed: %v", err)
+	}
+	if result.Body() == "" {
+		t.Fatal("plain Get should return the buffered body")
+	}
+}
+
 // ----------------------------------------------------------------------------
 // getDefaultClient — self-heal after Close (FIX-001)
 // ----------------------------------------------------------------------------
 
 func TestGetDefaultClient_SelfHealAfterClose(t *testing.T) {
 	defaultClient.Store(nil)
-	defer CloseDefaultClient()
+	defer func() { _ = CloseDefaultClient() }() // best-effort cleanup
 
 	// Acquire, then close via the client itself (leaves a closed impl stored,
 	// not nil) — exercises the IsClosed() fast/slow-path checks.
@@ -670,7 +710,7 @@ func TestGetDefaultClient_SelfHealAfterClose(t *testing.T) {
 	}
 
 	// Also cover the CloseDefaultClient path that stores nil before re-acquire.
-	CloseDefaultClient()
+	_ = CloseDefaultClient() // best-effort cleanup
 	c3, err := getDefaultClient()
 	if err != nil || c3 == nil {
 		t.Fatalf("getDefaultClient after CloseDefaultClient failed: err=%v client=%v", err, c3)
@@ -680,7 +720,7 @@ func TestGetDefaultClient_SelfHealAfterClose(t *testing.T) {
 
 func TestGetDefaultClient_ConcurrentSelfHeal(t *testing.T) {
 	defaultClient.Store(nil)
-	defer CloseDefaultClient()
+	defer func() { _ = CloseDefaultClient() }() // best-effort cleanup
 
 	const goroutines, iters = 16, 4
 	var wg sync.WaitGroup

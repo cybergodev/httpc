@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== HTTPC Redirect Examples ===\n ")
+	fmt.Println("=== HTTPC Redirect Examples ===")
 
 	// Example 1: Automatic redirect following (default behavior)
 	example1AutoFollow()
@@ -33,6 +33,8 @@ func main() {
 
 	// Example 7: Redirect whitelist (security)
 	example7RedirectWhitelist()
+
+	fmt.Println("\n=== All Examples Completed ===")
 }
 
 func example1AutoFollow() {
@@ -93,7 +95,7 @@ func example3MaxRedirects() {
 	// Configure client with redirect limit
 	config := httpc.DefaultConfig()
 	config.Defaults.FollowRedirects = true
-	config.Defaults.MaxRedirects = 2 // Only follow up to 2 redirects
+	config.Defaults.MaxRedirects = 2 // Limit counts the initial request: at most 1 redirect is followed
 	client, err := httpc.New(config)
 	if err != nil {
 		log.Printf("Failed to create client: %v\n", err)
@@ -101,7 +103,7 @@ func example3MaxRedirects() {
 	}
 	defer client.Close()
 
-	// This will fail because it tries to redirect 3 times
+	// This will fail: /redirect/3 needs 4 requests, the limit allows 2
 	resp, err := client.Get("https://httpbin.org/redirect/3")
 	if err != nil {
 		fmt.Printf("Expected error: %v\n", err)
@@ -109,8 +111,9 @@ func example3MaxRedirects() {
 		fmt.Printf("Unexpected success: %d redirects\n", resp.Meta.RedirectCount)
 	}
 
-	// This will succeed because it only redirects 2 times
-	resp, err = client.Get("https://httpbin.org/redirect/2")
+	// This succeeds: /redirect/1 needs 2 requests (initial + 1 redirect),
+	// exactly within the limit of 2
+	resp, err = client.Get("https://httpbin.org/redirect/1")
 	if err != nil {
 		log.Printf("Error: %v\n", err)
 		return
@@ -283,7 +286,7 @@ func example7RedirectWhitelist() {
 	}
 	defer client.Close()
 
-	// Same-domain redirect: allowed (httpbin.org → httpbin.org)
+	// Same-domain redirect: allowed (httpbin.org -> httpbin.org)
 	resp, err := client.Get("https://httpbin.org/redirect/1")
 	if err != nil {
 		log.Printf("Same-domain redirect error: %v\n", err)
@@ -295,5 +298,5 @@ func example7RedirectWhitelist() {
 	fmt.Println("\nRedirectWhitelist:")
 	fmt.Println("  - Only listed domains may receive redirected requests")
 	fmt.Println("  - Blocks open-redirect and redirect-based SSRF attacks")
-	fmt.Println("  - Combine with SecureConfig() for defense-in-depth\n ")
+	fmt.Println("  - Combine with SecureConfig() for defense-in-depth")
 }

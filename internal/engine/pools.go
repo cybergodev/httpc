@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -84,11 +85,16 @@ func CloneHeader(src http.Header) http.Header {
 			dst[k] = zeroStringSlice
 		case 1:
 			allValues[valueIdx] = v[0]
-			dst[k] = allValues[valueIdx : valueIdx+1]
+			// Cap-1 window (3-index slice), matching captureRequestHeaders: a
+			// 2-index window's cap would reach into the neighboring header's
+			// values, so appending to this entry could clobber another header.
+			dst[k] = allValues[valueIdx : valueIdx+1 : valueIdx+1]
 			valueIdx++
 		default:
 			endIdx := valueIdx + len(v)
-			newVals := allValues[valueIdx:endIdx]
+			// 3-index window for the same reason as the single-value case: a
+			// 2-index cap would reach into the next header's values.
+			newVals := allValues[valueIdx:endIdx:endIdx]
 			copy(newVals, v)
 			dst[k] = newVals
 			valueIdx = endIdx
@@ -140,86 +146,19 @@ func shouldEscape(c byte) bool {
 		c != '-' && c != '.' && c != '_' && c != '~'
 }
 
-// queryEscapePool pools byte slices for query escaping.
-var queryEscapePool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 64)
-		return &b
-	},
-}
-
 // maxQueryEscapeSize limits the maximum input size for optimized query escaping.
 // Inputs larger than this will use the standard library to avoid integer overflow
 // in capacity calculation (len(s)*3) and excessive memory allocation.
 const maxQueryEscapeSize = 10 * 1024 * 1024 // 10MB
 
-// QueryEscape performs URL query escaping with minimal allocations.
-// Returns the original string if no escaping is needed (zero allocation).
-func QueryEscape(s string) string {
-	// SECURITY: For very large inputs, use standard library to avoid:
-	// 1. Integer overflow in len(s)*3 capacity calculation (32-bit systems)
-	// 2. Excessive memory allocation
-	if len(s) > maxQueryEscapeSize {
-		// Count escapes to determine if we can return original
-		for i := 0; i < len(s); i++ {
-			if shouldEscape(s[i]) {
-				// Use standard library for large inputs that need escaping
-				return url.QueryEscape(s)
-			}
-		}
-		return s // No escaping needed
-	}
-
-	// Fast path: scan for characters that need escaping
-	var needsEscape bool
-	for i := 0; i < len(s); i++ {
-		if shouldEscape(s[i]) {
-			needsEscape = true
-			break
-		}
-	}
-	if !needsEscape {
-		return s // Zero allocation for strings that don't need escaping
-	}
-
-	// Slow path: escape using pooled buffer
-	// Safe from overflow: len(s) <= maxQueryEscapeSize (10MB), so len(s)*3 <= 30MB
-	bufPtr, ok := queryEscapePool.Get().(*[]byte)
-	origPtr := bufPtr
-	if !ok || bufPtr == nil || cap(*bufPtr) < len(s)*3 {
-		tmp := make([]byte, 0, len(s)*3)
-		bufPtr = &tmp
-	}
-	buf := (*bufPtr)[:0]
-
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if !shouldEscape(c) {
-			buf = append(buf, c)
-		} else {
-			buf = append(buf, '%')
-			buf = append(buf, "0123456789ABCDEF"[c>>4])
-			buf = append(buf, "0123456789ABCDEF"[c&0x0F])
-		}
-	}
-
-	result := string(buf)
-	if cap(buf) <= 1024 {
-		*bufPtr = buf
-		queryEscapePool.Put(bufPtr)
-	} else if origPtr != bufPtr && origPtr != nil {
-		*origPtr = (*origPtr)[:0]
-		queryEscapePool.Put(origPtr)
-	}
-	return result
-}
-
 // AppendQueryEscape appends the URL-query-escaped form of s directly to b.
 // Writing straight into the builder avoids the intermediate escaped string
 // allocation that b.WriteString(QueryEscape(s)) would incur whenever s
 // contains characters that need escaping. Inputs with no escapable bytes are
-// written verbatim after a single scan. Mirrors QueryEscape's semantics
-// (RFC 3986 unreserved set) and large-input safety fallback.
+// written verbatim after a single scan. Uses the RFC 3986 unreserved set —
+// note this differs from url.QueryEscape for the space character (%20 here,
+// '+' in the stdlib form encoding), which servers decode identically. Very
+// large inputs fall back to the standard library.
 func AppendQueryEscape(b *strings.Builder, s string) {
 	// SECURITY: delegate very large inputs to the standard library to avoid the
 	// per-byte loop cost and keep parity with QueryEscape's overflow guard.
@@ -279,8 +218,36 @@ func appendQueryParams(existingQuery string, params map[string]any) string {
 
 	var numBuf [32]byte // stack-allocated buffer for numeric formatting
 
+	// Fast path: a single parameter has no ordering to determine, so the
+	// key slice (and its sort) can be skipped entirely — one fewer allocation
+	// for the very common single-WithQuery request.
+	if len(params) == 1 {
+		for key, value := range params {
+			if existingQuery != "" {
+				sb.WriteByte('&')
+			}
+			AppendQueryEscape(sb, key)
+			sb.WriteByte('=')
+			writeQueryParamValue(sb, value, numBuf[:0])
+		}
+		result := sb.String()
+		putQueryBuilder(sb)
+		return result
+	}
+
+	// Sort keys for deterministic output, matching url.Values.Encode and
+	// encodeFormFields semantics. Map iteration order is random per request;
+	// unsorted keys would make the wire format nondeterministic, which breaks
+	// request signing/HMAC, response caching keyed on the URL, and multiplies
+	// entries in the URL cache (same params, different orderings).
+	keys := make([]string, 0, len(params))
+	for key := range params {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+
 	first := existingQuery == ""
-	for key, value := range params {
+	for _, key := range keys {
 		if first {
 			first = false
 		} else {
@@ -289,7 +256,7 @@ func appendQueryParams(existingQuery string, params map[string]any) string {
 		AppendQueryEscape(sb, key)
 		sb.WriteByte('=')
 
-		writeQueryParamValue(sb, value, numBuf[:0])
+		writeQueryParamValue(sb, params[key], numBuf[:0])
 	}
 
 	result := sb.String()
@@ -303,6 +270,11 @@ func appendQueryParams(existingQuery string, params map[string]any) string {
 // into the builder via appendQueryEscape.
 // nil emits nothing, matching FormatQueryParam (which formats nil as "");
 // without this guard the default %v branch would render the literal "<nil>".
+//
+// MAINTENANCE: this type switch has two siblings that MUST stay in sync —
+// FormatQueryParam (request.go, inspection/doc path) and the facade's
+// queryValueLength (public_options.go). query_param_parity_test.go guards
+// the drift; when adding a type, add it to all three.
 func writeQueryParamValue(sb *strings.Builder, value any, numBuf []byte) {
 	if value == nil {
 		return

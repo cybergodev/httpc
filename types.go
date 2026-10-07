@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/http/cookiejar"
 	"strconv"
 	"strings"
 	"sync"
@@ -16,17 +17,21 @@ import (
 )
 
 const (
-	maxJSONSize             = 50 * 1024 * 1024   // 50MB
-	maxTimeout              = 30 * time.Minute   // 30 minutes
-	maxIdleConns            = 1000               // Connection pool limit
-	maxConnsPerHost         = 1000               // Per-host connection limit
-	maxResponseBodySize     = 1024 * 1024 * 1024 // 1GB
-	maxDecompressedBodySize = 100 * 1024 * 1024  // 100MB default for decompressed bodies
-	maxRetryAttempts        = 10                 // Maximum retry attempts
-	minBackoffFactor        = 1.0                // Minimum backoff multiplier
-	maxBackoffFactor        = 10.0               // Maximum backoff multiplier
-	maxUserAgentLen         = 512                // User-Agent header limit
-	maxRedirectLimit        = 50                 // Maximum redirect limit
+	maxJSONSize         = 50 * 1024 * 1024   // 50MB
+	maxTimeout          = 30 * time.Minute   // 30 minutes
+	maxIdleConns        = 1000               // Connection pool limit
+	maxConnsPerHost     = 1000               // Per-host connection limit
+	maxResponseBodySize = 1024 * 1024 * 1024 // 1GB
+	// maxDecompressedBodySize is the validation ceiling for
+	// Security.MaxDecompressedBodySize. It intentionally matches the engine's
+	// runtime default (engine.defaultMaxDecompressedSize in response.go): the
+	// default must stay admissible. Keep the two in sync when changing either.
+	maxDecompressedBodySize = 100 * 1024 * 1024 // 100MB default for decompressed bodies
+	maxRetryAttempts        = 10                // Maximum retry attempts
+	minBackoffFactor        = 1.0               // Minimum backoff multiplier
+	maxBackoffFactor        = 10.0              // Maximum backoff multiplier
+	maxUserAgentLen         = 512               // User-Agent header limit
+	maxRedirectLimit        = 50                // Maximum redirect limit
 )
 
 // TimeoutConfig configures timeout behavior for HTTP requests.
@@ -153,6 +158,13 @@ type ConnectionConfig struct {
 	// Default: false.
 	EnableCookies bool
 
+	// PublicSuffixList supplies a public-suffix database to the cookie jar
+	// (see net/http/cookiejar.PublicSuffixList). Without one, the jar accepts
+	// cookies on public suffixes and applies looser domain matching, which can
+	// leak cookies across unrelated subdomains. Recommended value:
+	// golang.org/x/net/publicsuffix.List. Default: nil (no PSL enforcement).
+	PublicSuffixList cookiejar.PublicSuffixList
+
 	// EnableDoH enables DNS-over-HTTPS for DNS resolution.
 	// Default: false.
 	EnableDoH bool
@@ -163,7 +175,7 @@ type ConnectionConfig struct {
 
 	// MaxResponseHeaderBytes limits the maximum size of the server's response headers.
 	// This protects against malicious servers sending excessively large headers.
-	// Default: 0 (uses Go stdlib default of 10MB).
+	// Default: 0 (uses Go stdlib default of 1MB, net/http.DefaultMaxHeaderBytes).
 	MaxResponseHeaderBytes int64
 }
 
@@ -220,8 +232,10 @@ type SecurityConfig struct {
 	// StrictContentLength enables strict Content-Length validation. Default: true.
 	StrictContentLength bool
 
-	// CookieSecurity enables cookie security attribute validation.
-	// Default: nil (no validation).
+	// CookieSecurity is currently not enforced during request processing.
+	// Cookie security validation is applied via WithSecureCookie (per
+	// request) or SessionConfig.CookieSecurity (per session).
+	// Default: nil.
 	CookieSecurity *CookieSecurityConfig
 
 	// CertificatePinner, when set, enables certificate pinning: the TLS
@@ -258,7 +272,20 @@ type RetryConfig struct {
 	// Default: 30s. Set to 0 for no cap (not recommended).
 	MaxRetryDelay time.Duration
 
+	// RetryNonIdempotent allows retrying non-idempotent methods (POST, PATCH,
+	// and custom methods). Default: false — such requests execute exactly
+	// once, because a timeout or retryable 5xx may arrive after the server
+	// already committed the operation, and replaying the body would duplicate
+	// it (duplicate payment, double insert, ...). Enable only when the
+	// endpoint is known to tolerate replay, or guard it with an idempotency
+	// key. Idempotent methods (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) are
+	// always retried subject to MaxRetries.
+	RetryNonIdempotent bool
+
 	// CustomPolicy overrides the built-in retry logic. Default: nil.
+	// Like the built-in policy, it is only consulted for idempotent
+	// methods; a custom policy does not re-enable retries for POST/PATCH
+	// unless RetryNonIdempotent (or WithRetryNonIdempotent) is also set.
 	CustomPolicy RetryPolicy
 }
 
@@ -293,7 +320,9 @@ type RequestDefaults struct {
 
 // Config defines the HTTP client configuration organized into logical groups.
 // Use DefaultConfig() for sensible defaults, or use preset configurations
-// like SecureConfig(), PerformanceConfig(), or MinimalConfig().
+// like SecureConfig(), PerformanceConfig(), or MinimalConfig(). New validates
+// the configuration before use; call Validate to pre-check a Config without
+// constructing a client.
 //
 // Example:
 //
@@ -303,12 +332,20 @@ type RequestDefaults struct {
 //	cfg.Connection.ProxyURL = "http://proxy:8080"
 //	client, err := httpc.New(cfg)
 type Config struct {
-	Timeouts   TimeoutConfig
+	// Timeouts configures request, dial, TLS-handshake, response-header, and
+	// idle-connection timeouts.
+	Timeouts TimeoutConfig
+	// Connection configures pooling, proxies, HTTP/2, cookies, and DNS-over-HTTPS.
 	Connection ConnectionConfig
-	Security   SecurityConfig
-	Retry      RetryConfig
+	// Security configures TLS, SSRF protection, and body-size limits.
+	Security SecurityConfig
+	// Retry configures automatic retries of retryable failures.
+	Retry RetryConfig
+	// Middleware configures the per-client middleware chain.
 	Middleware MiddlewareConfig
-	Defaults   RequestDefaults
+	// Defaults holds per-request defaults (User-Agent, default headers,
+	// redirect policy) applied to every outgoing request.
+	Defaults RequestDefaults
 
 	// parsedCIDRs caches parsed SSRFExemptCIDRs to avoid double parsing.
 	// Filled by parseSSRFExemptCIDRs; consumed by convertToEngineConfig.
@@ -451,12 +488,13 @@ func DefaultConfig() Config {
 			StrictContentLength:     true,
 		},
 		Retry: RetryConfig{
-			MaxRetries:    3,
-			Delay:         1 * time.Second,
-			BackoffFactor: 2.0,
-			EnableJitter:  true,
-			MaxRetryDelay: 30 * time.Second,
-			CustomPolicy:  nil,
+			MaxRetries:         3,
+			Delay:              1 * time.Second,
+			BackoffFactor:      2.0,
+			EnableJitter:       true,
+			MaxRetryDelay:      30 * time.Second,
+			RetryNonIdempotent: false,
+			CustomPolicy:       nil,
 		},
 		Middleware: MiddlewareConfig{
 			Middlewares: nil,
@@ -486,8 +524,20 @@ func validateRange(field string, v, max int) error {
 	return nil
 }
 
+// Validate checks the configuration and returns an error describing the first
+// invalid value found, or nil if the configuration is valid. It is the method
+// form of ValidateConfig, which New and NewDomain call internally; call it
+// directly to validate a Config before construction (e.g., at startup or
+// config-load time).
+//
+// Calling Validate on a nil *Config is safe and returns ErrNilConfig.
+func (c *Config) Validate() error {
+	return ValidateConfig(c)
+}
+
 // ValidateConfig validates the configuration and returns an error if invalid.
 // This is called internally by New() but can also be called explicitly.
+// Equivalent to (*Config).Validate, which is preferred in new code.
 func ValidateConfig(cfg *Config) error {
 	if cfg == nil {
 		return ErrNilConfig
@@ -522,7 +572,10 @@ func ValidateConfig(cfg *Config) error {
 	}
 	for _, proxyURL := range cfg.Connection.ProxyPool {
 		if _, err := validation.ValidateProxyURL(proxyURL); err != nil {
-			return fmt.Errorf("%w: Connection.ProxyPool entry %q: %w", ErrInvalidConnection, proxyURL, err)
+			// SECURITY: sanitize before echoing — a misconfigured proxy URL
+			// containing userinfo would otherwise print its password into
+			// application logs.
+			return fmt.Errorf("%w: Connection.ProxyPool entry %q: %w", ErrInvalidConnection, validation.SanitizeURL(proxyURL), err)
 		}
 	}
 	if cfg.Connection.ProxyFailureThreshold < 0 {
@@ -595,7 +648,8 @@ func ValidateConfig(cfg *Config) error {
 }
 
 // parseSSRFExemptCIDRs parses and caches CIDR networks from SSRFExemptCIDRs.
-// Called after deepCopyConfig to avoid mutating the caller's original Config.
+// Called after copyConfig (in validatedCopy) so the cache is stored on the
+// private copy, not the caller's original Config.
 func (c *Config) parseSSRFExemptCIDRs() error {
 	if len(c.Security.SSRFExemptCIDRs) == 0 {
 		return nil

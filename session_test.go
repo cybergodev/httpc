@@ -3,6 +3,7 @@ package httpc
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/cybergodev/httpc/internal/validation"
@@ -12,21 +13,9 @@ import (
 // SESSION MANAGER TESTS
 // ============================================================================
 
-func TestNewSessionManager(t *testing.T) {
-	session, err := NewSessionManager(DefaultSessionConfig())
-	if err != nil {
-		t.Fatalf("NewSessionManager error: %v", err)
-	}
-	if session == nil {
-		t.Fatal("Expected non-nil SessionManager")
-	}
-	if len(session.cookies) != 0 {
-		t.Error("Expected empty cookies map")
-	}
-	if len(session.headers) != 0 {
-		t.Error("Expected empty headers map")
-	}
-}
+// TestNewSessionManager construction with defaults is covered by
+// TestNewSessionManagerDefault (DefaultSessionConfig is its input), so no
+// separate minimal-constructor test is kept here.
 
 func TestNewSessionManagerWithConfig(t *testing.T) {
 	securityConfig := validation.StrictCookieSecurityConfig()
@@ -228,6 +217,14 @@ func TestSessionManager_SetHeader(t *testing.T) {
 	if err := session.SetHeader("X-Bad", "value\r\nX-Injected: malicious"); err == nil {
 		t.Error("Expected error for header with CRLF")
 	}
+
+	// Oversize key / value are rejected by ValidateHeaderKeyValue limits.
+	if err := session.SetHeader("X-"+strings.Repeat("k", validation.MaxHeaderKeyLen), "value"); err == nil {
+		t.Error("Expected error for oversize header key")
+	}
+	if err := session.SetHeader("X-Key", strings.Repeat("v", validation.MaxValueLen+1)); err == nil {
+		t.Error("Expected error for oversize header value")
+	}
 }
 
 func TestSessionManager_SetHeaders(t *testing.T) {
@@ -414,4 +411,84 @@ func TestSessionManager_SetCookies_NilElement(t *testing.T) {
 	if err == nil {
 		t.Error("expected error for nil cookie element")
 	}
+}
+
+// ----------------------------------------------------------------------------
+// Nil-receiver safety
+// ----------------------------------------------------------------------------
+
+// TestSessionManager_NilReceiverSafety verifies every SessionManager method
+// either returns an error or is a safe no-op when called on a nil receiver.
+func TestSessionManager_NilReceiverSafety(t *testing.T) {
+	var s *SessionManager // nil receiver
+
+	t.Run("SetCookieSecurity does not panic", func(t *testing.T) {
+		s.SetCookieSecurity(nil)
+	})
+
+	t.Run("SetHeader returns error", func(t *testing.T) {
+		if err := s.SetHeader("key", "val"); err == nil {
+			t.Error("expected error on nil receiver")
+		}
+	})
+
+	t.Run("SetHeaders returns error", func(t *testing.T) {
+		if err := s.SetHeaders(map[string]string{"k": "v"}); err == nil {
+			t.Error("expected error on nil receiver")
+		}
+	})
+
+	t.Run("SetHeaders with invalid header returns error", func(t *testing.T) {
+		sm, _ := NewSessionManagerDefault()
+		badHeaders := map[string]string{"": "empty-key"}
+		if err := sm.SetHeaders(badHeaders); err == nil {
+			t.Error("expected error for empty header key")
+		}
+	})
+
+	t.Run("DeleteHeader does not panic", func(t *testing.T) {
+		s.DeleteHeader("key")
+	})
+
+	t.Run("ClearHeaders does not panic", func(t *testing.T) {
+		s.ClearHeaders()
+	})
+
+	t.Run("GetHeaders returns nil", func(t *testing.T) {
+		if h := s.GetHeaders(); h != nil {
+			t.Errorf("expected nil, got %v", h)
+		}
+	})
+
+	t.Run("SetCookie returns error", func(t *testing.T) {
+		if err := s.SetCookie(&http.Cookie{Name: "k", Value: "v"}); err == nil {
+			t.Error("expected error on nil receiver")
+		}
+	})
+
+	t.Run("SetCookies returns error", func(t *testing.T) {
+		if err := s.SetCookies([]*http.Cookie{{Name: "k", Value: "v"}}); err == nil {
+			t.Error("expected error on nil receiver")
+		}
+	})
+
+	t.Run("DeleteCookie does not panic", func(t *testing.T) {
+		s.DeleteCookie("key")
+	})
+
+	t.Run("ClearCookies does not panic", func(t *testing.T) {
+		s.ClearCookies()
+	})
+
+	t.Run("GetCookies returns nil", func(t *testing.T) {
+		if c := s.GetCookies(); c != nil {
+			t.Errorf("expected nil, got %v", c)
+		}
+	})
+
+	t.Run("GetCookie returns nil", func(t *testing.T) {
+		if c := s.GetCookie("key"); c != nil {
+			t.Errorf("expected nil, got %v", c)
+		}
+	})
 }

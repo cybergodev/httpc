@@ -356,3 +356,36 @@ func BenchmarkNormalizeDomain(b *testing.B) {
 		})
 	}
 }
+
+// TestDomainWhitelist_BoundaryConditions pins matcher edge cases that were
+// previously untested: empty non-nil whitelist, trailing-dot hosts,
+// host:port inputs, and IPv6 literals (which never suffix-match domains).
+func TestDomainWhitelist_BoundaryConditions(t *testing.T) {
+	t.Run("empty non-nil whitelist denies everything", func(t *testing.T) {
+		w := NewDomainWhitelist()
+		if w.IsAllowed("example.com") {
+			t.Error("empty whitelist must not allow any host")
+		}
+	})
+
+	t.Run("trailing dot host matches", func(t *testing.T) {
+		w := NewDomainWhitelist("example.com")
+		if !w.IsAllowed("example.com.") {
+			t.Error("trailing-dot FQDN should match its domain entry")
+		}
+	})
+
+	t.Run("host with port does not match", func(t *testing.T) {
+		w := NewDomainWhitelist("example.com")
+		if w.IsAllowed("example.com:8080") {
+			t.Error("host:port input must not match a bare domain entry")
+		}
+	})
+
+	t.Run("IPv6 literal does not match domain entry", func(t *testing.T) {
+		w := NewDomainWhitelist("example.com")
+		if w.IsAllowed("[::1]") {
+			t.Error("IPv6 literal must not match a domain entry")
+		}
+	})
+}

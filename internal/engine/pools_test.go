@@ -2,6 +2,7 @@ package engine
 
 import (
 	"net/http"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"testing"
@@ -70,9 +71,30 @@ func TestQueryBuilder(t *testing.T) {
 		sb.WriteString(strings.Repeat("x", 5000))
 		putQueryBuilder(sb) // should discard
 	})
+
+	t.Run("poisoned pools fall back to fresh values", func(t *testing.T) {
+		// Wrong-typed entries exercise the !ok fallback branches of
+		// getHTTPHeader and getQueryBuilder.
+		httpHeaderPool.Put(new(int)) // wrong type, pointer-like for SA6002
+		queryBuilderPool.Put(42)     //nolint:staticcheck // intentional wrong-type poisoning
+
+		h := getHTTPHeader()
+		if h == nil {
+			t.Fatal("getHTTPHeader returned nil from poisoned pool")
+		}
+		h.Set("X-Test", "v") // must be usable
+		putHTTPHeader(h)
+
+		qb := getQueryBuilder()
+		if qb == nil {
+			t.Fatal("getQueryBuilder returned nil from poisoned pool")
+		}
+		qb.WriteString("ok")
+		putQueryBuilder(qb)
+	})
 }
 
-func TestQueryEscape(t *testing.T) {
+func TestAppendQueryEscape(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
@@ -86,13 +108,21 @@ func TestQueryEscape(t *testing.T) {
 		{"Unreserved", "-._~", "-._~"},
 		{"AllAlpha", "ABCxyz", "ABCxyz"},
 		{"Digits", "12345", "12345"},
+		// Meta characters — classic divergence vs url.QueryEscape ("+" and "%"
+		// must both be escaped here, same as the stdlib).
+		{"Plus", "a+b", "a%2Bb"},
+		{"Percent", "100%", "100%25"},
+		{"Ampersand", "a&b", "a%26b"},
+		{"Equals", "a=b", "a%3Db"},
+		{"Tilde vs percent-tilde", "~", "~"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := QueryEscape(tt.input)
-			if got != tt.want {
-				t.Errorf("queryEscape(%q) = %q, want %q", tt.input, got, tt.want)
+			var b strings.Builder
+			AppendQueryEscape(&b, tt.input)
+			if got := b.String(); got != tt.want {
+				t.Errorf("AppendQueryEscape(%q) = %q, want %q", tt.input, got, tt.want)
 			}
 		})
 	}
@@ -199,10 +229,11 @@ func TestWriteQueryParamValue_MatchesQueryEscapeFormatQueryParam(t *testing.T) {
 		writeQueryParamValue(&sb, v, numBuf[:0])
 		got := sb.String()
 
-		want := QueryEscape(FormatQueryParam(v))
-		if got != want {
-			t.Errorf("writeQueryParamValue(%T %v) = %q, want QueryEscape(FormatQueryParam) = %q",
-				v, v, got, want)
+		var wantBuilder strings.Builder
+		AppendQueryEscape(&wantBuilder, FormatQueryParam(v))
+		if got != wantBuilder.String() {
+			t.Errorf("writeQueryParamValue(%T %v) = %q, want AppendQueryEscape(FormatQueryParam) = %q",
+				v, v, got, wantBuilder.String())
 		}
 	}
 }
@@ -237,6 +268,35 @@ func TestGetMIMEHeader_ReuseAndClear(t *testing.T) {
 		t.Errorf("expected 1 header after populate, got %d", len(*h2))
 	}
 	putMIMEHeader(h2)
+}
+
+// TestGetMIMEHeader_PoolFallback covers the defensive !ok and typed-nil
+// branches of getMIMEHeader (wrong-typed or nil pooled values must yield a
+// fresh, usable header).
+func TestGetMIMEHeader_PoolFallback(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wrong type", func(t *testing.T) {
+		mimeHeaderPool.Put(new(int)) // wrong type, pointer-like for SA6002
+		h := getMIMEHeader()
+		if h == nil {
+			t.Fatal("expected fresh MIMEHeader from fallback")
+		}
+		(*h)["Content-Type"] = []string{"text/plain"}
+		if len(*h) != 1 {
+			t.Errorf("fallback header not usable, len=%d", len(*h))
+		}
+		putMIMEHeader(h)
+	})
+
+	t.Run("typed nil", func(t *testing.T) {
+		mimeHeaderPool.Put((*textproto.MIMEHeader)(nil))
+		h := getMIMEHeader()
+		if h == nil {
+			t.Fatal("expected fresh MIMEHeader for typed-nil pooled value")
+		}
+		putMIMEHeader(h)
+	})
 }
 
 // TestAcquireReleaseRequest_ResetContract validates the pooled-Request reset
@@ -359,15 +419,6 @@ func TestPoolHelpers_EdgeCases(t *testing.T) {
 		putHTTPHeader(h2)
 	})
 
-	t.Run("getMIMEHeader reuse clears entries", func(t *testing.T) {
-		h := getMIMEHeader()
-		(*h)["X-Test"] = []string{"value"}
-		putMIMEHeader(h)
-
-		h2 := getMIMEHeader()
-		if _, ok := (*h2)["X-Test"]; ok {
-			t.Error("reused MIMEHeader should be cleared of previous entries")
-		}
-		putMIMEHeader(h2)
-	})
+	// getMIMEHeader get->populate->put->get-cleared is asserted by the
+	// dedicated TestGetMIMEHeader_ReuseAndClear above.
 }

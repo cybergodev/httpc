@@ -28,7 +28,7 @@ import (
 // timeout) — a visibly different outcome.
 
 func main() {
-	fmt.Println("=== SSRF Protection Examples ===\n ")
+	fmt.Println("=== SSRF Protection Examples ===")
 
 	// 1. Default behavior: private/loopback addresses are blocked
 	demonstrateDefaultBlock()
@@ -49,14 +49,14 @@ func main() {
 // difference between an SSRF block and a connection failure is visible.
 func report(err error) {
 	if err == nil {
-		fmt.Println("  ✓ Request succeeded")
+		fmt.Println("  [OK] Request succeeded")
 		return
 	}
 	var clientErr *httpc.ClientError
 	if errors.As(err, &clientErr) {
-		fmt.Printf("  → %s: %s\n", clientErr.Code(), clientErr.Message)
+		fmt.Printf("  -> %s: %s\n", clientErr.Code(), clientErr.Message)
 	} else {
-		fmt.Printf("  → request failed: %v\n", err)
+		fmt.Printf("  -> request failed: %v\n", err)
 	}
 }
 

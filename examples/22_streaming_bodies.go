@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,7 +20,7 @@ import (
 // uploads/downloads or when body data is produced incrementally.
 
 func main() {
-	fmt.Println("=== Streaming Bodies Examples ===\n ")
+	fmt.Println("=== Streaming Bodies Examples ===")
 
 	client, err := httpc.NewDefault()
 	if err != nil {
@@ -64,7 +65,7 @@ func demonstrateReaderBody(client httpc.Client) {
 		return
 	}
 
-	fmt.Printf("✓ Uploaded io.Reader body: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Uploaded io.Reader body: Status %d\n", resp.StatusCode())
 	fmt.Printf("  Sent %d bytes without buffering the full content\n\n", len(largeContent))
 }
 
@@ -95,8 +96,8 @@ func demonstratePipeBody(client httpc.Client) {
 		return
 	}
 
-	fmt.Printf("✓ Streamed via io.Pipe: Status %d\n", resp.StatusCode())
-	fmt.Println("  Data produced and consumed concurrently — zero intermediate buffering\n ")
+	fmt.Printf("[OK] Streamed via io.Pipe: Status %d\n", resp.StatusCode())
+	fmt.Println("  Data produced and consumed concurrently — zero intermediate buffering")
 }
 
 // demonstrateLimitedReader shows how to protect against unbounded reader sizes.
@@ -122,9 +123,9 @@ func demonstrateLimitedReader(client httpc.Client) {
 		return
 	}
 
-	fmt.Printf("✓ Capped reader upload: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Capped reader upload: Status %d\n", resp.StatusCode())
 	fmt.Println("  Always wrap untrusted io.Reader sources with io.LimitReader")
-	fmt.Println("  to prevent resource exhaustion (bypasses body-size validation)\n ")
+	fmt.Println("  to prevent resource exhaustion (bypasses body-size validation)")
 }
 
 // demonstrateStreamDownload shows streaming a large response body to disk.
@@ -132,6 +133,17 @@ func demonstrateLimitedReader(client httpc.Client) {
 // full body into memory regardless. Download streams directly to the file.
 func demonstrateStreamDownload(client httpc.Client) {
 	fmt.Println("--- Example 4: Stream Large Body to Disk ---")
+
+	// Pitfall: WithStreamBody(true) on a regular Get is rejected with
+	// ErrStreamBodyRequiresDownload — those methods buffer the body into a
+	// Result and cannot hand the stream to the caller. Streaming is only
+	// effective through Download (and other engine-Response consumers).
+	_, err := client.Get("https://httpbin.org/get", httpc.WithStreamBody(true))
+	if errors.Is(err, httpc.ErrStreamBodyRequiresDownload) {
+		fmt.Println("  Get + WithStreamBody(true) correctly rejected with ErrStreamBodyRequiresDownload")
+	} else if err != nil {
+		log.Printf("Get + WithStreamBody error: %v\n", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -162,7 +174,7 @@ func demonstrateStreamDownload(client httpc.Client) {
 		return
 	}
 
-	fmt.Printf("\n✓ Streamed to disk: %s (%s, avg %s)\n",
+	fmt.Printf("\n[OK] Streamed to disk: %s (%s, avg %s)\n",
 		result.FilePath,
 		httpc.FormatBytes(result.BytesWritten),
 		httpc.FormatSpeed(result.AverageSpeed))

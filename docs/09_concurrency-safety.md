@@ -70,9 +70,9 @@ defer client.Close()
 
 ### Result Objects
 
-**⚠️ Not Safe for Concurrent Access**
+**⚠️ Do Not Share a Result Variable Across Goroutines**
 
-`Result` objects are NOT safe for concurrent access. Each goroutine should have its own `Result` instance:
+A `Result` is immutable once returned — concurrent **reads** (calling `Body()`, `Unmarshal()`, `SaveToFile()`, etc. on the same `Result`) are safe. The race to avoid is multiple goroutines assigning to the same `Result` *variable*, as in Pitfall 1 below. Each goroutine should hold its own reference:
 
 ```go
 // ❌ WRONG: Sharing Result across goroutines
@@ -257,13 +257,13 @@ HTTPC uses the following synchronization mechanisms internally:
 | Operation | Thread-Safe | Notes |
 |-----------|-------------|-------|
 | `client.Get/Post/etc.` | ✅ Yes | Safe for concurrent calls |
-| `client.Close()` | ✅ Yes | Safe to call once |
-| `client.Download()` | ✅ Yes | Safe for concurrent downloads |
-| `result.Unmarshal()` | ❌ No | Each goroutine needs own Result |
-| `result.SaveToFile()` | ❌ No | Each goroutine needs own Result |
+| `client.Close()` | ✅ Yes | Idempotent — safe to call multiple times (subsequent calls are no-ops) |
+| `client.Download()` | ✅ Yes | Safe for concurrent downloads to *different* file paths. Two concurrent downloads targeting the **same** path fail fast with `ErrDownloadInProgress` (in-process guard; cross-process coordination is the caller's responsibility) |
+| `result.Unmarshal()` (concurrent reads) | ✅ Yes | `Result` is immutable after return — safe to call concurrently on the same instance |
+| `result.SaveToFile()` | ✅ Yes | Read-only w.r.t. the `Result`; concurrent writes to the same *file path* are the caller's responsibility |
 | `domainClient.SetHeader()` | ✅ Yes | Safe for concurrent calls |
 | `domainClient.SetCookie()` | ✅ Yes | Safe for concurrent calls |
-| `domainClient.Close()` | ✅ Yes | Safe to call once |
+| `domainClient.Close()` | ✅ Yes | Idempotent — safe to call multiple times (subsequent calls are no-ops) |
 
 ## Common Pitfalls
 
@@ -296,7 +296,8 @@ client.Get(url)  // May fail if closed during request
 ### 3. Not Using Context for Timeout
 
 ```go
-// ❌ WRONG: No timeout, may hang forever
+// ❌ WRONG: No timeout control — only the client default applies
+// (180s with NewDefault); cannot cancel or shrink per request
 go func() {
     client.Get("https://slow.example.com")
 }()

@@ -19,7 +19,7 @@ import (
 // instead of reinventing local helpers.
 
 func main() {
-	fmt.Println("=== File Operations Examples ===\n ")
+	fmt.Println("=== File Operations Examples ===")
 
 	// Create downloads directory
 	if err := os.MkdirAll("downloads", 0755); err != nil {
@@ -59,7 +59,7 @@ func demonstrateFileUpload(client httpc.Client) {
 	if err != nil {
 		log.Printf("Single file error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Single file: Status %d (%d bytes)\n", resp.StatusCode(), len(fileContent))
+		fmt.Printf("[OK] Single file: Status %d (%d bytes)\n", resp.StatusCode(), len(fileContent))
 	}
 
 	// 2. Multiple files upload
@@ -82,7 +82,7 @@ func demonstrateFileUpload(client httpc.Client) {
 	if err != nil {
 		log.Printf("Multiple files error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Multiple files: Status %d (%d files)\n", resp.StatusCode(), len(formData.Files))
+		fmt.Printf("[OK] Multiple files: Status %d (%d files)\n", resp.StatusCode(), len(formData.Files))
 	}
 
 	// 3. File with form fields (metadata)
@@ -107,7 +107,7 @@ func demonstrateFileUpload(client httpc.Client) {
 	if err != nil {
 		log.Printf("File with fields error: %v\n", err)
 	} else {
-		fmt.Printf("✓ File with metadata: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] File with metadata: Status %d\n", resp.StatusCode())
 	}
 
 	// 4. Large file with timeout
@@ -123,7 +123,7 @@ func demonstrateFileUpload(client httpc.Client) {
 	if err != nil {
 		log.Printf("Large file error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Large file: Status %d (%d bytes, took %v)\n\n",
+		fmt.Printf("[OK] Large file: Status %d (%d bytes, took %v)\n\n",
 			resp.StatusCode(), len(largeFile), resp.Meta.Duration)
 	}
 }
@@ -143,7 +143,7 @@ func demonstrateFileDownload(client httpc.Client) {
 	if err != nil {
 		log.Printf("Simple download error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Simple download: %s (%s, %v)\n",
+		fmt.Printf("[OK] Simple download: %s (%s, %v)\n",
 			result.FilePath,
 			httpc.FormatBytes(result.BytesWritten),
 			result.Duration)
@@ -172,7 +172,7 @@ func demonstrateFileDownload(client httpc.Client) {
 	if err != nil {
 		log.Printf("\nProgress download error: %v\n", err)
 	} else {
-		fmt.Printf("\n✓ Progress download: %s (%s, avg %s)\n",
+		fmt.Printf("\n[OK] Progress download: %s (%s, avg %s)\n",
 			result.FilePath,
 			httpc.FormatBytes(result.BytesWritten),
 			httpc.FormatSpeed(result.AverageSpeed))
@@ -191,7 +191,7 @@ func demonstrateFileDownload(client httpc.Client) {
 	if err != nil {
 		log.Printf("Auth download error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Authenticated download: %s (%s)\n",
+		fmt.Printf("[OK] Authenticated download: %s (%s)\n",
 			result.FilePath,
 			httpc.FormatBytes(result.BytesWritten))
 	}
@@ -205,7 +205,7 @@ func demonstrateFileDownload(client httpc.Client) {
 		if err := resp.SaveToFile(filePath); err != nil {
 			log.Printf("Save error: %v\n", err)
 		} else {
-			fmt.Printf("✓ SaveToFile: %s (%s)\n",
+			fmt.Printf("[OK] SaveToFile: %s (%s)\n",
 				filePath,
 				httpc.FormatBytes(int64(len(resp.RawBody()))))
 		}
@@ -224,9 +224,9 @@ func demonstrateFileDownload(client httpc.Client) {
 		log.Printf("Resume download error: %v\n", err)
 	} else {
 		if result.Resumed {
-			fmt.Printf("✓ Resumed download: %s (resumed from partial)\n", result.FilePath)
+			fmt.Printf("[OK] Resumed download: %s (resumed from partial)\n", result.FilePath)
 		} else {
-			fmt.Printf("✓ Complete download: %s (no resume needed)\n", result.FilePath)
+			fmt.Printf("[OK] Complete download: %s (no resume needed)\n", result.FilePath)
 		}
 	}
 }
@@ -257,7 +257,7 @@ func demonstrateContextDownload(client httpc.Client) {
 		return
 	}
 
-	fmt.Printf("✓ Downloaded: %s (%s)\n",
+	fmt.Printf("[OK] Downloaded: %s (%s)\n",
 		result.FilePath,
 		httpc.FormatBytes(result.BytesWritten))
 	fmt.Println("\nPass a context to Download for:")
@@ -308,7 +308,7 @@ func demonstrateChecksumDownload() {
 		return
 	}
 
-	fmt.Printf("✓ Verified: %s (checksum %s)\n", verified.FilePath, verified.ActualChecksum)
+	fmt.Printf("[OK] Verified: %s (checksum %s)\n", verified.FilePath, verified.ActualChecksum)
 	fmt.Println("\nChecksum verification:")
 	fmt.Println("  - Checksum = expected SHA-256 hex (from a trusted source)")
 	fmt.Println("  - A mismatch removes the downloaded file and returns an error")

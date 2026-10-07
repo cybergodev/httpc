@@ -29,7 +29,7 @@ type APIResponse struct {
 
 func main() {
 	fmt.Println("=== HTTPC Quick Start Examples ===")
-	fmt.Println("Learn the basics in 5 minutes!\n ")
+	fmt.Println("Learn the basics in 5 minutes!")
 
 	// Example 1: Simplest GET request (package-level function)
 	simpleGET()

@@ -14,7 +14,7 @@ import (
 // for persisting headers and cookies across multiple requests
 
 func main() {
-	fmt.Println("=== Session Management Examples ===\n ")
+	fmt.Println("=== Session Management Examples ===")
 
 	// 1. Basic session usage
 	demonstrateBasicSession()
@@ -118,9 +118,11 @@ func demonstrateSessionWithClient() {
 func demonstrateSessionState() {
 	fmt.Println("--- Session State Lifecycle ---")
 
-	session, err := httpc.NewSessionManagerDefault()
+	// NewSessionManager(cfg) is the explicit constructor; DefaultSessionConfig()
+	// holds the same defaults that NewSessionManagerDefault() applies.
+	session, err := httpc.NewSessionManager(httpc.DefaultSessionConfig())
 	if err != nil {
-		log.Printf("Failed to create client: %v\n", err)
+		log.Printf("Failed to create session manager: %v\n", err)
 		return
 	}
 
@@ -156,4 +158,40 @@ func demonstrateSessionState() {
 	session.ClearCookies()
 	fmt.Printf("After clearing: %d headers, %d cookies\n",
 		len(session.GetHeaders()), len(session.GetCookies()))
+
+	// UpdateFromCookies adopts a whole slice of cookies in one call — e.g.
+	// resp.Response.Cookies() harvested from a previous Result, or cookies
+	// shared from another session. It returns no error; once cookie security
+	// is configured (below), non-compliant cookies are silently skipped.
+	session.UpdateFromCookies([]*http.Cookie{
+		{Name: "imported_a", Value: "1"},
+		{Name: "imported_b", Value: "2"},
+	})
+	fmt.Printf("After UpdateFromCookies: %d cookies\n",
+		len(session.GetCookies()))
+
+	// SetCookieSecurity applies attribute validation to every cookie stored
+	// in the session — the session-level counterpart of the per-request
+	// WithSecureCookie option. Cookies missing required attributes are
+	// rejected by SetCookie/SetCookies.
+	session.SetCookieSecurity(httpc.StrictCookieSecurityConfig())
+
+	strictOK := &http.Cookie{
+		Name:     "strict_session",
+		Value:    "value",
+		Secure:   true,
+		HttpOnly: true,
+		SameSite: http.SameSiteStrictMode,
+	}
+	if err := session.SetCookie(strictOK); err != nil {
+		log.Printf("Operation failed: %v\n", err)
+	} else {
+		fmt.Println("[OK] Strict-compliant cookie accepted (Secure+HttpOnly+SameSite=Strict)")
+	}
+
+	if err := session.SetCookie(&http.Cookie{Name: "insecure", Value: "no-attrs"}); err != nil {
+		fmt.Printf("[X] Non-compliant cookie rejected: %v\n", err)
+	} else {
+		fmt.Println("Non-compliant cookie was accepted")
+	}
 }

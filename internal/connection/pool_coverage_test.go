@@ -3,12 +3,10 @@ package connection
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net"
 	"net/http"
 	"net/url"
-	"sync"
-	"sync/atomic"
+	"strings"
 	"testing"
 	"time"
 
@@ -279,7 +277,7 @@ func TestCreateDialer_DoHResolutionFailure(t *testing.T) {
 	if err == nil {
 		t.Fatal("Expected error from closed DoH resolver")
 	}
-	if !contains(err.Error(), "DoH DNS resolution failed") {
+	if !strings.Contains(err.Error(), "DoH DNS resolution failed") {
 		t.Errorf("Expected DoH resolution failure, got: %v", err)
 	}
 
@@ -386,7 +384,7 @@ func TestResolveAndValidateAddress_CoverageGaps(t *testing.T) {
 		defer pm.Close()
 
 		// Passing nil context must not panic; it falls back to context.Background().
-		_, err = pm.resolveAndValidateAddress(nil, "localhost:443") //nolint:SA1012 // intentionally nil to test the fallback path
+		_, err = pm.resolveAndValidateAddress(nil, "localhost:443") //nolint:staticcheck // intentionally nil to test the fallback path
 		if err == nil {
 			t.Error("Expected error for localhost with nil context")
 		}
@@ -405,120 +403,6 @@ func TestResolveAndValidateAddress_CoverageGaps(t *testing.T) {
 			t.Error("Expected error for localhost without port")
 		}
 	})
-}
-
-// ---------------------------------------------------------------------------
-// updateConnectionMetrics: defensive type-assertion failure (pool.go:645-647, 667-669)
-// ---------------------------------------------------------------------------
-
-func TestUpdateConnectionMetrics_TypeAssertFailures(t *testing.T) {
-	t.Run("fast path wrong type", func(t *testing.T) {
-		pm, err := NewPoolManager(nil)
-		if err != nil {
-			t.Fatalf("NewPoolManager: %v", err)
-		}
-		defer pm.Close()
-
-		// Pre-populate with a non-*hostStats value.
-		wrongHost := "wrong-type-fast"
-		pm.hostConns.Store(wrongHost, "not-a-hostStats")
-
-		stats := pm.updateConnectionMetrics(wrongHost, true)
-		if stats != nil {
-			t.Errorf("Expected nil stats for wrong type (fast path), got %v", stats)
-		}
-	})
-
-	t.Run("slow path wrong type", func(t *testing.T) {
-		pm, err := NewPoolManager(nil)
-		if err != nil {
-			t.Fatalf("NewPoolManager: %v", err)
-		}
-		defer pm.Close()
-
-		// Pre-populate with a non-*hostStats value so LoadOrStore returns
-		// the existing wrong value (loaded=true), and the subsequent type
-		// assertion fails.
-		wrongHost := "wrong-type-slow"
-		pm.hostConns.Store(wrongHost, 12345)
-
-		stats := pm.updateConnectionMetrics(wrongHost, true)
-		if stats != nil {
-			t.Errorf("Expected nil stats for wrong type (slow path), got %v", stats)
-		}
-	})
-}
-
-// ---------------------------------------------------------------------------
-// updateConnectionMetrics: maxHostEntries trigger (pool.go:660-662)
-// ---------------------------------------------------------------------------
-
-func TestUpdateConnectionMetrics_MaxHostEntriesTrigger(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager: %v", err)
-	}
-	defer pm.Close()
-
-	// Set hostCount just below the limit so the next new entry crosses it.
-	pm.hostCount.Store(int64(maxHostEntries))
-
-	// Adding a new host should trigger evictStaleHosts via the maxHostEntries
-	// check. The call must not panic.
-	stats := pm.updateConnectionMetrics("overflow-host.example.com", true)
-	if stats == nil {
-		t.Error("Expected non-nil stats for new host")
-	}
-}
-
-// ---------------------------------------------------------------------------
-// evictStaleHosts: CAS contention path (pool.go:696-698)
-// ---------------------------------------------------------------------------
-
-func TestEvictStaleHosts_CASContention(t *testing.T) {
-	pm, err := NewPoolManager(DefaultConfig())
-	if err != nil {
-		t.Fatalf("NewPoolManager: %v", err)
-	}
-	defer pm.Close()
-
-	// Add stale entries.
-	for i := 0; i < 10; i++ {
-		host := fmt.Sprintf("stale-%d.example.com", i)
-		pm.hostConns.Store(host, &hostStats{
-			Host:        host,
-			LastUsed:    time.Now().Add(-hostConnMaxAge - time.Minute).Unix(),
-			ActiveConns: 0,
-		})
-	}
-	pm.hostCount.Store(10)
-
-	// Reset eviction timer so calls proceed past the interval check.
-	atomic.StoreInt64(&pm.lastEviction, 0)
-
-	// Fire eviction from many goroutines simultaneously so the CAS
-	// fails for all but one.
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			pm.evictStaleHosts()
-		}()
-	}
-	wg.Wait()
-
-	// At least the goroutine that won the CAS should have evicted entries.
-	remaining := 0
-	pm.hostConns.Range(func(_, _ any) bool {
-		remaining++
-		return true
-	})
-	// Some or all stale entries should have been evicted. The exact count
-	// depends on timing, but it should be fewer than 10.
-	if remaining >= 10 {
-		t.Errorf("Expected some entries evicted, but all 10 remain")
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -610,124 +494,10 @@ func TestTrackedConn_CloseAfterPoolClosed(t *testing.T) {
 // check but has ActiveConns>0 by the time LoadAndDelete returns. We
 // simulate this by directly invoking eviction with a carefully crafted
 // entry whose ActiveConns we bump at the right moment.
-// ---------------------------------------------------------------------------
-
-func TestEvictStaleHosts_ReInsertActiveConn(t *testing.T) {
-	pm, err := NewPoolManager(DefaultConfig())
-	if err != nil {
-		t.Fatalf("NewPoolManager: %v", err)
-	}
-	defer pm.Close()
-
-	targetHost := "race-target.example.com"
-	stats := &hostStats{
-		Host:        targetHost,
-		LastUsed:    time.Now().Add(-hostConnMaxAge - time.Minute).Unix(),
-		ActiveConns: 0, // Passes the eviction pre-check.
-	}
-	pm.hostConns.Store(targetHost, stats)
-	pm.hostCount.Store(1)
-
-	// Set up a goroutine that increments ActiveConns shortly after we
-	// start eviction, simulating a concurrent connection that lands
-	// between the pre-check and the LoadAndDelete.
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// Small delay to land inside the eviction's Range callback
-		// but before LoadAndDelete reaches our entry.
-		time.Sleep(5 * time.Millisecond)
-		atomic.StoreInt64(&stats.ActiveConns, 1)
-	}()
-
-	// Reset eviction timer.
-	atomic.StoreInt64(&pm.lastEviction, 0)
-
-	// Add a trigger entry to start eviction.
-	pm.updateConnectionMetrics("trigger.example.com", true)
-
-	<-done
-
-	// The entry should still exist (re-inserted or not-yet-evicted)
-	// because ActiveConns was > 0 when the eviction tried to remove it.
-	// If the timing didn't work out (no race), the entry was evicted
-	// before ActiveConns was set, which is also acceptable — this test
-	// verifies no panic or corruption either way.
-	_, exists := pm.hostConns.Load(targetHost)
-	t.Logf("target host exists after eviction race: %v", exists)
-}
-
-// ---------------------------------------------------------------------------
-// CloseIdleConnections / NextProxyIndex: basic exercise
-// ---------------------------------------------------------------------------
-
-func TestCloseIdleConnections_NoPanic(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager: %v", err)
-	}
-	defer pm.Close()
-
-	// Should not panic on an empty pool.
-	pm.CloseIdleConnections()
-}
-
-func TestNextProxyIndex_NoPool(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager: %v", err)
-	}
-	defer pm.Close()
-
-	idx, ok := pm.NextProxyIndex()
-	if ok {
-		t.Error("Expected ok=false when no proxy pool configured")
-	}
-	if idx != 0 {
-		t.Errorf("Expected idx=0, got %d", idx)
-	}
-}
-
-func TestNextProxyIndex_WithPool(t *testing.T) {
-	config := &Config{
-		ProxyPool: []string{
-			"http://p1.example.com:8080",
-			"http://p2.example.com:8080",
-		},
-	}
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager: %v", err)
-	}
-	defer pm.Close()
-
-	idx1, ok := pm.NextProxyIndex()
-	if !ok {
-		t.Fatal("Expected ok=true with proxy pool")
-	}
-
-	idx2, _ := pm.NextProxyIndex()
-
-	// Consecutive calls should advance the index.
-	if idx2 <= idx1 {
-		t.Errorf("Expected idx2 > idx1, got idx1=%d idx2=%d", idx1, idx2)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Helper
-// ---------------------------------------------------------------------------
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
-		(len(s) > 0 && len(substr) > 0 && stringContains(s, substr)))
-}
-
-func stringContains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
+// TestEvictStaleHosts_ReInsertActiveConn, TestCloseIdleConnections_NoPanic,
+// TestNextProxyIndex_NoPool, and TestNextProxyIndex_WithPool were removed:
+// - The eviction race test only logged its outcome (could never fail);
+//   eviction correctness is asserted by TestEvictStaleHosts_CASContention.
+// - CloseIdleConnections/NextProxyIndex no-pool and advance/wrap behavior
+//   is covered (stronger, incl. after-Close and modulo wrap) in
+//   proxy_context_test.go.

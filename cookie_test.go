@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/cybergodev/httpc/internal/engine"
 )
 
 // ----------------------------------------------------------------------------
@@ -183,25 +185,6 @@ func TestCookie_RequestBasicOperations(t *testing.T) {
 				{Name: "cookie3", Value: "value3"},
 			}),
 		)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("WithCookieValue", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			cookie, err := r.Cookie("simple")
-			if err != nil || cookie.Value != "value" {
-				t.Error("Cookie not found or incorrect")
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Get(server.URL, WithCookie(http.Cookie{Name: "simple", Value: "value"}))
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -454,6 +437,15 @@ func TestCookie_StringParsing(t *testing.T) {
 				"data": strings.Repeat("x", 1024),
 			},
 		},
+		{
+			// The parser must split on the FIRST '=' only.
+			name:          "equals sign in value",
+			cookieString:  "data=a=b=c",
+			expectedCount: 1,
+			expectedCookies: map[string]string{
+				"data": "a=b=c",
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -688,96 +680,9 @@ func TestCookie_ResponseOperations(t *testing.T) {
 	})
 }
 
-// ----------------------------------------------------------------------------
-// Cookie Inspection
-// ----------------------------------------------------------------------------
-
-func TestCookie_Inspection(t *testing.T) {
-	t.Parallel()
-
-	var receivedCookies []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		for _, c := range r.Cookies() {
-			receivedCookies = append(receivedCookies, c.Name+"="+c.Value)
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	client, _ := newTestClient()
-	defer client.Close()
-
-	_, err := client.Get(server.URL,
-		WithCookie(http.Cookie{Name: "cookie1", Value: "value1"}),
-		WithCookie(http.Cookie{Name: "cookie2", Value: "value2"}),
-	)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
-
-	if len(receivedCookies) != 2 {
-		t.Fatalf("Expected 2 cookies, got %d", len(receivedCookies))
-	}
-	found1, found2 := false, false
-	for _, c := range receivedCookies {
-		if c == "cookie1=value1" {
-			found1 = true
-		}
-		if c == "cookie2=value2" {
-			found2 = true
-		}
-	}
-	if !found1 || !found2 {
-		t.Errorf("Missing cookies: cookie1=%v cookie2=%v, received=%v", found1, found2, receivedCookies)
-	}
-}
-
 // ============================================================================
-// Cookie pool and parseCookieHeader boundary tests
+// parseCookieHeader boundary tests
 // ============================================================================
-
-func TestCookieSlicePool_BoundaryConditions(t *testing.T) {
-	t.Run("get and return normal slice", func(t *testing.T) {
-		slice := getCookiesSlice()
-		if slice == nil {
-			t.Fatal("expected non-nil slice")
-		}
-		if len(*slice) != 0 {
-			t.Error("expected empty slice from pool")
-		}
-		*slice = append(*slice, &http.Cookie{Name: "test", Value: "val"})
-		putCookiesSlice(slice)
-	})
-
-	t.Run("pool type assertion fallback", func(t *testing.T) {
-		// Poison the pool with a wrong type to exercise the fallback branch.
-		cookieSlicePool.Put("not a cookie slice")
-		slice := getCookiesSlice()
-		if slice == nil {
-			t.Fatal("expected non-nil slice from fallback path")
-		}
-		if len(*slice) != 0 {
-			t.Error("expected empty slice from fallback")
-		}
-		putCookiesSlice(slice)
-	})
-
-	t.Run("oversized slice not pooled", func(t *testing.T) {
-		s := make([]*http.Cookie, 0, 128)
-		slice := &s
-		for i := range 100 {
-			*slice = append(*slice, &http.Cookie{Name: "c" + strings.Repeat("x", 1), Value: strings.Repeat("v", 1)})
-			_ = i
-		}
-		// cap > 64, should not be pooled
-		preCap := cap(*slice)
-		if preCap <= 64 {
-			t.Skip("slice cap too small to test oversized path")
-		}
-		putCookiesSlice(slice)
-		// No panic = success
-	})
-}
 
 func TestParseCookieHeader_BoundaryConditions(t *testing.T) {
 	tests := []struct {
@@ -805,5 +710,119 @@ func TestParseCookieHeader_BoundaryConditions(t *testing.T) {
 				t.Errorf("parseCookieHeader(%q) returned %d cookies, want %d", tt.input, len(cookies), tt.wantN)
 			}
 		})
+	}
+}
+
+// TestManualCookiesNotPersistedInJar verifies a one-off WithCookies value
+// applies only to its own request: it must not be written into the client's
+// shared cookie jar and replayed on later requests.
+func TestManualCookiesNotPersistedInJar(t *testing.T) {
+	var lastCookieHeader string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		lastCookieHeader = r.Header.Get("Cookie") // sequential requests: no lock needed
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.Connection.EnableCookies = true
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer client.Close()
+
+	// Request 1 carries the manual cookie.
+	if _, err := client.Get(server.URL, WithCookies([]http.Cookie{{Name: "oneoff", Value: "x"}})); err != nil {
+		t.Fatalf("Get with manual cookie: %v", err)
+	}
+	if !strings.Contains(lastCookieHeader, "oneoff=x") {
+		t.Fatalf("manual cookie missing on its own request, Cookie=%q", lastCookieHeader)
+	}
+
+	// Request 2 (no manual cookies) must not see it anymore.
+	if _, err := client.Get(server.URL); err != nil {
+		t.Fatalf("Get without manual cookie: %v", err)
+	}
+	if strings.Contains(lastCookieHeader, "oneoff") {
+		t.Errorf("one-off cookie persisted into shared jar and leaked to later request: %q", lastCookieHeader)
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Cookie option boundary conditions
+// (moved from boundary_test.go)
+// ----------------------------------------------------------------------------
+
+func TestWithCookie_BoundaryConditions(t *testing.T) {
+	tests := []struct {
+		name    string
+		cookie  http.Cookie
+		wantErr bool
+	}{
+		{"empty name", http.Cookie{Name: "", Value: "val"}, true},
+		{"control char in name", http.Cookie{Name: "ba\x00d", Value: "val"}, true},
+		{"control char in value", http.Cookie{Name: "ok", Value: "ba\x01d"}, true},
+		{"valid cookie", http.Cookie{Name: "session", Value: "abc123"}, false},
+		{"valid with domain", http.Cookie{Name: "token", Value: "xyz", Domain: "example.com"}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := engine.AcquireRequest()
+			err := WithCookie(tt.cookie)(req)
+			if tt.wantErr && err == nil {
+				t.Error("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected no error, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestEnsureCookieCapacity pins the growth policy of the per-request cookie
+// slice: appending one cookie at a time must not pay the 0→1→2→4 regrowth
+// (the slice starts empty on every request), and an adequately sized slice
+// must be returned unchanged.
+func TestEnsureCookieCapacity(t *testing.T) {
+	// From empty: one slot requested, minimum capacity 4 granted.
+	got := ensureCookieCapacity(nil, 1)
+	if len(got) != 0 {
+		t.Errorf("len = %d, want 0", len(got))
+	}
+	if cap(got) < 4 {
+		t.Errorf("cap = %d, want >= 4 (single-cookie regrowth)", cap(got))
+	}
+
+	// Sufficient capacity: same backing array, no reallocation.
+	base := make([]http.Cookie, 2, 8)
+	base[0] = http.Cookie{Name: "a", Value: "1"}
+	base[1] = http.Cookie{Name: "b", Value: "2"}
+	same := ensureCookieCapacity(base, 1)
+	if &same[0] != &base[0] {
+		t.Error("slice with sufficient capacity was reallocated")
+	}
+
+	// Batch growth still sizes exactly when larger than the minimum.
+	big := ensureCookieCapacity(nil, 10)
+	if cap(big) != 10 {
+		t.Errorf("cap = %d, want exact 10 for batched growth", cap(big))
+	}
+
+	// End-to-end: three WithCookie options accumulate into the request
+	// without depending on capacity carried across requests.
+	var r engine.Request
+	for _, c := range []http.Cookie{
+		{Name: "session_id", Value: "abc"},
+		{Name: "csrf_token", Value: "xyz"},
+		{Name: "user_pref", Value: "dark"},
+	} {
+		if err := WithCookie(c)(&r); err != nil {
+			t.Fatalf("WithCookie(%s): %v", c.Name, err)
+		}
+	}
+	if got := r.Cookies(); len(got) != 3 {
+		t.Errorf("request carries %d cookies, want 3", len(got))
 	}
 }

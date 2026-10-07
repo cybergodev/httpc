@@ -14,7 +14,7 @@ import (
 // This example demonstrates all request options: body formats, headers, authentication, and query parameters
 
 func main() {
-	fmt.Println("=== Request Options Examples ===\n ")
+	fmt.Println("=== Request Options Examples ===")
 
 	client, err := httpc.NewDefault()
 	if err != nil {
@@ -50,7 +50,7 @@ func demonstrateBodyFormats(client httpc.Client) {
 	if err != nil {
 		log.Printf("JSON error: %v\n", err)
 	} else {
-		fmt.Printf("✓ JSON: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] JSON: Status %d\n", resp.StatusCode())
 	}
 
 	// Form data (application/x-www-form-urlencoded)
@@ -64,7 +64,7 @@ func demonstrateBodyFormats(client httpc.Client) {
 	if err != nil {
 		log.Printf("Form error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Form: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Form: Status %d\n", resp.StatusCode())
 	}
 
 	// Plain text (Content-Type auto-detected as text/plain for string input)
@@ -74,7 +74,7 @@ func demonstrateBodyFormats(client httpc.Client) {
 	if err != nil {
 		log.Printf("Text error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Text: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Text: Status %d\n", resp.StatusCode())
 	}
 
 	// XML
@@ -90,7 +90,7 @@ func demonstrateBodyFormats(client httpc.Client) {
 	if err != nil {
 		log.Printf("XML error: %v\n", err)
 	} else {
-		fmt.Printf("✓ XML: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] XML: Status %d\n", resp.StatusCode())
 	}
 
 	// Binary data
@@ -101,7 +101,7 @@ func demonstrateBodyFormats(client httpc.Client) {
 	if err != nil {
 		log.Printf("Binary error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Binary: Status %d (%d bytes)\n", resp.StatusCode(), len(binaryData))
+		fmt.Printf("[OK] Binary: Status %d (%d bytes)\n", resp.StatusCode(), len(binaryData))
 	}
 
 	// WithBody with explicit BodyKind (forces encoding regardless of input type)
@@ -112,7 +112,7 @@ func demonstrateBodyFormats(client httpc.Client) {
 	if err != nil {
 		log.Printf("WithBody error: %v\n", err)
 	} else {
-		fmt.Printf("✓ WithBody(BodyJSON): Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] WithBody(BodyJSON): Status %d\n", resp.StatusCode())
 	}
 
 	// File upload
@@ -123,7 +123,7 @@ func demonstrateBodyFormats(client httpc.Client) {
 	if err != nil {
 		log.Printf("File error: %v\n", err)
 	} else {
-		fmt.Printf("✓ File upload: Status %d\n\n", resp.StatusCode())
+		fmt.Printf("[OK] File upload: Status %d\n\n", resp.StatusCode())
 	}
 }
 
@@ -138,7 +138,7 @@ func demonstrateHeadersAuth(client httpc.Client) {
 	if err != nil {
 		log.Printf("Header error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Custom header: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Custom header: Status %d\n", resp.StatusCode())
 	}
 
 	// Multiple headers
@@ -152,7 +152,7 @@ func demonstrateHeadersAuth(client httpc.Client) {
 	if err != nil {
 		log.Printf("Headers error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Multiple headers: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Multiple headers: Status %d\n", resp.StatusCode())
 	}
 
 	// Bearer token (JWT)
@@ -162,7 +162,7 @@ func demonstrateHeadersAuth(client httpc.Client) {
 	if err != nil {
 		log.Printf("Bearer error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Bearer token: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Bearer token: Status %d\n", resp.StatusCode())
 	}
 
 	// Basic authentication
@@ -172,7 +172,7 @@ func demonstrateHeadersAuth(client httpc.Client) {
 	if err != nil {
 		log.Printf("Basic auth error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Basic auth: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Basic auth: Status %d\n", resp.StatusCode())
 	}
 
 	// API key
@@ -182,7 +182,7 @@ func demonstrateHeadersAuth(client httpc.Client) {
 	if err != nil {
 		log.Printf("API key error: %v\n", err)
 	} else {
-		fmt.Printf("✓ API key: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] API key: Status %d\n", resp.StatusCode())
 	}
 
 	// User agent
@@ -192,7 +192,7 @@ func demonstrateHeadersAuth(client httpc.Client) {
 	if err != nil {
 		log.Printf("User agent error: %v\n", err)
 	} else {
-		fmt.Printf("✓ User agent: Status %d\n\n", resp.StatusCode())
+		fmt.Printf("[OK] User agent: Status %d\n\n", resp.StatusCode())
 	}
 }
 
@@ -208,7 +208,7 @@ func demonstrateQueryParams(client httpc.Client) {
 	if err != nil {
 		log.Printf("Query error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Single params: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Single params: Status %d\n", resp.StatusCode())
 	}
 
 	// Multiple parameters (recommended)
@@ -224,7 +224,7 @@ func demonstrateQueryParams(client httpc.Client) {
 	if err != nil {
 		log.Printf("Query map error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Query map: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Query map: Status %d\n", resp.StatusCode())
 	}
 
 	// Real-world pattern: Pagination + Filtering + Sorting
@@ -242,7 +242,7 @@ func demonstrateQueryParams(client httpc.Client) {
 	if err != nil {
 		log.Printf("Search error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Search with filters: Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Search with filters: Status %d\n", resp.StatusCode())
 	}
 
 	// Special characters (automatically URL-encoded)
@@ -256,6 +256,6 @@ func demonstrateQueryParams(client httpc.Client) {
 	if err != nil {
 		log.Printf("Special chars error: %v\n", err)
 	} else {
-		fmt.Printf("✓ Special characters (auto-encoded): Status %d\n", resp.StatusCode())
+		fmt.Printf("[OK] Special characters (auto-encoded): Status %d\n", resp.StatusCode())
 	}
 }

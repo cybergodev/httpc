@@ -44,7 +44,7 @@
 |------|------|
 | **默认安全** | TLS 1.2+、SSRF 防护、CRLF 注入防护、路径遍历阻断 |
 | **高性能** | 连接池、HTTP/2、goroutine 安全、`sync.Pool` 优化 |
-| **内置弹性** | 智能重试，支持指数退避和抖动 |
+| **内置弹性** | 智能重试，支持指数退避和抖动 —— 非幂等请求（POST/PATCH）默认仅执行一次 |
 | **自动解压缩** | 透明的 gzip/deflate 处理，带 Zip 炸弹防护 |
 | **开发者友好** | 简洁的 API、直观的选项模式、完善的文档 |
 | **极简依赖** | 1 个直接依赖 (golang.org/x/sys)，纯 Go 实现 |
@@ -341,7 +341,7 @@ result, _ := httpc.Get("https://api.example.com/users/123")
 // Result 结构组成:
 // result.Request  -> *RequestInfo  (URL, Method, Headers, Cookies)
 // result.Response -> *ResponseInfo (StatusCode, Status, Proto, Headers, Body, RawBody, ContentLength, Cookies)
-// result.Meta     -> *RequestMeta  (Duration, Attempts, RedirectCount, RedirectChain)
+// result.Meta     -> *RequestMeta  (Duration, Attempts, ProxyURL, RedirectCount, RedirectChain)
 
 // 快速访问方法 (nil 安全)
 fmt.Println(result.StatusCode())     // 200
@@ -381,6 +381,7 @@ if err := result.SaveToFile("response.json"); err != nil {
 // 元数据
 fmt.Println(result.Meta.Duration)      // 请求耗时
 fmt.Println(result.Meta.Attempts)      // 重试次数
+fmt.Println(result.Meta.ProxyURL)      // 本次请求使用的代理（"" = 直连）
 fmt.Println(result.Meta.RedirectCount) // 重定向次数
 fmt.Println(result.Meta.RedirectChain) // 重定向 URL 链
 
@@ -402,9 +403,14 @@ result, _ := httpc.Get("https://httpbin.org/gzip",
 fmt.Println(result.Body()) // 已自动解压
 ```
 
-> **注意：** Brotli (`br`) 和 LZW (`compress`) **不受支持**，若服务器返回这些
-> 编码会报错。由于 httpc 不会主动声明它们，仅在你手动设置 `Accept-Encoding`
-> 时才会发生。
+> **注意：** 除 `gzip`、`deflate` 和 `identity` 之外的任何 `Content-Encoding`
+> (如 Brotli `br`、LZW `compress`、`zstd`，或多编码列表 `gzip, br`)都会**直接
+> 返回错误**，而不是把原始压缩字节当作响应体静默返回。由于 httpc 只声明
+> `gzip, deflate`，通常仅在你手动设置 `Accept-Encoding` 时才会发生。
+
+> **流式请求：** 使用 `WithStreamBody(true)` 的请求（包括 `Download`）会发送
+> `Accept-Encoding: identity` —— 流式路径直接交付原始传输字节，因此不会请求
+> 压缩内容。流式请求上手动设置的 `Accept-Encoding` 将按原样生效。
 
 ---
 
@@ -575,7 +581,8 @@ result, _ := httpc.Download(ctx,
 ```
 
 > **注意：** 常规的 `Get` / `Post` 等方法**始终将完整响应体缓冲到内存中**。
-> `WithStreamBody` 对这些方法无效 — 请使用 `Download` 处理大型响应。详见[文件下载](#文件下载)。
+> 对这些方法传入 `WithStreamBody(true)` 会返回 `ErrStreamBodyRequiresDownload`
+> 错误 — 处理大型响应请使用 `Download`。详见[文件下载](#文件下载)。
 
 ---
 
@@ -764,7 +771,7 @@ config := httpc.Config{
 }
 
 // 创建客户端前验证配置 (New() 内部也会自动验证)
-if err := httpc.ValidateConfig(&config); err != nil {
+if err := config.Validate(); err != nil {
     log.Fatal(err)
 }
 
@@ -783,7 +790,7 @@ fmt.Println(config.String())
 | `PerformanceConfig()` | 高吞吐量 |
 | `MinimalConfig()` | 轻量级 (无重试) |
 | `TestingConfig()` | 仅限测试 - 禁用安全特性 |
-| `ValidateConfig(cfg)` | 验证配置，返回错误 |
+| `Config.Validate()` | 验证配置，返回错误（函数形态：`ValidateConfig(cfg)`） |
 | `Config.String()` | 安全字符串表示 (敏感值已遮蔽) |
 
 | 选项 | 类型 | 默认值 | 描述 |
@@ -809,7 +816,7 @@ fmt.Println(config.String())
 | `Connection.EnableCookies` | `bool` | `false` | 启用 Cookie Jar |
 | `Connection.EnableDoH` | `bool` | `false` | 启用 DNS-over-HTTPS |
 | `Connection.DoHCacheTTL` | `time.Duration` | `5m` | DoH 缓存时长 |
-| `Connection.MaxResponseHeaderBytes` | `int64` | `0` | 最大响应头大小 (0 = Go 标准库默认 10MB) |
+| `Connection.MaxResponseHeaderBytes` | `int64` | `0` | 最大响应头大小 (0 = Go 标准库默认 1MB) |
 | **安全设置** (`Security`) ||||
 | `Security.TLSConfig` | `*tls.Config` | `nil` | 自定义 TLS 配置 |
 | `Security.MinTLSVersion` | `uint16` | `TLS 1.2` | 最低 TLS 版本 |
@@ -825,7 +832,7 @@ fmt.Println(config.String())
 | `Security.RedirectWhitelist` | `[]string` | `nil` | 允许的重定向域名 |
 | `Security.MaxDecompressedBodySize` | `int64` | `100MB` | 最大解压响应体大小 (Zip 炸弹防护) |
 | `Security.SSRFExemptCIDRs` | `[]string` | `nil` | 豁免 SSRF 阻断的 CIDR 范围 |
-| `Security.CookieSecurity` | `*CookieSecurityConfig` | `nil` | Cookie 安全验证规则 |
+| `Security.CookieSecurity` | `*CookieSecurityConfig` | `nil` | 当前未在请求处理中生效——请使用 `WithSecureCookie` 或 `SessionConfig.CookieSecurity` |
 | **重试设置** (`Retry`) ||||
 | `Retry.MaxRetries` | `int` | `3` | 最大重试次数 |
 | `Retry.Delay` | `time.Duration` | `1s` | 初始重试延迟 |
@@ -839,7 +846,7 @@ fmt.Println(config.String())
 | `Defaults.UserAgent` | `string` | `"httpc/1.0"` | 默认 User-Agent |
 | `Defaults.Headers` | `map[string]string` | `{}` | 默认请求头 |
 | `Defaults.FollowRedirects` | `bool` | `true` | 跟随重定向 |
-| `Defaults.MaxRedirects` | `int` | `10` | 最大重定向次数 |
+| `Defaults.MaxRedirects` | `int` | `10` | 重定向上限;计入初始请求,即 10 最多跟随 9 次重定向 |
 
 ---
 
@@ -995,6 +1002,19 @@ config.Connection.ProxyRotatePerRequest = true
 （无连接复用），但对于爬虫或指纹轮换场景必不可少。需要 `ProxyPool`；
 对 `ProxyURL` 无效。
 
+### 查询本次请求使用的代理
+
+每个 `Result` 都会报告产生最终响应所使用的代理，因此可以对每次请求验证或
+记录轮换情况（空字符串表示直连）：
+
+```go
+result, _ := client.Get("https://httpbin.org/ip")
+fmt.Println(result.Meta.ProxyURL) // 例如 "http://proxy2.example.com:8080"
+```
+
+发生重试时，每次尝试可能使用不同的代理；`ProxyURL` 反映的是返回响应的那次
+尝试（`Meta.Attempts` 为尝试次数）。
+
 **优先级：** `ProxyURL` > `ProxyPool` > `EnableSystemProxy` > 直连。
 
 ---
@@ -1122,9 +1142,9 @@ if !result.IsSuccess() {
 | `Cause` | `error` | 底层错误 (可用 `%w` 解包) |
 | `URL` | `string` | 请求 URL |
 | `Method` | `string` | HTTP 方法 |
-| `Attempts` | `int` | 重试次数 |
+| `Attempts` | `int` | 总尝试次数 (含首次) |
 | `StatusCode` | `int` | HTTP 状态码 (如适用) |
-| `Host` | `string` | 目标主机 |
+| `Host` | `string` | 保留字段;引擎当前从不赋值 |
 
 ### 错误类型
 
@@ -1136,7 +1156,7 @@ const (
     ErrorTypeContextCanceled // Context 被取消
     ErrorTypeResponseRead   // 读取响应体错误
     ErrorTypeTransport      // HTTP 传输错误
-    ErrorTypeRetryExhausted // 所有重试已耗尽
+    ErrorTypeRetryExhausted // 保留用于重试耗尽;实际耗尽时保留最后一次错误的类型——请用 Attempts / IsRetryable() 判断
     ErrorTypeTLS            // TLS 握手错误
     ErrorTypeCertificate    // 证书验证错误
     ErrorTypeDNS            // DNS 解析错误
@@ -1212,7 +1232,7 @@ _ = httpc.CloseDefaultClient()
 **线程安全保证：**
 - 所有 `Client` 方法均可安全并发使用
 - 包级函数安全使用共享的默认客户端
-- `Result` 对象不支持并发访问 — 每个 goroutine 应使用各自的 `Result`
+- `Result` 对象返回后不可变 — 并发读取安全;仅需避免多个 goroutine 向同一 `Result` 变量赋值
 - 内部指标使用原子操作
 
 ---

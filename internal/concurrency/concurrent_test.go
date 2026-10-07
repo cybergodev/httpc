@@ -26,11 +26,15 @@ func TestConcurrentClientRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&requestCount, 1)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK")) // best-effort test response
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -64,6 +68,15 @@ func TestConcurrentClientRequests(t *testing.T) {
 	}
 
 	wg.Wait()
+
+	// The counter previously ignored failures; a regression in concurrent
+	// request handling must fail this test, not just be logged.
+	if got := atomic.LoadInt64(&errors); got != 0 {
+		t.Errorf("%d of %d concurrent requests failed", got, numGoroutines*requestsPerGoroutine)
+	}
+	if got := atomic.LoadInt64(&success); got != numGoroutines*requestsPerGoroutine {
+		t.Errorf("success count = %d, want %d", got, numGoroutines*requestsPerGoroutine)
+	}
 
 	t.Logf("Concurrent test completed: %d success, %d errors, %d server requests",
 		atomic.LoadInt64(&success), atomic.LoadInt64(&errors), atomic.LoadInt64(&requestCount))
@@ -260,10 +273,9 @@ func TestConcurrentSessionManagerWithCookieSecurity(t *testing.T) {
 
 // TestConcurrentDoHResolverCache tests concurrent DNS cache access.
 func TestConcurrentDoHResolverCache(t *testing.T) {
-	providers := []*dns.DoHProvider{
-		{Name: "test", Template: "https://example.com/dns-query?name={name}", Priority: 1},
-	}
-	resolver := dns.NewDoHResolver(providers, 5*time.Minute)
+	// nil selects defaultDoHProviders(); this test exercises concurrent cache
+	// and TTL operations only, so no provider is ever queried.
+	resolver := dns.NewDoHResolver(nil, 5*time.Minute)
 
 	const numGoroutines = 50
 	const opsPerGoroutine = 20
@@ -394,12 +406,12 @@ func TestConcurrentDefaultClient(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&requestCount, 1)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK")) // best-effort test response
 	}))
 	defer server.Close()
 
 	// Reset default client
-	httpc.CloseDefaultClient()
+	_ = httpc.CloseDefaultClient() // best-effort cleanup
 
 	const numGoroutines = 10
 	const requestsPerGoroutine = 5
@@ -425,7 +437,7 @@ func TestConcurrentDefaultClient(t *testing.T) {
 	wg.Wait()
 
 	// Cleanup
-	httpc.CloseDefaultClient()
+	_ = httpc.CloseDefaultClient() // best-effort cleanup
 
 	t.Logf("Default client test: %d errors, %d server requests",
 		atomic.LoadInt64(&errors), atomic.LoadInt64(&requestCount))
@@ -442,7 +454,11 @@ func TestConcurrentContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -496,7 +512,11 @@ func TestRaceConditionMetricsUpdate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -585,11 +605,15 @@ func TestConcurrentResultPool(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&requestCount, 1)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("response"))
+		_, _ = w.Write([]byte("response")) // best-effort test response
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -685,11 +709,15 @@ func TestConcurrentRedirectHandling(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK")) // best-effort test response
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
@@ -784,7 +812,7 @@ func TestConcurrentMiddlewareExecution(t *testing.T) {
 func TestConcurrentMixedOperations(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"ok"}`)) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -805,7 +833,7 @@ func TestConcurrentMixedOperations(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for atomic.LoadInt32(&stop) == 0 {
-			client.Get(server.URL)
+			_, _ = client.Get(server.URL) // results discarded: load generator
 		}
 	}()
 
@@ -814,7 +842,7 @@ func TestConcurrentMixedOperations(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for atomic.LoadInt32(&stop) == 0 {
-			client.Post(server.URL, httpc.WithJSON(map[string]string{"key": "value"}))
+			_, _ = client.Post(server.URL, httpc.WithJSON(map[string]string{"key": "value"})) // load generator
 		}
 	}()
 
@@ -824,7 +852,7 @@ func TestConcurrentMixedOperations(t *testing.T) {
 		defer wg.Done()
 		for atomic.LoadInt32(&stop) == 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			client.Request(ctx, "GET", server.URL)
+			_, _ = client.Request(ctx, "GET", server.URL) // load generator
 			cancel()
 		}
 	}()

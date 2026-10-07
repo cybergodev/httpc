@@ -35,10 +35,21 @@ const (
 	// unbounded time/memory draining an oversized error body; the remainder is
 	// left unread and the connection is not reused in that case.
 	maxDrainBodySize = 1 << 20 // 1 MiB
+
+	// downloadTmpSuffix names the temp sibling that non-resumed downloads
+	// write to before an atomic rename into the final location (see
+	// writeDownloadBody). A crashed download leaves this behind; the next
+	// attempt O_TRUNCs it, so the suffix doubles as self-healing cleanup.
+	downloadTmpSuffix = ".httpc-tmp"
 )
 
 // DownloadConfig configures file download behavior.
 // Use DefaultDownloadConfig() to get a configuration with sensible defaults.
+//
+// Size limit: downloads are subject to the client's Security.MaxResponseBodySize
+// (default 10 MB). A body exceeding the limit fails with a
+// "streamed response body exceeds size limit" error — it is never silently
+// truncated. Raise the limit on Config.Security for large-file workloads.
 type DownloadConfig struct {
 	// FilePath is the destination path for the downloaded file.
 	FilePath string
@@ -49,8 +60,11 @@ type DownloadConfig struct {
 	// ResumeDownload attempts to resume a previously interrupted download.
 	ResumeDownload bool
 	// Checksum is the expected hex-encoded checksum of the downloaded file.
-	// When set, the file is verified after download completes.
-	// A mismatch causes the download to fail and the file to be removed.
+	// When set, the file is verified after download completes. A mismatch
+	// fails the download: fresh downloads remove their temp file (any
+	// pre-existing destination is untouched), resumed downloads are
+	// truncated back to the offset the session started at — preserving the
+	// previously downloaded prefix for the next resume attempt.
 	Checksum string
 	// ChecksumAlgorithm specifies the hash algorithm for verification.
 	// Currently only "sha256" is supported. Default: "sha256".
@@ -119,6 +133,8 @@ type DownloadResult struct {
 // cfg must be non-nil; cfg.FilePath must be set (ErrEmptyFilePath otherwise).
 // Use context.Background() when no cancellation or timeout is required. Pass
 // options for headers, authentication, query parameters, etc.
+// The download is subject to the client's Security.MaxResponseBodySize
+// (default 10 MB); oversize bodies fail with an error — see DownloadConfig.
 func Download(ctx context.Context, url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
 	if cfg == nil {
 		return nil, fmt.Errorf("download config cannot be nil")
@@ -139,6 +155,42 @@ func (c *clientImpl) Download(ctx context.Context, url string, cfg *DownloadConf
 	return c.downloadFile(ctx, url, cfg, options...)
 }
 
+// downloadLocks serializes downloads to the same destination path within this
+// process (see downloadFile). Keyed by absolute path; entries are removed on
+// release so repeatedly downloading to fresh paths (timestamped files) does
+// not grow the map unboundedly.
+var downloadLocks sync.Map // map[string]*sync.Mutex
+
+// acquireDownloadLock tries to claim the download slot for path. ok is false
+// when a download to the same path is already running in this process, in
+// which case no lock is held and release is nil.
+func acquireDownloadLock(path string) (release func(), ok bool) {
+	key, err := filepath.Abs(path)
+	if err != nil {
+		key = filepath.Clean(path)
+	}
+	if runtime.GOOS == "windows" {
+		// Windows paths are case-insensitive: without normalizing, two
+		// spellings of one path ("FILE.bin" vs "file.bin") would take
+		// different locks and bypass the serialization.
+		key = strings.ToLower(key)
+	}
+	v, _ := downloadLocks.LoadOrStore(key, &sync.Mutex{})
+	mu := v.(*sync.Mutex)
+	if !mu.TryLock() {
+		return nil, false
+	}
+	return func() {
+		mu.Unlock()
+		// Best-effort entry cleanup: if another goroutine LoadOrStore'd this
+		// same entry while the lock was held, CompareAndDelete fails and that
+		// goroutine keeps using it — a later acquirer then creates a fresh
+		// entry, degrading (only for that pair) to the pre-lock behavior. It
+		// can never block or deadlock.
+		downloadLocks.CompareAndDelete(key, mu)
+	}, true
+}
+
 func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *DownloadConfig, options ...RequestOption) (result *DownloadResult, err error) {
 	// SEC-003: default panic safety net for the download path. Mirrors the guard in
 	// clientImpl.Request. Deferred cleanups registered below (engine.ReleaseResponse,
@@ -156,6 +208,18 @@ func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *Downloa
 	if opts.FilePath == "" {
 		return nil, ErrEmptyFilePath
 	}
+
+	// Serialize downloads to the same destination path within this process:
+	// two concurrent downloads would open the same temp sibling (O_TRUNC) or
+	// append to the same file (O_APPEND) and corrupt each other's writes.
+	// Fail fast with ErrDownloadInProgress instead of blocking — the caller
+	// can retry when the first download finishes. Cross-process coordination
+	// remains the caller's responsibility.
+	unlock, locked := acquireDownloadLock(opts.FilePath)
+	if !locked {
+		return nil, fmt.Errorf("%w: %s", ErrDownloadInProgress, opts.FilePath)
+	}
+	defer unlock()
 
 	filePath, resumeOffset, options, err := prepareResumeState(opts.FilePath, opts, options)
 	if err != nil {
@@ -197,12 +261,39 @@ func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *Downloa
 
 	resumed := resumeOffset > 0 && df.statusCode == http.StatusPartialContent
 
-	// When resume was requested but server returned 200 instead of 206,
-	// the server does not support range requests. Truncating the existing
-	// partial file would silently destroy data the user intended to resume.
+	// 416 gets its own diagnosis before the generic "no range support"
+	// error: with a resume offset it typically means the local file already
+	// matches (or exceeds) the remote size, not that the server lacks range
+	// support. handleDownloadStatus drains the body and gives the specific
+	// message; this also makes its 416 branch reachable.
+	if resumeOffset > 0 && df.statusCode == http.StatusRequestedRangeNotSatisfiable {
+		return nil, handleDownloadStatus(df.statusCode, df.bodyReader, resumeOffset)
+	}
+
+	// When resume was requested but the server did not return 206, first
+	// distinguish WHY: a 2xx (200) means no range support, while a 4xx/5xx is
+	// an ordinary error status whose specific diagnosis (and body preview)
+	// comes from handleDownloadStatus — reporting "does not support range
+	// requests" for a 404/500 would be misleading.
+	if resumeOffset > 0 && !resumed && df.statusCode != http.StatusOK {
+		return nil, handleDownloadStatus(df.statusCode, df.bodyReader, resumeOffset)
+	}
 	if resumeOffset > 0 && !resumed {
+		// 200 instead of 206: no range support. Truncating the existing
+		// partial file would silently destroy data the user intended to
+		// resume, so fail and leave it untouched.
 		_, _ = io.Copy(io.Discard, io.LimitReader(df.bodyReader, maxDrainBodySize))
 		return nil, fmt.Errorf("server does not support range requests (status %d); cannot resume download", df.statusCode)
+	}
+
+	// A 206 response must start exactly at the local file length. Without
+	// this check a server (or tampered response) starting at byte 0 would be
+	// appended after the existing prefix, silently corrupting the file.
+	if resumed {
+		if err := validateResumeContentRange(df.responseHeaders, resumeOffset); err != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(df.bodyReader, maxDrainBodySize))
+			return nil, err
+		}
 	}
 
 	// Validate response status
@@ -215,7 +306,17 @@ func (c *clientImpl) downloadFile(ctx context.Context, url string, opts *Downloa
 	}
 
 	downloadStart := time.Now()
-	result, writeErr := writeDownloadBody(df.bodyReader, filePath, opts, resumed, resumeOffset, df.statusCode, df.contentLength, downloadStart, df.responseCookies)
+	result, writeErr := writeDownloadBody(downloadWriteParams{
+		bodyReader:      df.bodyReader,
+		filePath:        filePath,
+		opts:            opts,
+		resumed:         resumed,
+		resumeOffset:    resumeOffset,
+		statusCode:      df.statusCode,
+		contentLength:   df.contentLength,
+		downloadStart:   downloadStart,
+		responseCookies: df.responseCookies,
+	})
 	if writeErr != nil {
 		return nil, writeErr
 	}
@@ -310,10 +411,12 @@ func handleDownloadStatus(statusCode int, bodyReader io.Reader, resumeOffset int
 	if statusCode != http.StatusOK && statusCode != http.StatusPartialContent {
 		var bodyPreview string
 		if bodyReader != nil {
-			previewBuf := make([]byte, 512)
-			n, _ := bodyReader.Read(previewBuf)
-			if n > 0 {
-				bodyPreview = string(previewBuf[:n])
+			// io.ReadAll handles short reads; a single Read may legally
+			// return fewer bytes than requested, which used to leave the
+			// preview empty on fragmented network bodies.
+			preview, _ := io.ReadAll(io.LimitReader(bodyReader, 512))
+			if len(preview) > 0 {
+				bodyPreview = string(preview)
 				if len(bodyPreview) > 200 {
 					bodyPreview = bodyPreview[:200] + "..."
 				}
@@ -329,20 +432,72 @@ func handleDownloadStatus(statusCode int, bodyReader io.Reader, resumeOffset int
 	return nil
 }
 
+// validateResumeContentRange verifies a 206 response honors the resume offset.
+// RFC 9110 requires Content-Range on 206 responses; a start different from the
+// local file length means the body begins at another byte, and appending it
+// would silently corrupt the file.
+func validateResumeContentRange(headers http.Header, resumeOffset int64) error {
+	cr := headers.Get("Content-Range")
+	if cr == "" {
+		return fmt.Errorf("resume failed: 206 response is missing Content-Range header")
+	}
+	// Format: "bytes <start>-<end>/<total>" (total may be "*").
+	var start int64
+	if n, err := fmt.Sscanf(cr, "bytes %d-", &start); err != nil || n != 1 {
+		return fmt.Errorf("resume failed: malformed Content-Range %q", cr)
+	}
+	if start != resumeOffset {
+		return fmt.Errorf("resume failed: server returned range starting at byte %d, local file has %d bytes", start, resumeOffset)
+	}
+	return nil
+}
+
+// downloadWriteParams groups writeDownloadBody's inputs; nine positional
+// parameters were easy to mis-order at call sites.
+type downloadWriteParams struct {
+	bodyReader      io.Reader
+	filePath        string
+	opts            *DownloadConfig
+	resumed         bool
+	resumeOffset    int64
+	statusCode      int
+	contentLength   int64
+	downloadStart   time.Time
+	responseCookies []*http.Cookie
+}
+
 // writeDownloadBody streams the response body to a file and returns download statistics.
-func writeDownloadBody(bodyReader io.Reader, filePath string, opts *DownloadConfig, resumed bool, resumeOffset int64, statusCode int, contentLength int64, downloadStart time.Time, responseCookies []*http.Cookie) (*DownloadResult, error) {
+//
+// SECURITY: non-resumed downloads write to a "<path>.httpc-tmp" sibling and are
+// atomically renamed into place only after the body completes and any checksum
+// verifies. This closes the symlink-swap TOCTOU window that prepareFilePath's
+// validation alone cannot (check-then-open), and guarantees an interrupted or
+// checksum-failing download never truncates the destination. Resumed downloads
+// must append to the destination itself and keep that pre-validated path.
+func writeDownloadBody(p downloadWriteParams) (*DownloadResult, error) {
+	bodyReader, filePath, opts := p.bodyReader, p.filePath, p.opts
+	resumed, resumeOffset, statusCode := p.resumed, p.resumeOffset, p.statusCode
+	contentLength, downloadStart, responseCookies := p.contentLength, p.downloadStart, p.responseCookies
 	// Validate checksum algorithm BEFORE touching the destination file.
 	// A configuration error must not truncate (O_TRUNC) an existing file.
 	if opts.Checksum != "" && opts.ChecksumAlgorithm != ChecksumSHA256 && opts.ChecksumAlgorithm != "" {
 		return nil, fmt.Errorf("unsupported checksum algorithm: %s", opts.ChecksumAlgorithm)
 	}
 
+	// Non-resumed writes target the temp sibling; the final rename happens
+	// after checksum verification below. Cleanup paths remove the temp file,
+	// leaving the destination (if any) untouched.
+	writePath := filePath
+	if !resumed {
+		writePath = filePath + downloadTmpSuffix
+	}
+
 	var file *os.File
 	var err error
 	if resumed {
-		file, err = os.OpenFile(filePath, os.O_WRONLY|os.O_APPEND, filePermissions)
+		file, err = os.OpenFile(writePath, os.O_WRONLY|os.O_APPEND, filePermissions)
 	} else {
-		file, err = os.OpenFile(filePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, filePermissions)
+		file, err = os.OpenFile(writePath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, filePermissions)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
@@ -355,6 +510,21 @@ func writeDownloadBody(bodyReader io.Reader, filePath string, opts *DownloadConf
 		// Algorithm already validated above; both SHA-256 and the empty
 		// default map to SHA-256.
 		hasher = sha256.New()
+		// When resuming, seed the hasher with the already-downloaded prefix so
+		// the final sum covers the complete file — opts.Checksum is by
+		// convention the hash of the whole content, while the response body
+		// only carries the bytes after resumeOffset.
+		if resumed {
+			prefix, openErr := os.Open(filePath)
+			if openErr != nil {
+				return nil, fmt.Errorf("failed to open existing file for checksum: %w", openErr)
+			}
+			_, hashErr := io.Copy(hasher, prefix)
+			_ = prefix.Close() // best-effort; read-only handle
+			if hashErr != nil {
+				return nil, fmt.Errorf("failed to hash existing file prefix: %w", hashErr)
+			}
+		}
 		writer = io.MultiWriter(file, hasher)
 	}
 	if opts.ProgressCallback != nil {
@@ -376,7 +546,7 @@ func writeDownloadBody(bodyReader io.Reader, filePath string, opts *DownloadConf
 	if err != nil {
 		_ = file.Close() // best-effort cleanup on write failure
 		if !resumed {
-			_ = os.Remove(filePath) // best-effort cleanup of partial file
+			_ = os.Remove(writePath) // best-effort cleanup of partial file
 		}
 		return nil, fmt.Errorf("failed to write file: %w", err)
 	}
@@ -387,13 +557,13 @@ func writeDownloadBody(bodyReader io.Reader, filePath string, opts *DownloadConf
 	if syncErr := file.Sync(); syncErr != nil {
 		_ = file.Close() // best-effort cleanup on sync failure
 		if !resumed {
-			_ = os.Remove(filePath) // don't leave a truncated/corrupt file
+			_ = os.Remove(writePath) // don't leave a truncated/corrupt file
 		}
 		return nil, fmt.Errorf("failed to sync file: %w", syncErr)
 	}
 	if closeErr := file.Close(); closeErr != nil {
 		if !resumed {
-			_ = os.Remove(filePath)
+			_ = os.Remove(writePath)
 		}
 		return nil, fmt.Errorf("failed to close file: %w", closeErr)
 	}
@@ -406,8 +576,32 @@ func writeDownloadBody(bodyReader io.Reader, filePath string, opts *DownloadConf
 
 	// Verify checksum if expected value is provided
 	if opts.Checksum != "" && actualChecksum != strings.ToLower(opts.Checksum) {
-		_ = os.Remove(filePath) // remove corrupted download
+		if resumed {
+			// Preserve the pre-existing prefix: truncate back to the offset
+			// this session started at, restoring the file to exactly its
+			// pre-attempt state so a later resume can retry from there.
+			// Deleting the whole file — as the fresh-download branch below
+			// does — would also destroy the previously downloaded prefix the
+			// resume feature exists to protect (and which the write/sync
+			// error paths above deliberately preserve). The mismatch may be
+			// caused solely by the bytes appended in this attempt.
+			if truncErr := os.Truncate(filePath, resumeOffset); truncErr != nil {
+				return nil, fmt.Errorf("checksum mismatch (expected %s, got %s) and failed to restore file to offset %d: %w",
+					strings.ToLower(opts.Checksum), actualChecksum, resumeOffset, truncErr)
+			}
+			return nil, fmt.Errorf("checksum mismatch: expected %s, got %s; file truncated to previous offset %d for a fresh resume",
+				strings.ToLower(opts.Checksum), actualChecksum, resumeOffset)
+		}
+		_ = os.Remove(writePath) // remove corrupted download (fresh downloads write to the temp sibling)
 		return nil, fmt.Errorf("checksum mismatch: expected %s, got %s", strings.ToLower(opts.Checksum), actualChecksum)
+	}
+
+	// Atomically move the verified temp file into its final location.
+	if !resumed {
+		if renameErr := os.Rename(writePath, filePath); renameErr != nil {
+			_ = os.Remove(writePath) // best-effort cleanup
+			return nil, fmt.Errorf("failed to finalize download %s: %w", filePath, renameErr)
+		}
 	}
 
 	duration := time.Since(downloadStart)
@@ -592,8 +786,12 @@ func prepareFilePath(filePath string) (string, error) {
 		}
 	}
 
-	// SECURITY: Check parent directory for symlinks as well
-	// This prevents TOCTOU attacks where a directory is replaced with a symlink
+	// SECURITY: Check parent directory for symlinks as well, complementing the
+	// write-to-temp-then-rename strategy in writeDownloadBody: the destination
+	// file is only created via rename of a pre-validated temp sibling, so a
+	// symlink swapped in after this check is never opened for writing (the
+	// residual TOCTOU window affects resumed downloads, which must append to
+	// the destination itself).
 	dir := filepath.Dir(absPath)
 	if dir != absPath { // Avoid infinite recursion at root
 		if err := checkParentDirSymlinks(dir, 0); err != nil {

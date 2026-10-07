@@ -3,6 +3,7 @@
 package dns
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,7 +25,7 @@ var _ io.Closer = (*DoHResolver)(nil)
 // DoHResolver provides DNS-over-HTTPS resolution
 type DoHResolver struct {
 	client    *http.Client
-	providers []*DoHProvider
+	providers []*dohProvider
 	cache     sync.Map
 	cacheTTL  atomic.Int64 // Thread-safe cache TTL (stored as nanoseconds)
 	cacheSize atomic.Int64 // O(1) cache size tracking
@@ -34,13 +36,12 @@ type DoHResolver struct {
 	inflight inflightMap
 }
 
-// Compile-time interface check
-var _ resolver = (*DoHResolver)(nil)
-
-// DoHProvider represents a DNS-over-HTTPS service provider with a URL template and priority.
-type DoHProvider struct {
+// dohProvider represents a DNS-over-HTTPS service provider with a URL template and priority.
+type dohProvider struct {
 	Name     string
 	Template string // URL template with {name} placeholder
+	// Priority controls query order: lower values are tried first.
+	// NewDoHResolver sorts providers by this field.
 	Priority int
 
 	// Pre-computed template parts for fast URL building (set by NewDoHResolver)
@@ -58,9 +59,9 @@ type cacheEntry struct {
 
 // call represents a single in-flight DoH lookup shared by concurrent waiters.
 type call struct {
-	wg  sync.WaitGroup
-	ips []net.IPAddr
-	err error
+	ips  []net.IPAddr
+	err  error
+	done chan struct{} // closed once ips/err are published
 }
 
 // inflightMap deduplicates concurrent lookups for the same host
@@ -82,10 +83,10 @@ const (
 	maxDoHCacheSize = 1000
 )
 
-// DefaultDoHProviders returns common DoH providers.
+// defaultDoHProviders returns common DoH providers.
 // Templates use {name} for hostname and {type} for record type (A/AAAA).
-func DefaultDoHProviders() []*DoHProvider {
-	return []*DoHProvider{
+func defaultDoHProviders() []*dohProvider {
+	return []*dohProvider{
 		{
 			Name:     "cloudflare",
 			Template: "https://1.1.1.1/dns-query?name={name}&type={type}",
@@ -104,24 +105,33 @@ func DefaultDoHProviders() []*DoHProvider {
 	}
 }
 
-// NewDoHResolver creates a new DoH resolver
-func NewDoHResolver(providers []*DoHProvider, cacheTTL time.Duration) *DoHResolver {
+// NewDoHResolver creates a new DoH resolver. Passing nil or an empty
+// providers slice selects defaultDoHProviders(); custom providers can only
+// be supplied within this package (the dohProvider type is unexported).
+func NewDoHResolver(providers []*dohProvider, cacheTTL time.Duration) *DoHResolver {
 	if len(providers) == 0 {
-		providers = DefaultDoHProviders()
+		providers = defaultDoHProviders()
 	}
 	if cacheTTL == 0 {
 		cacheTTL = 5 * time.Minute
 	}
 
-	// Defensive copy: callers may reuse or share the provided DoHProvider
+	// Defensive copy: callers may reuse or share the provided dohProvider
 	// structs. The template pre-split below writes resolver-internal fields
 	// (urlPrefix/urlMiddle/urlSuffix) onto each provider, so operate on owned
 	// copies to avoid mutating the caller's input or aliasing across resolvers.
-	owned := make([]*DoHProvider, len(providers))
+	owned := make([]*dohProvider, len(providers))
 	for i := range providers {
 		cp := *providers[i]
 		owned[i] = &cp
 	}
+
+	// Query in Priority order (lower value = tried first) regardless of the
+	// order providers were passed in — previously the field was silently
+	// ignored and lookupViaProviders used slice order.
+	slices.SortStableFunc(owned, func(a, b *dohProvider) int {
+		return cmp.Compare(a.Priority, b.Priority)
+	})
 
 	r := &DoHResolver{
 		client: &http.Client{
@@ -168,6 +178,22 @@ func (r *DoHResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAd
 		return nil, fmt.Errorf("DoH resolver is closed")
 	}
 
+	// Fast path: an IP-literal host needs no resolution. Without this, every
+	// connection to an IP address (e.g. http://127.0.0.1) would pay a full DoH
+	// provider round-trip — stalling until the provider timeout when offline.
+	// Matches net.DefaultResolver semantics, which returns IP literals as-is.
+	// SSRF filtering happens in the caller (connection pool) on the returned
+	// IPs, so private-address blocking is unaffected.
+	if ip := net.ParseIP(host); ip != nil {
+		return []net.IPAddr{{IP: ip}}, nil
+	}
+
+	// DNS names are case-insensitive (RFC 1035 §3.1). Normalize the key so
+	// Example.com and example.com share one cache entry and one singleflight
+	// round-trip instead of duplicating provider queries and cache slots.
+	// strings.ToLower returns s unchanged (no allocation) when already lower.
+	host = strings.ToLower(host)
+
 	// Check cache — Load is safe since cacheEntry is read-only after creation.
 	if cached, ok := r.cache.Load(host); ok {
 		if entry, typeOk := cached.(*cacheEntry); typeOk && entry != nil {
@@ -194,14 +220,18 @@ func (r *DoHResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAd
 		return nil, err
 	}
 	if len(ips) == 0 {
-		return ips, nil
+		// Unreachable in practice — every provider path and the system
+		// fallback return an error rather than an empty success — but if it
+		// ever fired, the caller (connection/pool.go) would misreport it as
+		// "resolves only to blocked addresses". Surface the real condition.
+		return nil, fmt.Errorf("DoH lookup for %s returned no addresses", host)
 	}
 
 	// SECURITY: Use CAS to atomically reserve cache slot before storing.
 	// Bounded retry prevents theoretical livelock under extreme contention
 	// where concurrent goroutines continuously fill and evict the cache.
 	const maxCacheRetryAttempts = 3
-	for attempt := 0; attempt < maxCacheRetryAttempts; attempt++ {
+	for range maxCacheRetryAttempts {
 		current := r.cacheSize.Load()
 		if current >= maxDoHCacheSize {
 			// Cache full — evict expired entries first, then the oldest fresh
@@ -240,26 +270,48 @@ func (r *DoHResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAd
 // once, only the first performs the provider queries; the others wait and
 // share the result. This is a minimal singleflight using the standard library.
 func (r *DoHResolver) lookupDedup(ctx context.Context, host string) ([]net.IPAddr, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	r.inflight.mu.Lock()
 	if r.inflight.m == nil {
 		r.inflight.m = make(map[string]*call)
 	}
 	if c, ok := r.inflight.m[host]; ok {
-		// Another goroutine is already resolving this host — wait for its result.
+		// Another goroutine is already resolving this host. Wait for its
+		// result, but honor the caller's context: cancellation must not
+		// block behind a slow leader.
 		r.inflight.mu.Unlock()
-		c.wg.Wait()
-		return c.ips, c.err
+		select {
+		case <-c.done:
+			return c.ips, c.err
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
-	c := new(call)
-	c.wg.Add(1)
+	c := &call{done: make(chan struct{})}
 	r.inflight.m[host] = c
 	r.inflight.mu.Unlock()
 
-	ips, err := r.lookupViaProviders(ctx, host)
+	// Guard the leader's provider round-trip the same way the per-record-type
+	// goroutines in lookupWithProvider are guarded. A panic escaping
+	// lookupViaProviders would skip both close(c.done) and the inflight cleanup
+	// below: the orphaned call would never complete, and every later lookup for
+	// this host would attach to it and block until its own context deadline.
+	// Converting the panic into an error keeps waiters (and the fallback path)
+	// moving.
+	ips, err := func() (ips []net.IPAddr, err error) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				ips, err = nil, fmt.Errorf("doh lookup panic recovered: %v", rec)
+			}
+		}()
+		return r.lookupViaProviders(ctx, host)
+	}()
 
-	// Publish the result before Done() so waiters observe it after Wait().
+	// Publish the result before closing done so waiters observe it.
 	c.ips, c.err = ips, err
-	c.wg.Done()
+	close(c.done)
 
 	r.inflight.mu.Lock()
 	delete(r.inflight.m, host)
@@ -289,7 +341,7 @@ func (r *DoHResolver) CacheSize() int64 {
 
 // lookupWithProvider performs DNS lookup using a specific DoH provider.
 // It queries both A (IPv4) and AAAA (IPv6) records concurrently.
-func (r *DoHResolver) lookupWithProvider(ctx context.Context, provider *DoHProvider, host string) ([]net.IPAddr, error) {
+func (r *DoHResolver) lookupWithProvider(ctx context.Context, provider *dohProvider, host string) ([]net.IPAddr, error) {
 	escapedHost := url.PathEscape(host)
 
 	type lookupResult struct {
@@ -344,7 +396,7 @@ func (r *DoHResolver) lookupWithProvider(ctx context.Context, provider *DoHProvi
 }
 
 // lookupRecordType queries a specific DNS record type (A or AAAA) via DoH.
-func (r *DoHResolver) lookupRecordType(ctx context.Context, provider *DoHProvider, escapedHost, recordType string) ([]net.IPAddr, error) {
+func (r *DoHResolver) lookupRecordType(ctx context.Context, provider *dohProvider, escapedHost, recordType string) ([]net.IPAddr, error) {
 	// Build request URL using pre-split template parts (avoids strings.Replace allocations)
 	var requestURL string
 	if provider.urlPrefix != "" || provider.urlMiddle != "" {
@@ -426,11 +478,18 @@ func (r *DoHResolver) parseResponse(resp *http.Response, host string) ([]net.IPA
 	}
 
 	// Unknown or missing Content-Type: try JSON (matches the Accept header we
-	// sent) and fall back to wire format so a misconfigured server still resolves.
-	if ips, jsonErr := r.parseJSONResponse(body, host); jsonErr == nil {
-		return ips, nil
+	// sent) and fall back to wire format so a misconfigured server still
+	// resolves. When both fail, report both clues instead of silently
+	// discarding the JSON parse error.
+	jsonIPs, jsonErr := r.parseJSONResponse(body, host)
+	if jsonErr == nil {
+		return jsonIPs, nil
 	}
-	return r.parseWireFormatResponse(body, host)
+	wireIPs, wireErr := r.parseWireFormatResponse(body, host)
+	if wireErr == nil {
+		return wireIPs, nil
+	}
+	return nil, fmt.Errorf("unknown DoH response format (json: %w; wire: %w)", jsonErr, wireErr)
 }
 
 // dohMediaType extracts the media type from a Content-Type header value,
@@ -463,6 +522,13 @@ func (r *DoHResolver) parseJSONResponse(body []byte, host string) ([]net.IPAddr,
 		return nil, fmt.Errorf("DNS query returned status %d", resp.Status)
 	}
 
+	// BINDING: the first answer must answer the queried name. Without this
+	// check a faulty or malicious endpoint could return another domain's
+	// records and have them cached under this host.
+	if len(resp.Answer) > 0 && !dnsNameEqual(resp.Answer[0].Name, host) {
+		return nil, fmt.Errorf("response answers %q, not the queried host %q", resp.Answer[0].Name, host)
+	}
+
 	ips := make([]net.IPAddr, 0, 4)
 	for _, answer := range resp.Answer {
 		// Type 1 = A record (IPv4), Type 28 = AAAA record (IPv6)
@@ -490,6 +556,14 @@ func (r *DoHResolver) parseWireFormatResponse(body []byte, host string) ([]net.I
 		return nil, fmt.Errorf("response too short")
 	}
 
+	// RCODE lives in the low nibble of byte 3. Non-zero codes (SERVFAIL,
+	// REFUSED, ...) must surface as errors — otherwise they parse as empty
+	// answers and mask the real failure. NXDOMAIN (3) is tolerated to match
+	// the JSON parser, which maps it to "no IP addresses found".
+	if rcode := body[3] & 0x0F; rcode != 0 && rcode != 3 {
+		return nil, fmt.Errorf("DNS response RCODE %d (%s)", rcode, rcodeName(rcode))
+	}
+
 	// Skip header (12 bytes)
 	offset := 12
 
@@ -515,14 +589,26 @@ func (r *DoHResolver) parseWireFormatResponse(body []byte, host string) ([]net.I
 	ips := make([]net.IPAddr, 0, 4)
 
 	for i := 0; i < int(anCount); i++ {
-		_, newOffset, err := parseDomain(body, offset, 0)
+		name, newOffset, err := parseDomain(body, offset, 0)
 		if err != nil {
-			break
+			// Surface the parse error instead of breaking out to the generic
+			// "no IP addresses found in response" below: a truncated or
+			// corrupt wire response deserves its actual diagnosis, and the
+			// caller's fallback path logs it.
+			return nil, fmt.Errorf("malformed answer name at %d: %w", offset, err)
 		}
 		offset = newOffset
 
+		// BINDING: the first answer must answer the queried name (later
+		// answers may legitimately belong to a CNAME chain). Without this
+		// check a faulty or malicious endpoint could return another domain's
+		// records and have them cached under this host.
+		if i == 0 && !dnsNameEqual(name, host) {
+			return nil, fmt.Errorf("response answers %q, not the queried host %q", name, host)
+		}
+
 		if offset+10 > len(body) {
-			break
+			return nil, fmt.Errorf("truncated DNS answer record at offset %d", offset)
 		}
 
 		// TYPE, CLASS, TTL, RDLENGTH
@@ -531,7 +617,7 @@ func (r *DoHResolver) parseWireFormatResponse(body []byte, host string) ([]net.I
 		offset += 10
 
 		if offset+rdLength > len(body) {
-			break
+			return nil, fmt.Errorf("DNS RDATA overruns response (offset %d, length %d, body %d)", offset, rdLength, len(body))
 		}
 
 		// Type 1 = A record (IPv4), Type 28 = AAAA record (IPv6)
@@ -555,6 +641,29 @@ func (r *DoHResolver) parseWireFormatResponse(body []byte, host string) ([]net.I
 	}
 
 	return ips, nil
+}
+
+// dnsNameEqual compares DNS names case-insensitively (RFC 1035 §2.3.3),
+// tolerating the optional trailing root dot.
+func dnsNameEqual(a, b string) bool {
+	return strings.EqualFold(strings.TrimSuffix(a, "."), strings.TrimSuffix(b, "."))
+}
+
+// rcodeName maps common DNS RCODEs (RFC 1035 §4.1.1, RFC 8914) to their
+// mnemonic for clearer error messages.
+func rcodeName(rcode byte) string {
+	switch rcode {
+	case 1:
+		return "FORMERR"
+	case 2:
+		return "SERVFAIL"
+	case 4:
+		return "NOTIMP"
+	case 5:
+		return "REFUSED"
+	default:
+		return "UNKNOWN"
+	}
 }
 
 // maxDomainRecursion limits the depth of DNS compression pointer recursion
@@ -628,8 +737,25 @@ func getUint16(b []byte) (uint16, error) {
 	return uint16(b[0])<<8 | uint16(b[1]), nil
 }
 
+// fallbackLookupTimeout bounds the system-resolver fallback when the caller's
+// context carries no deadline. The DoH providers have already spent up to
+// ~10s (5s HTTP timeout × sequential providers × 2 record types); handing a
+// deadline-less context to the system resolver can stall the dial far beyond
+// DialTimeout. Mirrors the 10s cap the non-DoH dialer path applies to DNS
+// (connection/pool.go resolveAndValidateAddress) so both resolution paths
+// have consistent worst-case behavior.
+const fallbackLookupTimeout = 10 * time.Second
+
 // fallbackLookup falls back to system DNS resolver
 func (r *DoHResolver) fallbackLookup(ctx context.Context, host string, lastErr error) ([]net.IPAddr, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, fallbackLookupTimeout)
+		defer cancel()
+	}
 	// Use system resolver as fallback
 	systemResolver := net.DefaultResolver
 	ips, err := systemResolver.LookupIPAddr(ctx, host)
@@ -641,6 +767,13 @@ func (r *DoHResolver) fallbackLookup(ctx context.Context, host string, lastErr e
 
 // ClearCache clears the DNS cache.
 // Deletes all entries and atomically resets the counter to zero.
+//
+// The final recount is approximate under concurrency: an entry admitted
+// between the counting Range and the Store can leave the counter slightly
+// below the true size, so the cache may transiently exceed maxDoHCacheSize by
+// the number of concurrent admissions. The overshoot is bounded by caller
+// concurrency (never unbounded) and self-corrects at the next admission check,
+// which re-reads and evicts.
 func (r *DoHResolver) ClearCache() {
 	r.cache.Range(func(key, value any) bool {
 		if _, ok := r.cache.LoadAndDelete(key); ok {
@@ -651,6 +784,7 @@ func (r *DoHResolver) ClearCache() {
 	// Reconcile counter: concurrent eviction may have decremented entries
 	// we already deleted, or new entries may have been inserted during the scan.
 	// Loading the actual count ensures the counter never goes negative.
+	// (See the doc comment above for the bounded under-count race this leaves.)
 	count := int64(0)
 	r.cache.Range(func(_, _ any) bool {
 		count++

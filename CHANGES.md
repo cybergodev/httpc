@@ -4,7 +4,7 @@ All notable changes to the cybergodev/httpc library will be documented in this f
 
 ---
 
-## v1.6.2- Per-Request Proxy Rotation, Performance & Bug Fixes (2026-08-12)
+## v1.6.2 - Per-Request Proxy Rotation, Performance & Bug Fixes (2026-08-12)
 
 ### Added
 - `ProxyRotatePerRequest` field on `ConnectionConfig` — each independent request (Get/Post/etc.) uses a different proxy from the pool

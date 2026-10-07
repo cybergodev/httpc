@@ -49,6 +49,17 @@ type requestWriter interface {
 // RequestMutator provides read-write access to request data for middleware.
 // It embeds requestReader and requestWriter for full access to request properties.
 // Middleware can inspect and modify request properties before the request is sent.
+//
+// LIFETIME CONTRACT: the maps returned by Headers() and QueryParams() are
+// pooled internal storage, valid only for the duration of the request. Do not
+// retain references beyond the middleware call (e.g. in async logging or
+// audit pipelines) — after the request completes the maps are cleared and
+// recycled for unrelated requests. Copy the data if you need to keep it.
+//
+// OWNERSHIP CONTRACT (setter side): SetHeaders and SetQueryParams COPY the
+// supplied maps into engine-owned pooled storage. Passing a caller-owned or
+// shared map is safe — the engine never retains the argument, and later
+// mutations to it do not affect the in-flight request.
 type RequestMutator interface {
 	requestReader
 	requestWriter

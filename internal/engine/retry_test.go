@@ -14,6 +14,34 @@ import (
 // RETRY ENGINE UNIT TESTS
 // ============================================================================
 
+// TestRetryEngine_GetDelay_Int64Overflow verifies that an extreme-but-valid
+// configuration (RetryDelay=30m, BackoffFactor=10, attempt>=7 grows the
+// product past int64's range) never produces a negative or uncapped delay.
+// Before the clamp, the out-of-range float64→Duration conversion yielded
+// minInt64, which slipped past the MaxRetryDelay cap and made retries fire
+// immediately instead of backing off.
+func TestRetryEngine_GetDelay_Int64Overflow(t *testing.T) {
+	const maxDelay = 30 * time.Second
+	re := newRetryEngine(&Config{
+		RetryDelay:    30 * time.Minute, // public validation ceiling (maxTimeout)
+		BackoffFactor: 10.0,             // public validation ceiling (maxBackoffFactor)
+		MaxRetryDelay: maxDelay,
+		Jitter:        false, // deterministic assertions
+	})
+
+	// attempt 9 is the highest index the retry loop can request (MaxRetries
+	// is validated to at most 10, and sleep uses attempt < MaxRetries).
+	for attempt := 0; attempt <= 9; attempt++ {
+		d := re.calculateExponentialDelay(attempt)
+		if d < 0 {
+			t.Errorf("attempt %d: negative delay %v — int64 overflow not clamped", attempt, d)
+		}
+		if d > maxDelay {
+			t.Errorf("attempt %d: delay %v exceeds MaxRetryDelay %v", attempt, d, maxDelay)
+		}
+	}
+}
+
 func TestRetryEngine_New(t *testing.T) {
 	config := &Config{
 		MaxRetries:    3,
@@ -67,51 +95,17 @@ func TestRetryEngine_ShouldRetry(t *testing.T) {
 	engine := newRetryEngine(config)
 
 	t.Run("NetworkErrors", func(t *testing.T) {
+		// OpError/DNSError/context rows were removed: ShouldRetry(nil, err, n)
+		// delegates to isRetryableError, whose full classification table lives
+		// in TestRetryEngine_IsRetryableError. One delegation row remains.
 		tests := []struct {
 			name     string
 			err      error
 			expected bool
 		}{
 			{
-				name: "OpError is retryable (temporary)",
-				err: &net.OpError{
-					Op:   "dial",
-					Net:  "tcp",
-					Addr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 80},
-					Err:  errors.New("connection refused"),
-				},
-				expected: false, // OpError.Temporary() returns false by default, so not retryable via net.Error interface
-			},
-			{
-				name: "DNSError is retryable (temporary)",
-				err: &net.DNSError{
-					Err:         "no such host",
-					Name:        "example.com",
-					Server:      "8.8.8.8",
-					IsTimeout:   false,
-					IsTemporary: true, // Set to true to make it retryable
-				},
-				expected: true,
-			},
-			{
-				name: "DNSError not temporary",
-				err: &net.DNSError{
-					Err:         "no such host",
-					Name:        "example.com",
-					Server:      "8.8.8.8",
-					IsTimeout:   false,
-					IsTemporary: false,
-				},
-				expected: false,
-			},
-			{
-				name:     "Context canceled is not retryable",
+				name:     "Context canceled is not retryable (delegates to isRetryableError)",
 				err:      context.Canceled,
-				expected: false,
-			},
-			{
-				name:     "Context deadline exceeded is not retryable",
-				err:      context.DeadlineExceeded,
 				expected: false,
 			},
 		}
@@ -227,53 +221,8 @@ func TestRetryEngine_ExtraRetryableStatusCodes(t *testing.T) {
 	}
 }
 
-func TestRetryEngine_GetDelay_ExponentialBackoff(t *testing.T) {
-	config := &Config{
-		RetryDelay:    100 * time.Millisecond,
-		BackoffFactor: 2.0,
-		Jitter:        false, // Disable jitter for predictable testing
-	}
-
-	engine := newRetryEngine(config)
-
-	tests := []struct {
-		attempt     int
-		expectedMin time.Duration
-		expectedMax time.Duration
-	}{
-		{
-			attempt:     0,
-			expectedMin: 100 * time.Millisecond,
-			expectedMax: 100 * time.Millisecond,
-		},
-		{
-			attempt:     1,
-			expectedMin: 200 * time.Millisecond,
-			expectedMax: 200 * time.Millisecond,
-		},
-		{
-			attempt:     2,
-			expectedMin: 400 * time.Millisecond,
-			expectedMax: 400 * time.Millisecond,
-		},
-		{
-			attempt:     3,
-			expectedMin: 800 * time.Millisecond,
-			expectedMax: 800 * time.Millisecond,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run("", func(t *testing.T) {
-			delay := engine.GetDelay(tt.attempt)
-
-			if delay < tt.expectedMin || delay > tt.expectedMax {
-				t.Errorf("Attempt %d: expected delay between %v and %v, got %v",
-					tt.attempt, tt.expectedMin, tt.expectedMax, delay)
-			}
-		})
-	}
-}
+// TestRetryEngine_GetDelay_ExponentialBackoff was removed: its exact-value
+// rows for attempts 0-3 are rows of TestRetryEngine_GetDelay_TableDriven.
 
 func TestRetryEngine_GetDelay_WithJitter(t *testing.T) {
 	config := &Config{
@@ -328,6 +277,46 @@ func TestRetryEngine_GetDelay_TableDriven(t *testing.T) {
 		expectedMax   time.Duration
 		checkMax      bool // if true, verify delay <= expectedMax instead of exact match
 	}{
+		{
+			name: "exponential attempt 0 = base delay",
+			config: &Config{
+				RetryDelay:    100 * time.Millisecond,
+				BackoffFactor: 2.0,
+				Jitter:        false,
+			},
+			attempt:       0,
+			expectedDelay: 100 * time.Millisecond,
+		},
+		{
+			name: "exponential attempt 1 = base * 2",
+			config: &Config{
+				RetryDelay:    100 * time.Millisecond,
+				BackoffFactor: 2.0,
+				Jitter:        false,
+			},
+			attempt:       1,
+			expectedDelay: 200 * time.Millisecond,
+		},
+		{
+			name: "exponential attempt 2 = base * 4",
+			config: &Config{
+				RetryDelay:    100 * time.Millisecond,
+				BackoffFactor: 2.0,
+				Jitter:        false,
+			},
+			attempt:       2,
+			expectedDelay: 400 * time.Millisecond,
+		},
+		{
+			name: "exponential attempt 3 = base * 8",
+			config: &Config{
+				RetryDelay:    100 * time.Millisecond,
+				BackoffFactor: 2.0,
+				Jitter:        false,
+			},
+			attempt:       3,
+			expectedDelay: 800 * time.Millisecond,
+		},
 		{
 			name: "MaxRetryDelay caps exponential growth",
 			config: &Config{
@@ -808,6 +797,10 @@ func TestExecuteWithRetry_BodyBufferedForRetry(t *testing.T) {
 		RetryDelay:      time.Millisecond,
 		BackoffFactor:   1.0,
 		UserAgent:       "test/1.0",
+		// The body under test rides a POST; the retry loop (and thus the
+		// io.Reader buffering branch) only engages for it when non-idempotent
+		// retries are explicitly enabled.
+		RetryNonIdempotent: true,
 	}
 	client, err := NewClient(config, func(opts *clientOptions) {
 		opts.customTransport = mock

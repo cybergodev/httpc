@@ -1,3 +1,5 @@
+//go:build integration
+
 package dns
 
 import (
@@ -104,7 +106,7 @@ func TestDoHResolverFallback(t *testing.T) {
 	}
 
 	// Create resolver with invalid provider to force fallback
-	invalidProviders := []*DoHProvider{
+	invalidProviders := []*dohProvider{
 		{
 			Name:     "invalid",
 			Template: "http://invalid.invalid.invalid/test",

@@ -38,7 +38,7 @@ func forwardProxy(id string) *httptest.Server {
 			w.Header()[k] = vs
 		}
 		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		_, _ = io.Copy(w, resp.Body) // best-effort test proxying
 	}))
 }
 
@@ -48,7 +48,7 @@ func forwardProxy(id string) *httptest.Server {
 func TestProxyPool_EndToEndRotation(t *testing.T) {
 	// Target echoes which proxy forwarded the request.
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(r.Header.Get("X-Proxy-ID")))
+		_, _ = w.Write([]byte(r.Header.Get("X-Proxy-ID"))) // best-effort test response
 	}))
 	defer target.Close()
 
@@ -95,7 +95,7 @@ func TestProxyPool_EndToEndRotation(t *testing.T) {
 func TestProxyPool_RotatePerRequest_NoRetries(t *testing.T) {
 	// Target echoes which proxy forwarded the request.
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(r.Header.Get("X-Proxy-ID")))
+		_, _ = w.Write([]byte(r.Header.Get("X-Proxy-ID"))) // best-effort test response
 	}))
 	defer target.Close()
 
@@ -142,7 +142,7 @@ func TestProxyPool_RotatePerRequest_NoRetries(t *testing.T) {
 // opens a fresh tunnel through a different proxy.
 func TestProxyPool_RotatePerRequest_HTTPS(t *testing.T) {
 	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(r.RemoteAddr))
+		_, _ = w.Write([]byte(r.RemoteAddr)) // best-effort test response
 	}))
 	defer target.Close()
 
@@ -178,14 +178,14 @@ func TestProxyPool_RotatePerRequest_HTTPS(t *testing.T) {
 			defer clientConn.Close()
 			defer dst.Close()
 
-			bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+			_, _ = bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n") // best-effort handshake
 			bufrw.Flush()
 
 			go func() {
-				io.Copy(dst, bufrw)
+				_, _ = io.Copy(dst, bufrw) // tunnel relay
 				dst.Close()
 			}()
-			io.Copy(clientConn, dst)
+			_, _ = io.Copy(clientConn, dst) // tunnel relay
 		}))
 		defer proxy.Close()
 		proxyURLs[i] = proxy.URL
@@ -233,7 +233,7 @@ func TestProxyPool_RotatePerRequest_HTTPS(t *testing.T) {
 func TestProxyPool_RotatePerRequest_SkipsBadProxy(t *testing.T) {
 	// Target echoes which proxy forwarded the request.
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(r.Header.Get("X-Proxy-ID")))
+		_, _ = w.Write([]byte(r.Header.Get("X-Proxy-ID"))) // best-effort test response
 	}))
 	defer target.Close()
 
@@ -357,7 +357,7 @@ func TestProxyPool_EndToEndRotation_HTTPS(t *testing.T) {
 	// TLS target — the body echoes the TCP RemoteAddr so we can distinguish
 	// which proxy's tunnel the request arrived through.
 	target := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(r.RemoteAddr))
+		_, _ = w.Write([]byte(r.RemoteAddr)) // best-effort test response
 	}))
 	defer target.Close()
 
@@ -394,15 +394,15 @@ func TestProxyPool_EndToEndRotation_HTTPS(t *testing.T) {
 			defer clientConn.Close()
 			defer dst.Close()
 
-			bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n")
+			_, _ = bufrw.WriteString("HTTP/1.1 200 Connection Established\r\n\r\n") // best-effort handshake
 			bufrw.Flush()
 
 			// Bidirectional tunnel: client ↔ target
 			go func() {
-				io.Copy(dst, bufrw)
+				_, _ = io.Copy(dst, bufrw) // tunnel relay
 				dst.Close()
 			}()
-			io.Copy(clientConn, dst)
+			_, _ = io.Copy(clientConn, dst) // tunnel relay
 		}))
 		defer proxy.Close()
 		proxyURLs[i] = proxy.URL
@@ -460,11 +460,11 @@ func TestProxyPool_RotateOn403_OneProxySucceeds(t *testing.T) {
 
 		if proxyID == "proxy-A" {
 			w.WriteHeader(http.StatusForbidden)
-			w.Write([]byte("CF blocked"))
+			_, _ = w.Write([]byte("CF blocked")) // best-effort test response
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK from " + proxyID))
+		_, _ = w.Write([]byte("OK from " + proxyID)) // best-effort test response
 	}))
 	defer target.Close()
 
@@ -575,4 +575,166 @@ func TestProxyPool_RotateOn403_RedirectSafe(t *testing.T) {
 	}
 	t.Logf("Redirect-safe rotation: %d attempts across %d distinct proxies: %v",
 		len(attempted), len(distinct), attempted)
+}
+
+// TestProxyPool_MetaProxyURL verifies Result.Meta.ProxyURL reports the pool
+// entry that actually served each request. The target echoes the forwarding
+// proxy's ID, so the metadata is cross-checked against ground truth rather
+// than against itself.
+func TestProxyPool_MetaProxyURL(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(r.Header.Get("X-Proxy-ID"))) // best-effort test response
+	}))
+	defer target.Close()
+
+	ids := []string{"proxy-A", "proxy-B", "proxy-C"}
+	proxyURLs := make([]string, len(ids))
+	idByURL := make(map[string]string, len(ids))
+	for i, id := range ids {
+		p := forwardProxy(id)
+		defer p.Close()
+		proxyURLs[i] = p.URL
+		idByURL[p.URL] = id
+	}
+
+	cfg := DefaultConfig()
+	cfg.Connection.ProxyPool = proxyURLs
+	cfg.Connection.ProxyRotatePerRequest = true
+	cfg.Retry.MaxRetries = 0 // exercise the no-retry fast path
+	cfg.Security.AllowPrivateIPs = true
+	cfg.Timeouts.Request = 5 * time.Second
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer client.Close()
+
+	seen := make(map[string]int)
+	for i := 0; i < 3; i++ {
+		result, err := client.Get(target.URL)
+		if err != nil {
+			t.Fatalf("Request %d failed: %v", i, err)
+		}
+		if result.Meta.ProxyURL == "" {
+			t.Fatalf("Request %d: Meta.ProxyURL is empty, want the serving proxy", i)
+		}
+		id, ok := idByURL[result.Meta.ProxyURL]
+		if !ok {
+			t.Fatalf("Request %d: Meta.ProxyURL %q is not a configured pool entry", i, result.Meta.ProxyURL)
+		}
+		if echoed := strings.TrimSpace(result.Body()); echoed != id {
+			t.Errorf("Request %d: Meta.ProxyURL says %s but the request was forwarded by %s",
+				i, id, echoed)
+		}
+		seen[result.Meta.ProxyURL]++
+	}
+	if len(seen) != 3 {
+		t.Errorf("expected Meta.ProxyURL to report 3 distinct proxies, got %d: %v", len(seen), seen)
+	}
+}
+
+// TestProxyPool_MetaProxyURL_SingleProxy verifies Meta.ProxyURL for a single
+// static Connection.ProxyURL (the highest-priority proxy mode).
+func TestProxyPool_MetaProxyURL_SingleProxy(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(r.Header.Get("X-Proxy-ID"))) // best-effort test response
+	}))
+	defer target.Close()
+
+	staticProxy := forwardProxy("static-proxy")
+	defer staticProxy.Close()
+
+	cfg := DefaultConfig()
+	cfg.Connection.ProxyURL = staticProxy.URL
+	cfg.Security.AllowPrivateIPs = true
+	cfg.Timeouts.Request = 5 * time.Second
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer client.Close()
+
+	result, err := client.Get(target.URL)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if result.Meta.ProxyURL != staticProxy.URL {
+		t.Errorf("Meta.ProxyURL = %q, want %q", result.Meta.ProxyURL, staticProxy.URL)
+	}
+}
+
+// TestMetaProxyURL_DirectConnection verifies Meta.ProxyURL stays empty when
+// no proxy is configured.
+func TestMetaProxyURL_DirectConnection(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok")) // best-effort test response
+	}))
+	defer target.Close()
+
+	cfg := DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true // test server is on localhost
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer client.Close()
+
+	result, err := client.Get(target.URL)
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if result.Meta.ProxyURL != "" {
+		t.Errorf("Meta.ProxyURL = %q, want empty for direct connection", result.Meta.ProxyURL)
+	}
+}
+
+// TestProxyPool_MetaProxyURL_AfterRetry verifies Meta.ProxyURL reports the
+// proxy that served the FINAL attempt when earlier attempts failed on a dead
+// proxy and rotated away — the scenario dev_test/main_6.go debugs.
+func TestProxyPool_MetaProxyURL_AfterRetry(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(r.Header.Get("X-Proxy-ID"))) // best-effort test response
+	}))
+	defer target.Close()
+
+	deadProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "should not be reached", http.StatusInternalServerError)
+	}))
+	deadProxy.Close() // closed immediately so connections are refused
+
+	healthyProxy := forwardProxy("proxy-A")
+	defer healthyProxy.Close()
+
+	cfg := DefaultConfig()
+	// Dead proxy first: the initial attempt (base index 0) hits it, the
+	// retry (base index 1) must rotate to the healthy proxy.
+	cfg.Connection.ProxyPool = []string{deadProxy.URL, healthyProxy.URL}
+	cfg.Connection.ProxyRotatePerRequest = true
+	cfg.Retry.MaxRetries = 1
+	cfg.Retry.Delay = 10 * time.Millisecond
+	cfg.Security.AllowPrivateIPs = true
+	cfg.Timeouts.Request = 10 * time.Second
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+	defer client.Close()
+
+	result, err := client.Get(target.URL)
+	if err != nil {
+		t.Fatalf("Request failed (should have rotated past dead proxy): %v", err)
+	}
+	if result.Meta.Attempts < 2 {
+		t.Fatalf("expected a retry past the dead proxy, attempts = %d", result.Meta.Attempts)
+	}
+	if result.Meta.ProxyURL != healthyProxy.URL {
+		t.Errorf("Meta.ProxyURL = %q, want %q (the final attempt's proxy)",
+			result.Meta.ProxyURL, healthyProxy.URL)
+	}
+	if echoed := strings.TrimSpace(result.Body()); echoed != "proxy-A" {
+		t.Errorf("forwarded by %q, want proxy-A", echoed)
+	}
 }

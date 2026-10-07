@@ -3,6 +3,7 @@ package httpc
 import (
 	"errors"
 
+	"github.com/cybergodev/httpc/internal/connection"
 	"github.com/cybergodev/httpc/internal/engine"
 )
 
@@ -72,6 +73,14 @@ var (
 	// MaxRetries must be 0-10, BackoffFactor must be 1.0-10.0.
 	ErrInvalidRetry = errors.New("invalid retry configuration")
 
+	// ErrInvalidMaxRedirects is returned when the per-request redirect limit
+	// is negative or exceeds 50.
+	ErrInvalidMaxRedirects = errors.New("invalid max redirects")
+
+	// ErrInvalidCredentials is returned when Basic or Bearer credentials fail
+	// validation (empty, oversized, or containing invalid characters).
+	ErrInvalidCredentials = errors.New("invalid credentials")
+
 	// ErrInvalidConnection is returned when connection configuration is invalid.
 	// MaxIdleConns and MaxConnsPerHost must be within allowed ranges.
 	ErrInvalidConnection = errors.New("invalid connection configuration")
@@ -99,4 +108,29 @@ var (
 	// ErrResponseBodyTooLarge is returned when response body exceeds size limit.
 	// Increase MaxResponseBodySize in Config or reduce response size.
 	ErrResponseBodyTooLarge = errors.New("response body too large")
+
+	// ErrStreamBodyRequiresDownload is returned when WithStreamBody is used
+	// with the standard request methods (Get, Post, ..., Request). Streaming
+	// is only effective through Download, which consumes the raw body reader
+	// directly; every other path buffers the body into a Result and closes
+	// the stream, so the option is rejected instead of silently returning an
+	// empty body. Use errors.Is(err, httpc.ErrStreamBodyRequiresDownload) to
+	// detect this condition.
+	ErrStreamBodyRequiresDownload = errors.New("WithStreamBody requires Download; standard request methods buffer the response body")
+
+	// ErrDownloadInProgress is returned when a Download targeting the same
+	// file path is already running in this process. Two concurrent downloads
+	// to one destination would corrupt each other's writes (shared temp file
+	// or concurrent append), so the second caller fails fast instead of
+	// blocking; retry when the first download finishes. The lock is
+	// in-process only — coordinating downloads across separate processes is
+	// the caller's responsibility.
+	ErrDownloadInProgress = errors.New("download already in progress for this file path")
+
+	// ErrProxyConnectionFailed is returned when a configured proxy could not
+	// be dialed. It is wrapped (alongside the underlying cause) in every
+	// proxy dial failure so callers can detect the condition with
+	// errors.Is(err, httpc.ErrProxyConnectionFailed) without matching the
+	// specific transport error.
+	ErrProxyConnectionFailed = connection.ErrProxyConnectionFailed
 )

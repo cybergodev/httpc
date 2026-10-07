@@ -12,7 +12,7 @@ import (
 // This example demonstrates comprehensive response handling
 
 func main() {
-	fmt.Println("=== Response Handling Examples ===\n ")
+	fmt.Println("=== Response Handling Examples ===")
 
 	client, err := httpc.NewDefault()
 	if err != nil {
@@ -67,6 +67,7 @@ func demonstrateResultAPI(client httpc.Client) {
 
 	// Metadata
 	fmt.Println("Metadata:")
+	fmt.Printf("  Proto: %s\n", result.Proto())
 	fmt.Printf("  Duration: %v\n", result.Meta.Duration)
 	fmt.Printf("  Attempts: %d\n", result.Meta.Attempts)
 	fmt.Printf("  Redirect count: %d\n\n", result.Meta.RedirectCount)
@@ -95,7 +96,7 @@ func demonstrateResponseParsing(client httpc.Client) {
 	if err := resp.Unmarshal(&apiResp); err != nil {
 		log.Printf("JSON parse error: %v\n", err)
 	} else {
-		fmt.Printf("✓ JSON struct: Method=%s, Args=%d\n", apiResp.Method, len(apiResp.Args))
+		fmt.Printf("[OK] JSON struct: Method=%s, Args=%d\n", apiResp.Method, len(apiResp.Args))
 	}
 
 	// JSON parsing into map
@@ -103,42 +104,51 @@ func demonstrateResponseParsing(client httpc.Client) {
 	if err := resp.Unmarshal(&mapResult); err != nil {
 		log.Printf("JSON map error: %v\n", err)
 	} else {
-		fmt.Printf("✓ JSON map: %d keys\n", len(mapResult))
+		fmt.Printf("[OK] JSON map: %d keys\n", len(mapResult))
 	}
 
 	// Raw body access
 	bodyStr := resp.Body()
-	fmt.Printf("✓ Raw body: %d bytes\n", len(bodyStr))
+	fmt.Printf("[OK] Raw body: %d bytes\n", len(bodyStr))
 
 	// Raw bytes
 	bodyBytes := resp.RawBody()
-	fmt.Printf("✓ Raw bytes: %d bytes\n\n", len(bodyBytes))
+	fmt.Printf("[OK] Raw bytes: %d bytes\n\n", len(bodyBytes))
 }
 
-// demonstrateStatusChecking shows status code checking methods
+// demonstrateStatusChecking shows status code checking methods.
+// A 200 response and a 404 response are both fetched so every classifier
+// has a real value to report.
 func demonstrateStatusChecking(client httpc.Client) {
 	fmt.Println("--- Status Code Checking ---")
 
-	resp, err := client.Get("https://echo.hoppscotch.io")
-	if err != nil {
-		log.Printf("Error: %v\n", err)
-		return
-	}
+	for _, url := range []string{
+		"https://echo.hoppscotch.io",     // 200 OK
+		"https://httpbin.org/status/404", // 404 Not Found
+	} {
+		resp, err := client.Get(url)
+		if err != nil {
+			log.Printf("Error: %v\n", err)
+			return
+		}
 
-	fmt.Printf("Status Code: %d\n", resp.StatusCode())
-	fmt.Printf("Status Text: %s\n", resp.Response.Status)
-	fmt.Printf("Is Success (2xx): %v\n", resp.IsSuccess())
-	fmt.Printf("Is Redirect (3xx): %v\n", resp.IsRedirect())
-	fmt.Printf("Is Client Error (4xx): %v\n", resp.IsClientError())
-	fmt.Printf("Is Server Error (5xx): %v\n\n", resp.IsServerError())
+		fmt.Printf("URL: %s\n", url)
+		fmt.Printf("Status Code: %d\n", resp.StatusCode())
+		fmt.Printf("Status Text: %s\n", resp.Response.Status)
+		fmt.Printf("Is Success (2xx): %v\n", resp.IsSuccess())
+		fmt.Printf("Is Redirect (3xx): %v\n", resp.IsRedirect())
+		fmt.Printf("Is Client Error (4xx): %v\n", resp.IsClientError())
+		fmt.Printf("Is Server Error (5xx): %v\n", resp.IsServerError())
 
-	// Practical pattern
-	if resp.IsSuccess() {
-		fmt.Println("✓ Request successful, safe to process\n ")
-	} else if resp.IsClientError() {
-		fmt.Println("✗ Client error - check request\n ")
-	} else if resp.IsServerError() {
-		fmt.Println("✗ Server error - retry may help\n ")
+		// Practical pattern
+		if resp.IsSuccess() {
+			fmt.Println("[OK] Request successful, safe to process")
+		} else if resp.IsClientError() {
+			fmt.Println("[X] Client error - check request")
+		} else if resp.IsServerError() {
+			fmt.Println("[X] Server error - retry may help")
+		}
+		fmt.Println()
 	}
 }
 

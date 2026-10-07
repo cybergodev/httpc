@@ -228,7 +228,7 @@ func (c *APIClient) SearchUsers(ctx context.Context, query string) ([]User, erro
 }
 
 func main() {
-	fmt.Println("=== REST API Client Example ===\n ")
+	fmt.Println("=== REST API Client Example ===")
 
 	// Create API client
 	// Note: Using echo.hoppscotch.io for demonstration
@@ -242,7 +242,7 @@ func main() {
 	ctx := context.Background()
 
 	fmt.Println("This example demonstrates a REST API client pattern.")
-	fmt.Println("Note: echo.hoppscotch.io echoes requests, so responses show what was sent.\n ")
+	fmt.Println("Note: echo.hoppscotch.io echoes requests, so responses show what was sent.")
 
 	// Example 1: Create a user
 	fmt.Println("--- Example 1: Create User (POST) ---")
@@ -254,9 +254,10 @@ func main() {
 	createdUser, err := client.CreateUser(ctx, newUser)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
-		fmt.Println("(This is expected - echo API returns the request, not a user object)\n ")
 	} else {
-		fmt.Printf("Response: %+v\n\n", createdUser)
+		fmt.Printf("Parsed into User: %+v\n", createdUser)
+		fmt.Println("(echo returns the request envelope, so unmatched fields parse as zero values)")
+		fmt.Println()
 	}
 
 	// Example 2: Get a user
@@ -264,9 +265,9 @@ func main() {
 	user, err := client.GetUser(ctx, 123)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
-		fmt.Println("(This is expected - echo API returns the request, not a user object)\n ")
 	} else {
-		fmt.Printf("Response: %+v\n\n", user)
+		fmt.Printf("Parsed into User: %+v\n", user)
+		fmt.Println()
 	}
 
 	// Example 3: List users with pagination
@@ -277,7 +278,7 @@ func main() {
 	} else {
 		if len(users) == 0 {
 			fmt.Println("Retrieved 0 users (echo API returns request object, not user array)")
-			fmt.Println("In a real API, this would return an array of users\n ")
+			fmt.Println("In a real API, this would return an array of users")
 		} else {
 			fmt.Printf("Retrieved %d users\n\n", len(users))
 		}
@@ -294,9 +295,9 @@ func main() {
 	updatedUser, err := client.UpdateUser(ctx, 123, updateUser)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
-		fmt.Println("(This is expected - echo API returns the request, not a user object)\n ")
 	} else {
-		fmt.Printf("Response: %+v\n\n", updatedUser)
+		fmt.Printf("Parsed into User: %+v\n", updatedUser)
+		fmt.Println()
 	}
 
 	// Example 5: Search users
@@ -307,7 +308,7 @@ func main() {
 	} else {
 		if len(searchResults) == 0 {
 			fmt.Println("Found 0 users (echo API returns request object, not search results)")
-			fmt.Println("In a real API, this would return matching users\n ")
+			fmt.Println("In a real API, this would return matching users")
 		} else {
 			fmt.Printf("Found %d users\n\n", len(searchResults))
 		}
@@ -318,9 +319,8 @@ func main() {
 	err = client.DeleteUser(ctx, 123)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
-		fmt.Println("(This is expected - echo API returns the request)\n ")
 	} else {
-		fmt.Println("User deleted successfully\n ")
+		fmt.Println("User deleted successfully")
 	}
 
 	fmt.Println("=== Key Takeaways ===")

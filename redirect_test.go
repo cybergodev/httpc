@@ -14,7 +14,7 @@ func TestRedirect_AutoFollow(t *testing.T) {
 	redirectCount := 0
 	finalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Final destination"))
+		_, _ = w.Write([]byte("Final destination")) // best-effort test response
 	}))
 	defer finalServer.Close()
 
@@ -65,7 +65,7 @@ func TestRedirect_NoFollow(t *testing.T) {
 
 	finalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Final destination"))
+		_, _ = w.Write([]byte("Final destination")) // best-effort test response
 	}))
 	defer finalServer.Close()
 
@@ -134,7 +134,7 @@ func TestRedirect_PerRequestOverride(t *testing.T) {
 
 	finalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Final destination"))
+		_, _ = w.Write([]byte("Final destination")) // best-effort test response
 	}))
 	defer finalServer.Close()
 
@@ -217,7 +217,7 @@ func TestRedirect_DifferentStatusCodes(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			finalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte("Success"))
+				_, _ = w.Write([]byte("Success")) // best-effort test response
 			}))
 			defer finalServer.Close()
 
@@ -256,7 +256,7 @@ func TestRedirect_ChainTracking(t *testing.T) {
 
 	server3 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Final"))
+		_, _ = w.Write([]byte("Final")) // best-effort test response
 	}))
 	defer server3.Close()
 
@@ -484,7 +484,7 @@ func TestRedirect_MixedStatusCodes(t *testing.T) {
 
 	finalServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Done"))
+		_, _ = w.Write([]byte("Done")) // best-effort test response
 	}))
 	defer finalServer.Close()
 

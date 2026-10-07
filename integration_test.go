@@ -178,7 +178,7 @@ func TestIntegration_QueryParameterVariations(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		page := r.URL.Query().Get("page")
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"page": page})
+		_ = json.NewEncoder(w).Encode(map[string]string{"page": page}) // best-effort test response
 	}))
 	defer server.Close()
 

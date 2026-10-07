@@ -182,9 +182,11 @@ resp3, err := client.Post(url3, httpc.WithJSON(data))
 if err != nil {
     log.Fatal(err)
 }
+
+fmt.Println(resp1.StatusCode(), resp2.StatusCode(), resp3.StatusCode())
 ```
 
-**Why close?** Closing the client releases resources like connection pools and goroutines.
+**Why close?** Closing the client releases resources like connection pools and the underlying transport.
 
 ### Result Objects
 
@@ -538,6 +540,7 @@ Now that you understand the basics, explore these guides:
 - **[File Downloads](07_file-download.md)** - Download files with progress tracking
 - **[Request Inspection](08_request-inspection.md)** - Debug and inspect requests
 - **[Concurrency Safety](09_concurrency-safety.md)** - Thread-safe usage patterns
+- **[API Unification & Migration](10_api-unification-and-migration.md)** - v1.5.x → v1.6.x migration guide
 
 ---
 
@@ -562,7 +565,7 @@ client, err := httpc.New(httpc.DefaultConfig())
 // High Security - Strict settings
 client, err := httpc.New(httpc.SecureConfig())
 
-// High Throughput - Large connection pools, longer timeouts
+// High Throughput - Larger connection pools, fast-fail request timeout (60s)
 client, err := httpc.New(httpc.PerformanceConfig())
 
 // Minimal - No retries, no redirects, lightweight

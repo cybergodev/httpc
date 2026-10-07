@@ -149,6 +149,14 @@ func demonstrateGenericRequest(client httpc.Client) {
 		fmt.Printf("  %s %s -> %d\n", m.method, m.url, resp.StatusCode())
 	}
 
+	// Package-level equivalent: httpc.Request uses the shared default client
+	resp, err := httpc.Request(ctx, "GET", "https://httpbin.org/get")
+	if err != nil {
+		log.Printf("Package-level Request error: %v\n", err)
+	} else {
+		fmt.Printf("  httpc.Request (package-level) -> %d\n", resp.StatusCode())
+	}
+
 	fmt.Println("\nUse Request() when:")
 	fmt.Println("  - HTTP method is determined at runtime")
 	fmt.Println("  - Building generic API wrappers")

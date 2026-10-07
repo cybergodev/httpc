@@ -3,7 +3,10 @@ package engine
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cybergodev/httpc/internal/validation"
@@ -67,7 +70,7 @@ func BenchmarkCloneHeader_Small(b *testing.B) {
 func BenchmarkCloneHeader_Large(b *testing.B) {
 	src := make(http.Header, 20)
 	for i := 0; i < 20; i++ {
-		src.Set(http.CanonicalHeaderKey("X-Custom-"+string(rune('A'+i%26))), "value")
+		src.Set("X-Custom-"+string(rune('A'+i%26)), "value")
 	}
 
 	b.ReportAllocs()
@@ -78,7 +81,7 @@ func BenchmarkCloneHeader_Large(b *testing.B) {
 	}
 }
 
-func BenchmarkQueryEscape_NoEscape(b *testing.B) {
+func BenchmarkAppendQueryEscape_NoEscape(b *testing.B) {
 	inputs := []string{"hello", "value123", "abc_def-ghi", "test~value"}
 
 	b.ReportAllocs()
@@ -86,12 +89,13 @@ func BenchmarkQueryEscape_NoEscape(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		for _, s := range inputs {
-			_ = QueryEscape(s)
+			var sb strings.Builder
+			AppendQueryEscape(&sb, s)
 		}
 	}
 }
 
-func BenchmarkQueryEscape_NeedsEscape(b *testing.B) {
+func BenchmarkAppendQueryEscape_NeedsEscape(b *testing.B) {
 	inputs := []string{"hello world", "a=b&c=d", "special chars!", "/path?q=1"}
 
 	b.ReportAllocs()
@@ -99,7 +103,8 @@ func BenchmarkQueryEscape_NeedsEscape(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		for _, s := range inputs {
-			_ = QueryEscape(s)
+			var sb strings.Builder
+			AppendQueryEscape(&sb, s)
 		}
 	}
 }
@@ -164,6 +169,62 @@ func BenchmarkAppendQueryParams_Strings(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		_ = appendQueryParams("", params)
+	}
+}
+
+// BenchmarkAppendQueryParams_Single covers the single-parameter case — the
+// most common shape in practice (one WithQuery per request) — where the
+// key-slice allocation and sort can be skipped entirely.
+func BenchmarkAppendQueryParams_Single(b *testing.B) {
+	params := map[string]any{
+		"page": 1,
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = appendQueryParams("", params)
+	}
+}
+
+// uniqueURLCounter keeps BenchmarkURLCache_UniqueURLs' URLs unique across the
+// b.N ramp-up iterations and repeated -count runs within one process — without
+// it the second run would hit the raw cache and measure the hit path instead.
+var uniqueURLCounter atomic.Int64
+
+// BenchmarkURLCache_UniqueURLs exercises the cache-miss path with URLs that
+// never repeat (high-cardinality workloads, e.g. crawlers): every Get parses,
+// keys, and inserts. The process-wide cache is capped, so sustained runs also
+// exercise eviction.
+func BenchmarkURLCache_UniqueURLs(b *testing.B) {
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		n := uniqueURLCounter.Add(1)
+		if _, err := globalURLCache.GetReadOnly(fmt.Sprintf("https://host.example.com/path?item=%d", n)); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkURLCache_HitPath measures the repeated-URL hot path (the common
+// case for API clients): a raw-cache hit under the read lock. The URL carries
+// a query string, the worst case for the sensitive-content scan.
+func BenchmarkURLCache_HitPath(b *testing.B) {
+	const url = "https://host.example.com/path?page=1&limit=50&sort=created_at"
+	if _, err := globalURLCache.GetReadOnly(url); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		if _, err := globalURLCache.GetReadOnly(url); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -96,36 +97,8 @@ func TestURLCache_SanitizedKey(t *testing.T) {
 	}
 }
 
-// TestURLCache_Operations validates cache population, size reporting, and clearing.
-func TestURLCache_Operations(t *testing.T) {
-	// Clear cache to start fresh
-	clearURLCache()
-
-	if getURLCacheSize() != 0 {
-		t.Errorf("Expected empty cache after clear, got %d", getURLCacheSize())
-	}
-
-	// Populate cache by parsing URLs
-	_, err := globalURLCache.Get("https://example.com/page1")
-	if err != nil {
-		t.Fatalf("Failed to parse URL: %v", err)
-	}
-	_, err = globalURLCache.Get("https://example.com/page2")
-	if err != nil {
-		t.Fatalf("Failed to parse URL: %v", err)
-	}
-
-	size := getURLCacheSize()
-	if size < 2 {
-		t.Errorf("Expected at least 2 cached entries, got %d", size)
-	}
-
-	// Clear and verify
-	clearURLCache()
-	if getURLCacheSize() != 0 {
-		t.Errorf("Expected empty cache after clear, got %d", getURLCacheSize())
-	}
-}
+// TestURLCache_Operations was removed: populate/size/clear behavior is a
+// strict subset of TestURLCache_Get below.
 
 // TestCloneURL validates deep copying of URL structures.
 func TestCloneURL(t *testing.T) {
@@ -270,7 +243,7 @@ func TestPooledMultipartBuffer_Read(t *testing.T) {
 		}
 	})
 
-	t.Run("Read until EOF triggers pool return", func(t *testing.T) {
+	t.Run("Read until EOF defers pool return to Close", func(t *testing.T) {
 		buf := getMultipartBuffer()
 		buf.WriteString("data")
 		reader := &pooledMultipartBuffer{buf: buf, owned: true}
@@ -278,12 +251,24 @@ func TestPooledMultipartBuffer_Read(t *testing.T) {
 		// Read everything
 		_, _ = io.ReadAll(reader)
 
-		// Buffer should be nil after EOF
+		// EOF must NOT release: net/http closes the body after reading it
+		// (later, and on HTTP/2 from another goroutine). Releasing at EOF
+		// would recycle the wrapper while a delayed Close can still arrive
+		// and release a wrapper already reused by another request.
+		if reader.buf == nil {
+			t.Error("buf must stay owned after EOF read — release belongs to Close")
+		}
+		if !reader.owned {
+			t.Error("owned must stay true after EOF read — release belongs to Close")
+		}
+
+		_ = reader.Close()
+
 		if reader.buf != nil {
-			t.Error("Expected buf to be nil after EOF read")
+			t.Error("Expected buf to be nil after Close")
 		}
 		if reader.owned {
-			t.Error("Expected owned to be false after EOF read")
+			t.Error("Expected owned to be false after Close")
 		}
 	})
 }
@@ -313,7 +298,7 @@ func TestPooledJSONBuffer_Read(t *testing.T) {
 		}
 	})
 
-	t.Run("Read until EOF triggers pool return", func(t *testing.T) {
+	t.Run("Read until EOF defers pool return to Close", func(t *testing.T) {
 		buf := getJSONBuffer()
 		buf.WriteString(`{"test":true}`)
 		reader := &pooledJSONBuffer{buf: buf, owned: true}
@@ -321,12 +306,22 @@ func TestPooledJSONBuffer_Read(t *testing.T) {
 		// Read everything
 		_, _ = io.ReadAll(reader)
 
-		// Buffer should be nil after EOF
+		// EOF must NOT release — see the matching pooledMultipartBuffer
+		// subtest for the net/http close-after-EOF rationale.
+		if reader.buf == nil {
+			t.Error("buf must stay owned after EOF read — release belongs to Close")
+		}
+		if !reader.owned {
+			t.Error("owned must stay true after EOF read — release belongs to Close")
+		}
+
+		_ = reader.Close()
+
 		if reader.buf != nil {
-			t.Error("Expected buf to be nil after EOF read")
+			t.Error("Expected buf to be nil after Close")
 		}
 		if reader.owned {
-			t.Error("Expected owned to be false after EOF read")
+			t.Error("Expected owned to be false after Close")
 		}
 	})
 }
@@ -418,6 +413,12 @@ func TestResponse_Accessors_TableDriven(t *testing.T) {
 			setFunc: func(r *Response) { r.SetRedirectCount(2) },
 			getFunc: func(r *Response) any { return r.RedirectCount() },
 			want:    2,
+		},
+		{
+			name:    "ProxyURL",
+			setFunc: func(r *Response) { r.SetProxyURL("http://proxy.example.com:8080") },
+			getFunc: func(r *Response) any { return r.ProxyURL() },
+			want:    "http://proxy.example.com:8080",
 		},
 		{
 			name:    "RequestHeaders",
@@ -561,23 +562,8 @@ func TestClient_PoolOperations(t *testing.T) {
 // ADDITIONAL COVERAGE TESTS
 // ============================================================================
 
-// TestReleaseResponse validates response pool release behavior.
-func TestReleaseResponse(t *testing.T) {
-	t.Run("Nil input", func(t *testing.T) {
-		ReleaseResponse(nil) // should not panic
-	})
-
-	t.Run("Normal release", func(t *testing.T) {
-		resp := &Response{}
-		resp.SetStatusCode(200)
-		resp.SetBody("test")
-		ReleaseResponse(resp)
-		// After release, the response should be zeroed
-		if resp.StatusCode() != 0 {
-			t.Error("Expected zeroed response after release")
-		}
-	})
-}
+// TestReleaseResponse was removed: nil/double-release and zeroed-after-release
+// are asserted together in TestReleaseResponseNilSafe (resource_leak_test.go).
 
 // TestClearResponsePools validates that clearResponsePools does not panic.
 func TestClearResponsePools(t *testing.T) {
@@ -886,16 +872,9 @@ func TestPooledLimitReader(t *testing.T) {
 	})
 }
 
-// TestResponseProcessor_NilResponse validates nil response handling.
-func TestResponseProcessor_NilResponse(t *testing.T) {
-	config := &Config{Timeout: 30 * time.Second}
-	processor := newResponseProcessor(config)
-
-	_, err := processor.Process(nil)
-	if err == nil {
-		t.Error("Expected error for nil response")
-	}
-}
+// TestResponseProcessor_NilResponse was removed: the nil-response row of
+// TestResponseProcessor_ErrorHandling (response_processor_test.go) asserts
+// the same Process(nil) -> error contract.
 
 // ============================================================================
 // MULTIPART FORM DATA TESTS
@@ -969,7 +948,10 @@ func TestBuild_MultipartFormData(t *testing.T) {
 		}
 	})
 
-	t.Run("Nil file entry skipped", func(t *testing.T) {
+	t.Run("Nil file entry errors", func(t *testing.T) {
+		// A nil *FileData map entry means the caller's upload is missing a
+		// file. Silently dropping it (the old behavior) loses data without
+		// notice — Build must fail loudly instead.
 		files := map[string]*fileDataHelper{
 			"nil_file": nil,
 		}
@@ -982,11 +964,11 @@ func TestBuild_MultipartFormData(t *testing.T) {
 			Build()
 
 		httpReq, err := processor.Build(req)
-		if err != nil {
-			t.Fatalf("Unexpected error: %v", err)
+		if err == nil {
+			t.Fatal("Expected error for nil FileData entry, got nil")
 		}
-		if httpReq == nil {
-			t.Fatal("Expected request, got nil")
+		if httpReq != nil {
+			t.Errorf("Expected nil request on error, got %v", httpReq)
 		}
 	})
 }
@@ -1115,44 +1097,9 @@ func TestClient_RetryOnServerErrors(t *testing.T) {
 	}
 }
 
-// TestClient_RetryExhausted validates that retries stop after max attempts.
-func TestClient_RetryExhausted(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer server.Close()
-
-	config := &Config{
-		Timeout:         5 * time.Second,
-		AllowPrivateIPs: true,
-		MaxRetries:      2,
-		RetryDelay:      10 * time.Millisecond,
-		BackoffFactor:   1.0,
-		UserAgent:       "test/1.0",
-	}
-
-	client, err := NewClient(config)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	resp, err := client.Request(backgroundCtx, "GET", server.URL)
-	// After all retries are exhausted, the last response (500) is returned and
-	// the full attempt count was made. We deliberately do not assert on err: the
-	// documented contract is "return the last response"; whether that is also
-	// wrapped in an error is implementation-defined and not part of the contract.
-	_ = err
-	if resp == nil {
-		t.Fatal("expected non-nil response after exhausting retries")
-	}
-	if resp.StatusCode() != 500 {
-		t.Errorf("Expected status 500 after exhausted retries, got %d", resp.StatusCode())
-	}
-	if wantAttempts := 3; resp.Attempts() != wantAttempts { // 1 initial + 2 retries
-		t.Errorf("Expected %d attempts after exhausting MaxRetries=2, got %d", wantAttempts, resp.Attempts())
-	}
-}
+// TestClient_RetryExhausted was removed: TestClient_ExecuteRetry_MaxReached
+// covers the same always-5xx exhaustion scenario and additionally counts
+// actual server hits.
 
 // TestClient_OverrideMaxRetries validates per-request retry override.
 func TestClient_OverrideMaxRetries(t *testing.T) {
@@ -1271,20 +1218,23 @@ func TestClient_NoRedirectFollowing(t *testing.T) {
 // QUERY ESCAPE LARGE INPUT TEST
 // ============================================================================
 
-// TestQueryEscape_LargeInput validates the large input fast path.
-func TestQueryEscape_LargeInput(t *testing.T) {
+// TestAppendQueryEscape_LargeInput validates the large input fast path.
+func TestAppendQueryEscape_LargeInput(t *testing.T) {
 	// Create a string larger than maxQueryEscapeSize with no special chars
 	largeInput := strings.Repeat("a", maxQueryEscapeSize+1)
 
-	result := QueryEscape(largeInput)
-	if result != largeInput {
+	var b strings.Builder
+	AppendQueryEscape(&b, largeInput)
+	if b.String() != largeInput {
 		t.Error("Expected identity for large string without special chars")
 	}
 
 	// Large string with special char near the beginning to trigger escaping
 	largeWithSpecial := "hello world" + strings.Repeat("a", maxQueryEscapeSize)
-	result = QueryEscape(largeWithSpecial)
+	b.Reset()
+	AppendQueryEscape(&b, largeWithSpecial)
 	// url.QueryEscape encodes space as +
+	result := b.String()
 	if !strings.Contains(result, "+") && !strings.Contains(result, "%20") {
 		t.Errorf("Expected space encoding in large string, got %q", result[:min(50, len(result))])
 	}
@@ -1569,46 +1519,10 @@ func TestPooledFlateReader(t *testing.T) {
 // CONTEXT CANCELLATION WITH SLEEP TEST
 // ============================================================================
 
-// TestClient_SleepWithContext validates context cancellation during sleep.
-func TestClient_SleepWithContext(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("OK"))
-	}))
-	defer server.Close()
-
-	config := &Config{
-		Timeout:         30 * time.Second,
-		AllowPrivateIPs: true,
-		MaxRetries:      3,
-		RetryDelay:      100 * time.Millisecond,
-		BackoffFactor:   2.0,
-		Jitter:          true,
-		UserAgent:       "test/1.0",
-	}
-
-	client, err := NewClient(config)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	// Use a short-lived context to test cancellation during retry sleep
-	attempts := 0
-	failServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts++
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer failServer.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	_, err = client.Request(ctx, "GET", failServer.URL)
-	if err == nil {
-		t.Error("Expected error due to context cancellation during retries")
-	}
-}
+// TestClient_SleepWithContext was removed: it never touched its first test
+// server (dead code) and only asserted err != nil. The sleep branches are
+// unit-covered by TestSleepWithContext (retry_test.go) and integration-covered
+// by TestClient_ContextCancellation (client_test.go).
 
 // ============================================================================
 // EXECUTE WITH RETRY - MAX RETRIES REACHED TEST
@@ -1783,28 +1697,9 @@ func TestClient_MaxRedirectLimit(t *testing.T) {
 // URL CACHE EVICTION TEST
 // ============================================================================
 
-// TestURLCache_Eviction validates cache eviction when full.
-func TestURLCache_Eviction(t *testing.T) {
-	// Create a small cache for testing
-	cache := &urlCache{
-		entries: make(map[string]*url.URL, 4),
-		keys:    make([]string, 0, 4),
-		maxSize: 4,
-	}
-
-	// Fill the cache
-	for i := 0; i < 5; i++ {
-		_, err := cache.Get(fmt.Sprintf("https://example.com/page%d", i))
-		if err != nil {
-			t.Fatalf("Failed to get URL %d: %v", i, err)
-		}
-	}
-
-	// Cache should have evicted the first entry
-	if cache.size() > 4 {
-		t.Errorf("Cache size should be <= 4, got %d", cache.size())
-	}
-}
+// TestURLCache_Eviction was removed: bounded-eviction is asserted (stronger,
+// including the evicted key and refill) by TestURLCache_EvictOldest
+// (request_test.go) and TestURLCacheRawEviction (resource_leak_test.go).
 
 // ============================================================================
 // NIL OPTION TEST
@@ -1903,6 +1798,49 @@ func (p *testRetryPolicy) ShouldRetry(resp types.ResponseReader, err error, atte
 		return attempt < p.maxRetries
 	}
 	return false
+}
+
+// TestClient_CustomRetryPolicy_NegativeMaxRetries verifies that a custom
+// policy violating the RetryPolicy contract (MaxRetries < 0) still results in
+// the request being executed exactly once. Before the clamp in
+// executeWithRetry, a negative value skipped the no-retry fast path and fell
+// into a never-entered retry loop, returning "request failed after -4
+// attempts" without the request ever being sent.
+func TestClient_CustomRetryPolicy_NegativeMaxRetries(t *testing.T) {
+	attempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer server.Close()
+
+	config := &Config{
+		Timeout:           30 * time.Second,
+		AllowPrivateIPs:   true,
+		UserAgent:         "test/1.0",
+		CustomRetryPolicy: &testRetryPolicy{maxRetries: -5, delay: time.Millisecond},
+	}
+
+	client, err := NewClient(config)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	resp, err := client.Request(backgroundCtx, "GET", server.URL)
+	if err != nil {
+		t.Fatalf("Request must still execute with a contract-violating policy, got: %v", err)
+	}
+	if resp.StatusCode() != 200 {
+		t.Errorf("Expected status 200, got %d", resp.StatusCode())
+	}
+	if resp.Attempts() != 1 {
+		t.Errorf("Expected exactly 1 attempt, got %d", resp.Attempts())
+	}
+	if attempts != 1 {
+		t.Errorf("Server saw %d requests, want 1", attempts)
+	}
 }
 
 // ============================================================================
@@ -2200,65 +2138,9 @@ func TestClient_MockTransportRetry(t *testing.T) {
 
 // === Merged from coverage_gap_test.go ===
 
-func TestIsRetryableWrappedError(t *testing.T) {
-	tests := []struct {
-		name      string
-		inner     *ClientError
-		wantRetry bool
-	}{
-		{
-			name: "inner with retryable network message cause",
-			inner: &ClientError{
-				Type:  ErrorTypeNetwork,
-				Cause: errors.New("connection reset by peer"),
-			},
-			wantRetry: true,
-		},
-		{
-			name: "inner with non-retryable cause message",
-			inner: &ClientError{
-				Type:  ErrorTypeNetwork,
-				Cause: errors.New("something unknown"),
-			},
-			wantRetry: false,
-		},
-		{
-			name: "inner with nil cause but retryable type (timeout)",
-			inner: &ClientError{
-				Type: ErrorTypeTimeout,
-			},
-			wantRetry: true,
-		},
-		{
-			name: "inner with nil cause and non-retryable type (validation)",
-			inner: &ClientError{
-				Type: ErrorTypeValidation,
-			},
-			wantRetry: false,
-		},
-		{
-			name: "inner with EOF message in cause",
-			inner: &ClientError{
-				Type:  ErrorTypeNetwork,
-				Cause: errors.New("unexpected EOF"),
-			},
-			wantRetry: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			outer := &ClientError{
-				Type:  ErrorTypeNetwork,
-				Cause: tt.inner,
-			}
-			got := outer.IsRetryable()
-			if got != tt.wantRetry {
-				t.Errorf("IsRetryable() = %v, want %v", got, tt.wantRetry)
-			}
-		})
-	}
-}
+// TestIsRetryableWrappedError was removed: its message-cause and nil-cause
+// rows are rows of TestClientError_IsRetryable (errors_test.go), which now
+// also carries the wrapped-ClientError (unwrap depth) rows.
 
 // ============================================================================
 // Task 1b: isRetryableSyscallError tests (0% coverage)
@@ -2427,6 +2309,61 @@ func TestStreamingBody(t *testing.T) {
 	})
 }
 
+// TestStreamingBody_ExceedsLimit verifies that a streamed body larger than
+// MaxResponseBodySize surfaces as a Read error instead of a synthetic EOF.
+// Before this regression guard, the pooled limit reader returned io.EOF when
+// its budget ran out, so io.Copy-based consumers (Download) silently truncated
+// the body to the limit and reported success.
+func TestStreamingBody_ExceedsLimit(t *testing.T) {
+	body := bytes.Repeat([]byte("x"), 2000)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	config := &Config{
+		Timeout:             30 * time.Second,
+		AllowPrivateIPs:     true,
+		MaxRetries:          0,
+		MaxResponseBodySize: 1000,
+	}
+	client, err := NewClient(config)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+	defer client.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.Request(ctx, "GET", server.URL, func(req *Request) error {
+		req.SetStreamBody(true)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	defer ReleaseResponse(resp)
+
+	reader := resp.RawBodyReader()
+	if reader == nil {
+		t.Fatal("Expected non-nil RawBodyReader for streaming request")
+	}
+
+	read, readErr := io.ReadAll(reader)
+	if readErr == nil {
+		t.Fatalf("Expected error reading oversize streamed body, got success (%d bytes)", len(read))
+	}
+	if !strings.Contains(readErr.Error(), "exceeds size limit") {
+		t.Errorf("Expected size-limit error, got: %v", readErr)
+	}
+	if len(read) > 1001 { // limit + the one over-read byte
+		t.Errorf("Read %d bytes, want at most limit+1", len(read))
+	}
+}
+
 // ============================================================================
 // Task 3: Close method tests for pooled readers (0% coverage)
 // ============================================================================
@@ -2585,7 +2522,7 @@ func TestCreateDecompressor_GzipDirectNewReader(t *testing.T) {
 	// Test the fallback path where pool returns a wrong type.
 	// Clear the pool and put a non-*gzip.Reader value in it.
 	clearResponsePools()
-	gzipReaderPool.Put("not a gzip reader") // wrong type
+	gzipReaderPool.Put("not a gzip reader") //nolint:staticcheck // intentional wrong-type poisoning // wrong type
 
 	config := &Config{Timeout: 30 * time.Second}
 	processor := newResponseProcessor(config)
@@ -2621,7 +2558,7 @@ func TestCreateDecompressor_GzipDirectNewReader(t *testing.T) {
 // zero-value instead of panicking.
 func TestPoolGet_TypeAssertionFallback(t *testing.T) {
 	t.Run("getHeadersMap", func(t *testing.T) {
-		headersMapPool.Put("wrong type") // poison the pool
+		headersMapPool.Put("wrong type") //nolint:staticcheck // intentional wrong-type poisoning // poison the pool
 		m := getHeadersMap()
 		if m == nil {
 			t.Fatal("expected non-nil map from fallback")
@@ -2632,7 +2569,7 @@ func TestPoolGet_TypeAssertionFallback(t *testing.T) {
 	})
 
 	t.Run("getQueryParamsMap", func(t *testing.T) {
-		queryParamsPool.Put(42) // poison with a different wrong type
+		queryParamsPool.Put(new(int)) // poison with a different wrong type (pointer-like to satisfy SA6002)
 		m := getQueryParamsMap()
 		if m == nil {
 			t.Fatal("expected non-nil map from fallback")
@@ -2642,9 +2579,19 @@ func TestPoolGet_TypeAssertionFallback(t *testing.T) {
 		}
 	})
 
+	t.Run("getQueryParamsMap typed-nil map", func(t *testing.T) {
+		// A typed-nil map passes the type assertion (ok=true) but must still
+		// hit the fresh-map fallback.
+		queryParamsPool.Put(map[string]any(nil))
+		m := getQueryParamsMap()
+		if m == nil {
+			t.Fatal("expected fresh map for typed-nil pooled value")
+		}
+	})
+
 	t.Run("requestPool get", func(t *testing.T) {
 		rp := newRequestPool()
-		rp.pool.Put("not a request") // poison the pool
+		rp.pool.Put(new(int)) // poison the pool with a wrong pointer-like type
 		req := rp.get()
 		if req == nil {
 			t.Fatal("expected non-nil Request from fallback")

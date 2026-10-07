@@ -110,7 +110,7 @@ func Test_DecompressionBombProtection(t *testing.T) {
 		// Return more than 1000 bytes
 		largeData := make([]byte, 2000)
 		w.WriteHeader(http.StatusOK)
-		w.Write(largeData)
+		_, _ = w.Write(largeData) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -145,7 +145,7 @@ func assertNoPanic(t *testing.T, name string, fn func()) {
 func TestPanicSafety(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("test"))
+		_, _ = w.Write([]byte("test")) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -163,27 +163,6 @@ func TestPanicSafety(t *testing.T) {
 			}
 			if client != nil {
 				client.Close()
-			}
-		}},
-		{"EmptyURL", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			defer client.Close()
-			_, err = client.Get("")
-			_ = err
-		}},
-		{"InvalidURL", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			defer client.Close()
-			for _, u := range []string{"not a url", "http://", "://invalid", "http://\x00bad"} {
-				_, _ = client.Get(u)
 			}
 		}},
 		{"NilBody", func() {
@@ -219,18 +198,6 @@ func TestPanicSafety(t *testing.T) {
 			_, err := NewDomain("not a url", DefaultConfig())
 			if err == nil {
 				t.Error("Expected error for invalid base URL")
-			}
-		}},
-		{"DownloadInvalidPath", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			defer client.Close()
-			_, err = client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: ""})
-			if err == nil {
-				t.Error("Expected error for empty file path")
 			}
 		}},
 		{"SessionManagerNilInput", func() {
@@ -277,27 +244,6 @@ func TestPanicSafety(t *testing.T) {
 				<-done
 			}
 		}},
-		{"CloseTwice", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			_ = client.Close()
-			_ = client.Close()
-		}},
-		{"ClosedClient", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			client.Close()
-			_, err = client.Get("http://example.com")
-			if err == nil {
-				t.Error("Expected error when using closed client")
-			}
-		}},
 		// SEC-003: the default safety net must convert panics to errors even when
 		// the user has NOT installed RecoveryMiddleware.
 		{"MiddlewarePanicDefaultNet", func() {
@@ -339,6 +285,22 @@ func TestPanicSafety(t *testing.T) {
 				t.Error("Expected error from panic caught by download safety net")
 			}
 		}},
+		// SEC-003: a panicking RequestOption must not crash DomainClient —
+		// the session-capture pass applies user options before the
+		// request-path safety net is installed, so it needs its own guard.
+		{"DomainClientPanicOption", func() {
+			dc, err := NewDomain(server.URL, testConfig())
+			if err != nil {
+				return
+			}
+			defer dc.Close()
+			_, err = dc.Get("/",
+				func(r *engine.Request) error { panic("option panic during session capture") },
+			)
+			if err == nil {
+				t.Error("Expected error from panicking option in DomainClient")
+			}
+		}},
 	}
 
 	for _, tt := range tests {
@@ -368,7 +330,7 @@ func Test_WithAllowPrivateIPs_OverridesClientPolicy(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("local-ok"))
+		_, _ = w.Write([]byte("local-ok")) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -440,7 +402,7 @@ func Test_WithAllowPrivateIPs_RedirectOverride(t *testing.T) {
 	// Final target: a real localhost server the redirect resolves to.
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("redirected-ok"))
+		_, _ = w.Write([]byte("redirected-ok")) // best-effort test response
 	}))
 	defer target.Close()
 

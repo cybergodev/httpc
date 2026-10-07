@@ -56,7 +56,8 @@ func SecureConfig() Config {
 func PerformanceConfig() Config {
 	cfg := DefaultConfig()
 
-	// Timeouts - longer for throughput
+	// Timeouts - tight request deadline for fast fail; slightly longer
+	// dial/TLS/idle windows for busy pools
 	cfg.Timeouts.Request = 60 * time.Second
 	cfg.Timeouts.Dial = 15 * time.Second
 	cfg.Timeouts.TLSHandshake = 15 * time.Second

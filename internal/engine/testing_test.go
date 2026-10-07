@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/cybergodev/httpc/internal/connection"
 )
 
 // errForcedFailure is returned by mockTransport for the first failFirst calls,
@@ -117,8 +119,10 @@ func withMockTransport(mt *mockTransport) clientOption {
 func clearResponsePools() {
 	gzipReaderPool = sync.Pool{
 		New: func() any {
-			reader, _ := gzip.NewReader(bytes.NewReader(nil))
-			return reader
+			// Must mirror the production New: gzip.NewReader on an empty
+			// stream returns (nil, io.EOF), and discarding that error
+			// silently yields a nil New that disables the pool entirely.
+			return new(gzip.Reader)
 		},
 	}
 	flateReaderPool = sync.Pool{
@@ -151,18 +155,6 @@ func clearTransportPools() {
 			return &redirectSettings{}
 		},
 	}
-	cookieMapPool = sync.Pool{
-		New: func() any {
-			m := make(map[string]*http.Cookie, 8)
-			return &m
-		},
-	}
-	cookieSlicePool = sync.Pool{
-		New: func() any {
-			s := make([]*http.Cookie, 0, 8)
-			return &s
-		},
-	}
 }
 
 // clearURLCache clears the global URL cache to release memory.
@@ -175,4 +167,11 @@ func clearURLCache() {
 // For use in tests only.
 func getURLCacheSize() int {
 	return globalURLCache.size()
+}
+
+// testConnectionConfig returns a connection config suitable for testing.
+func testConnectionConfig() *connection.Config {
+	config := connection.DefaultConfig()
+	config.AllowPrivateIPs = true
+	return config
 }

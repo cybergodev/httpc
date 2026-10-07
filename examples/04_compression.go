@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== HTTP Response Decompression Example ===\n ")
+	fmt.Println("=== HTTP Response Decompression Example ===")
 
 	// Example 1: Automatic gzip decompression
 	demonstrateGzipDecompression()

@@ -689,3 +689,88 @@ func TestRequestProcessor_EdgeCases(t *testing.T) {
 		}
 	})
 }
+
+// TestBuild_AcceptEncodingStreaming verifies the Accept-Encoding contract:
+// buffered responses are decompressed by the response processor (advertise
+// gzip/deflate), while streaming responses bypass that pipeline and must
+// request identity so callers never receive compressed bytes. A user-supplied
+// Accept-Encoding always wins in both modes.
+func TestBuild_AcceptEncodingStreaming(t *testing.T) {
+	config := &Config{Timeout: 30 * time.Second}
+	processor := newRequestProcessor(config)
+
+	build := func(stream bool, headers map[string]string) *http.Request {
+		t.Helper()
+		req := testRequestBuilder().
+			Method("GET").
+			URL("https://api.example.com/data").
+			Context(context.Background()).
+			Build()
+		req.SetStreamBody(stream)
+		if headers != nil {
+			req.SetHeaders(headers)
+		}
+		httpReq, err := processor.Build(req)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		return httpReq
+	}
+
+	if got := build(false, nil).Header.Get("Accept-Encoding"); got != "gzip, deflate" {
+		t.Errorf("non-streaming Accept-Encoding = %q, want %q", got, "gzip, deflate")
+	}
+	if got := build(true, nil).Header.Get("Accept-Encoding"); got != "identity" {
+		t.Errorf("streaming Accept-Encoding = %q, want %q", got, "identity")
+	}
+	if got := build(true, map[string]string{"Accept-Encoding": "br"}).Header.Get("Accept-Encoding"); got != "br" {
+		t.Errorf("user override Accept-Encoding = %q, want %q", got, "br")
+	}
+}
+
+// TestBuild_URLUserinfoBasicAuth verifies URL credentials are converted to a
+// Basic Authorization header (net/http parity) instead of being silently
+// stripped, and that an explicit Authorization header wins.
+func TestBuild_URLUserinfoBasicAuth(t *testing.T) {
+	config := &Config{Timeout: 30 * time.Second}
+	processor := newRequestProcessor(config)
+
+	build := func(rawURL string, headers map[string]string) *http.Request {
+		t.Helper()
+		req := testRequestBuilder().
+			Method("GET").
+			URL(rawURL).
+			Context(context.Background()).
+			Build()
+		if headers != nil {
+			req.SetHeaders(headers)
+		}
+		httpReq, err := processor.Build(req)
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		return httpReq
+	}
+
+	// base64("user:pass") == "dXNlcjpwYXNz"
+	httpReq := build("https://user:pass@api.example.com/data", nil)
+	if got := httpReq.Header.Get("Authorization"); got != "Basic dXNlcjpwYXNz" {
+		t.Errorf("userinfo not converted to Basic auth: got %q", got)
+	}
+	if httpReq.URL.User != nil {
+		t.Errorf("credentials not stripped from request URL: %v", httpReq.URL.User)
+	}
+
+	// Explicit Authorization header wins over URL userinfo.
+	httpReq = build("https://user:pass@api.example.com/data", map[string]string{"Authorization": "Bearer token123"})
+	if got := httpReq.Header.Get("Authorization"); got != "Bearer token123" {
+		t.Errorf("explicit Authorization should win, got %q", got)
+	}
+
+	// URLs without userinfo are unaffected (the "@" pre-filter must not
+	// misfire on "@" in query strings).
+	httpReq = build("https://api.example.com/data?email=a@b.com", nil)
+	if got := httpReq.Header.Get("Authorization"); got != "" {
+		t.Errorf("no userinfo: Authorization should be absent, got %q", got)
+	}
+}

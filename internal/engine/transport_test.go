@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
 	"net/url"
 	"testing"
@@ -590,4 +591,65 @@ func TestTransport_SetRedirectPolicyCleanup(t *testing.T) {
 		_, settings := transport.SetRedirectPolicy(context.Background(), true, 5)
 		putRedirectSettings(settings)
 	})
+}
+
+// TestCookieOverlayJar verifies manual cookies are layered onto (not written
+// into) the shared jar: same-hostname requests receive them, other hosts do
+// not, manual wins by name, and SetCookies only reaches the base jar.
+func TestCookieOverlayJar(t *testing.T) {
+	base, err := cookiejar.New(nil)
+	if err != nil {
+		t.Fatalf("cookiejar.New: %v", err)
+	}
+	origin := &url.URL{Scheme: "http", Host: "api.example.com"}
+	base.SetCookies(origin, []*http.Cookie{
+		{Name: "jar-cookie", Value: "jar"},
+		{Name: "shared-name", Value: "from-jar"},
+	})
+
+	req := &http.Request{Header: http.Header{}, URL: origin}
+	req.AddCookie(&http.Cookie{Name: "manual", Value: "m1"})
+	req.AddCookie(&http.Cookie{Name: "shared-name", Value: "from-manual"})
+	overlay := newCookieOverlayJar(base, req, req.Cookies())
+
+	// Same host: jar + manual, manual wins the name clash.
+	sameHost := &url.URL{Scheme: "https", Host: "api.example.com"} // port/scheme differences are fine
+	got := overlay.Cookies(sameHost)
+	byName := map[string]string{}
+	for _, c := range got {
+		byName[c.Name] = c.Value
+	}
+	if byName["jar-cookie"] != "jar" || byName["manual"] != "m1" {
+		t.Errorf("overlay merge wrong: %v", byName)
+	}
+	if byName["shared-name"] != "from-manual" {
+		t.Errorf("manual cookie should win by name, got %q", byName["shared-name"])
+	}
+
+	// Other host: manual cookies must not leak.
+	otherHost := &url.URL{Scheme: "https", Host: "other.example.net"}
+	for _, c := range overlay.Cookies(otherHost) {
+		if c.Name == "manual" || c.Name == "shared-name" && c.Value == "from-manual" {
+			t.Errorf("manual cookie leaked to other host: %+v", c)
+		}
+	}
+
+	// Manual cookies were never written into the base jar.
+	for _, c := range base.Cookies(sameHost) {
+		if c.Name == "manual" {
+			t.Errorf("manual cookie persisted into base jar: %+v", c)
+		}
+	}
+
+	// SetCookies forwards to the base jar (response cookies still stick).
+	overlay.SetCookies(origin, []*http.Cookie{{Name: "resp", Value: "r1"}})
+	found := false
+	for _, c := range base.Cookies(origin) {
+		if c.Name == "resp" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("SetCookies did not forward to base jar")
+	}
 }

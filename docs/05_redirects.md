@@ -12,8 +12,13 @@ HTTPC provides comprehensive support for HTTP redirects with automatic following
 - [Per-Request Control](#per-request-control)
 - [Redirect Tracking](#redirect-tracking)
 - [Manual Redirect Handling](#manual-redirect-handling)
+- [Redirect Whitelist](#redirect-whitelist)
+- [Redirect Security](#redirect-security)
 - [Supported Status Codes](#supported-status-codes)
 - [Best Practices](#best-practices)
+- [Error Handling](#error-handling)
+- [Examples](#examples)
+- [Summary](#summary)
 
 ## Overview
 
@@ -25,11 +30,11 @@ HTTP redirects (3xx status codes) instruct the client to request a different URL
 - ✅ Redirect chain tracking (URLs visited)
 - ✅ Per-request redirect control
 - ✅ Manual redirect handling
-- ✅ Support for all redirect status codes (301, 302, 303, 307, 308)
+- ✅ Support for all redirect status codes (301, 302, 303, 307, 308) — 307/308 replay the request body when it is held in memory (see [Method Preservation](#method-preservation))
 
 ## Automatic Redirect Following
 
-By default, HTTPC automatically follows redirects up to a maximum of 10 redirects:
+By default, HTTPC automatically follows redirects. The default limit is `MaxRedirects = 10`, which — matching `net/http` — counts the initial request, so at most **9 redirects** are followed:
 
 ```go
 client, err := httpc.NewDefault()
@@ -57,7 +62,7 @@ Configure redirect behavior when creating the client:
 ```go
 config := httpc.DefaultConfig()
 config.Defaults.FollowRedirects = true  // Enable automatic following (default)
-config.Defaults.MaxRedirects = 5        // Limit to 5 redirects (default: 10)
+config.Defaults.MaxRedirects = 5        // At most 4 redirects: the limit counts the initial request (default: 10)
 
 client, err := httpc.New(config)
 if err != nil {
@@ -92,19 +97,21 @@ fmt.Printf("Redirect to: %s\n", result.Response.Headers.Get("Location"))
 
 ### Configuration Limits
 
-- **MaxRedirects**: 0-50 (0 = use Go's default limit of 10 redirects)
-- **Default**: 10 redirects
+- **MaxRedirects**: 0-50 (0 = fall back to the default limit of 10)
+- **Default**: 10 (at most 9 redirects are followed)
 - **Validation**: Config validation ensures MaxRedirects is within valid range
 
-**Note:** Setting `MaxRedirects` to 0 does NOT disable redirects — it uses Go's built-in default of 10. To disable redirects entirely, set `FollowRedirects = false`.
+**Note:** Setting `MaxRedirects` to 0 does NOT disable redirects — it uses the built-in default of 10. To disable redirects entirely, set `FollowRedirects = false`.
+
+**Counting semantics:** the limit includes the initial request, matching `net/http`. `MaxRedirects = n` allows at most `n-1` redirects, so the default of 10 follows 9. To permit exactly `k` redirects, set `MaxRedirects = k + 1`.
 
 ```go
 config := httpc.DefaultConfig()
 config.Defaults.MaxRedirects = 50  // Maximum allowed
 
 // Invalid values will fail validation
-config.Defaults.MaxRedirects = -1  // Error: invalid middleware configuration: Defaults.MaxRedirects must be 0-50, got -1
-config.Defaults.MaxRedirects = 51  // Error: invalid middleware configuration: Defaults.MaxRedirects must be 0-50, got 51
+config.Defaults.MaxRedirects = -1  // Error: invalid configuration: invalid middleware configuration: Defaults.MaxRedirects must be 0-50, got -1
+config.Defaults.MaxRedirects = 51  // Error: invalid configuration: invalid middleware configuration: Defaults.MaxRedirects must be 0-50, got 51
 ```
 
 ## Per-Request Control
@@ -139,7 +146,7 @@ if result.IsRedirect() {
 ```go
 // Override max redirects for this request
 result, err := client.Get("https://example.com/redirect",
-    httpc.WithMaxRedirects(3),  // Only follow up to 3 redirects
+    httpc.WithMaxRedirects(3),  // At most 2 redirects (limit counts the initial request)
 )
 if err != nil {
     log.Fatal(err)
@@ -170,6 +177,7 @@ type RequestMeta struct {
     Attempts      int
     RedirectChain []string // URLs visited during redirect chain
     RedirectCount int      // Number of redirects followed
+    ProxyURL      string   // Proxy used by the attempt that produced this response ("" = direct)
 }
 
 type Result struct {
@@ -264,8 +272,18 @@ for redirectCount < maxRedirects {
         break
     }
 
-    fmt.Printf("Redirecting to: %s\n", location)
-    currentURL = location
+    // Location may be relative — resolve it against the current URL
+    base, baseErr := url.Parse(currentURL)
+    if baseErr != nil {
+        log.Fatalf("invalid current URL: %v", baseErr)
+    }
+    ref, parseErr := url.Parse(location)
+    if parseErr != nil {
+        log.Fatalf("invalid redirect URL: %v", parseErr)
+    }
+    currentURL = base.ResolveReference(ref).String()
+
+    fmt.Printf("Redirecting to: %s\n", currentURL)
     redirectCount++
 }
 
@@ -302,6 +320,24 @@ When `RedirectWhitelist` is set, redirects to domains not in the list will be re
 - Restricting redirects to known CDN domains
 - Compliance with security policies
 
+## Redirect Security
+
+Beyond the limit counter, the engine enforces three protections while following redirects:
+
+### Cross-Origin Credential Stripping
+
+When a redirect changes the request's origin — a different host, a different port (with scheme-default ports normalized, so `example.com` and `example.com:80` under http are the same origin while `example.com:8080` is not), or a different scheme — the `Authorization`, `Proxy-Authorization`, and `Cookie` headers are removed before the next hop. This includes the https → http downgrade (credentials must not travel over a plaintext hop) and, matching net/http's own behavior, the http → https upgrade on the same host.
+
+### SSRF Re-Validation of Redirect Targets
+
+Every redirect target is validated against the SSRF policy (private/reserved IP blocking) before it is followed — a public URL cannot be used to bounce the client onto an internal address. A per-request `WithAllowPrivateIPs(true)` override also applies to redirect targets.
+
+### Circular Redirect Detection
+
+True cycles (A → B → A, where the target URL appeared earlier in the chain reached from a different URL) fail immediately with Message `"circular redirect detected"`. Consecutive same-URL repeats (A → A) are allowed because the server may legitimately respond differently per visit.
+
+Failures from these protections (SSRF re-validation and circular-redirect detection; cross-origin credential stripping is silent and never fails) — along with `Security.RedirectWhitelist` rejections — are classified as `*httpc.ClientError` with `Type == httpc.ErrorTypeValidation` (`Code()` returns `"VALIDATION_ERROR"`).
+
 ## Supported Status Codes
 
 HTTPC automatically follows these redirect status codes:
@@ -311,15 +347,20 @@ HTTPC automatically follows these redirect status codes:
 | 301  | Moved Permanently     | Resource permanently moved to new URL          |
 | 302  | Found                 | Resource temporarily at different URL          |
 | 303  | See Other             | Response at different URL (use GET)            |
-| 307  | Temporary Redirect    | Temporary redirect (preserve method)           |
-| 308  | Permanent Redirect    | Permanent redirect (preserve method)           |
+| 307  | Temporary Redirect    | Temporary redirect (method and body preserved) |
+| 308  | Permanent Redirect    | Permanent redirect (method and body preserved) |
 
 ### Method Preservation
 
 - **301, 302, 303**: May change POST to GET (per HTTP spec)
-- **307, 308**: Preserve original HTTP method
+- **307, 308**: Preserve original HTTP method **and body**
 
-Go's `http.Client` handles method preservation automatically according to HTTP specifications.
+Method preservation relies on Go's `http.Client`, which replays the request body on 307/308 via `Request.GetBody`. HTTPC sets `GetBody` for every body held in memory — `string`, `[]byte`, JSON, XML, and multipart (`WithBody`, `WithJSON`, `WithXML`, `WithBinary`, `WithForm`/`WithFormData`/`WithFile`, ...) — so such requests follow 307/308 with the full body re-sent on every hop.
+
+One exception mirrors `net/http`'s own rules:
+
+- A raw `io.Reader` body with `Retry.MaxRetries == 0` passes through unbuffered and **cannot be replayed** — the 307/308 response is returned as-is, as if `WithFollowRedirects(false)` had been set. Use an in-memory body, or handle the redirect manually (see [Manual Redirect Handling](#manual-redirect-handling)).
+- With `Retry.MaxRetries > 0` (default 3), `io.Reader` bodies are buffered to `[]byte` for retry safety — which also makes them replayable across 307/308 hops.
 
 ## Best Practices
 
@@ -422,9 +463,17 @@ defer client.Close()
 
 result, err := client.Get(url)
 if err != nil {
-    // Error: "stopped after 3 redirects"
-    log.Printf("Redirect error: %v", err)
-    return
+    // Exceeding the redirect limit surfaces as *httpc.ClientError with
+    // Type == httpc.ErrorTypeValidation and Message "redirect limit
+    // exceeded"; the "stopped after 3 redirects" text from HTTPC's
+    // redirect policy (wording identical to net/http) is preserved
+    // in the cause chain.
+    var clientErr *httpc.ClientError
+    if errors.As(err, &clientErr) && clientErr.Message == "redirect limit exceeded" {
+        log.Printf("Redirect error: %v", err)
+        return
+    }
+    log.Fatal(err)
 }
 ```
 
@@ -436,7 +485,10 @@ if err != nil {
 
 result, err := client.Get("https://example.com/infinite-loop")
 if err != nil {
-    // Error: "stopped after 10 redirects"
+    // A→B→A cycles are detected early and fail with Message
+    // "circular redirect detected"; only chains that grow without
+    // repeating a URL reach the MaxRedirects limit
+    // ("redirect limit exceeded").
     log.Printf("Possible infinite loop: %v", err)
 }
 ```
@@ -451,12 +503,13 @@ See [09_redirects.go](../examples/09_redirects.go) for complete working examples
 4. **Per-request redirect control** - Override client settings
 5. **Track redirect chain** - Monitor redirect path
 6. **Manual redirect handling** - Complete control
+7. **Redirect whitelist** - Restrict redirect destinations for security
 
 ## Summary
 
 HTTPC provides flexible redirect handling:
 
-- **Default**: Automatically follows up to 10 redirects
+- **Default**: Automatically follows redirects (default limit 10 → at most 9 redirects)
 - **Configurable**: Set limits at client or request level
 - **Trackable**: Monitor redirect chain and count
 - **Controllable**: Disable or manually handle redirects

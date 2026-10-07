@@ -2,9 +2,12 @@ package httpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -178,27 +181,63 @@ func TestTimeoutMiddleware(t *testing.T) {
 	}
 }
 
-func TestTimeoutMiddleware_NilConfig(t *testing.T) {
-	// Nil config = DefaultTimeoutMiddlewareConfig() = Duration 0 = pass-through.
+// TestMiddleware_NilConfig verifies each middleware constructor accepts a nil
+// config, applying documented defaults without panicking or breaking requests.
+// Consolidates the former Timeout/Header/RequestID/Metrics nil-config tests.
+func TestMiddleware_NilConfig(t *testing.T) {
+	var receivedID string
+	tests := []struct {
+		name       string
+		middleware MiddlewareFunc
+		verify     func(t *testing.T)
+	}{
+		{
+			name:       "TimeoutMiddleware nil config = disabled",
+			middleware: TimeoutMiddleware(nil),
+		},
+		{
+			name:       "HeaderMiddleware nil config = no headers",
+			middleware: HeaderMiddleware(nil),
+		},
+		{
+			name:       "MetricsMiddleware nil config",
+			middleware: MetricsMiddleware(nil),
+		},
+		{
+			name:       "RequestIDMiddleware nil config sets default header",
+			middleware: RequestIDMiddleware(nil),
+			verify: func(t *testing.T) {
+				if receivedID == "" {
+					t.Error("expected request ID to be set")
+				}
+			},
+		},
+	}
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedID = r.Header.Get("X-Request-ID")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer ts.Close()
 
-	cfg := testConfig()
-	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		TimeoutMiddleware(nil),
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := testConfig()
+			cfg.Middleware.Middlewares = []MiddlewareFunc{tt.middleware}
 
-	client, err := New(cfg)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-	defer client.Close()
+			client, err := New(cfg)
+			if err != nil {
+				t.Fatalf("failed to create client: %v", err)
+			}
+			defer client.Close()
 
-	_, err = client.Get(ts.URL)
-	if err != nil {
-		t.Fatalf("nil-config timeout middleware should be a pass-through: %v", err)
+			if _, err := client.Get(ts.URL); err != nil {
+				t.Fatalf("request with nil-config middleware failed: %v", err)
+			}
+			if tt.verify != nil {
+				tt.verify(t)
+			}
+		})
 	}
 }
 
@@ -276,30 +315,6 @@ func TestHeaderMiddleware(t *testing.T) {
 	}
 	if receivedHeaders["Authorization"] != "Bearer test-token" {
 		t.Errorf("expected Authorization 'Bearer test-token', got: %s", receivedHeaders["Authorization"])
-	}
-}
-
-func TestHeaderMiddleware_NilConfig(t *testing.T) {
-	// Nil config = DefaultHeaderConfig() = no headers (pass-through).
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	cfg := testConfig()
-	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		HeaderMiddleware(nil),
-	}
-
-	client, err := New(cfg)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	_, err = client.Get(ts.URL)
-	if err != nil {
-		t.Fatalf("nil-config header middleware should be a pass-through: %v", err)
 	}
 }
 
@@ -654,7 +669,7 @@ func TestAuditMiddleware(t *testing.T) {
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("response"))
+		_, _ = w.Write([]byte("response")) // best-effort test response
 	}))
 	defer ts.Close()
 
@@ -828,43 +843,6 @@ func TestAuditMiddleware_ConfigVariants(t *testing.T) {
 	}
 }
 
-func TestAuditMiddlewareOnAuditInConfig(t *testing.T) {
-	var capturedEvent AuditEvent
-	var mu sync.Mutex
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusCreated)
-	}))
-	defer ts.Close()
-
-	cfg := testConfig()
-	auditCfg := DefaultAuditConfig()
-	auditCfg.OnAudit = func(event AuditEvent) {
-		mu.Lock()
-		defer mu.Unlock()
-		capturedEvent = event
-	}
-	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		AuditMiddleware(auditCfg),
-	}
-
-	client, err := New(cfg)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	if _, err := client.Get(ts.URL); err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if capturedEvent.StatusCode != http.StatusCreated {
-		t.Errorf("expected status %d from config.OnAudit, got %d", http.StatusCreated, capturedEvent.StatusCode)
-	}
-}
-
 func TestAuditMiddlewareNoCallbackIsNoOp(t *testing.T) {
 	// No OnAudit callback set: the middleware is a no-op (unwrapped handler)
 	// and must not panic when a request runs through it.
@@ -938,36 +916,6 @@ func TestDefaultAuditConfig(t *testing.T) {
 	}
 	if !config.SanitizeError {
 		t.Error("expected SanitizeError to be true")
-	}
-}
-
-func TestRequestIDMiddleware_NilConfig(t *testing.T) {
-	var receivedID string
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		receivedID = r.Header.Get("X-Request-ID")
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	cfg := testConfig()
-	// Nil config = defaults (X-Request-ID header, crypto/rand generator)
-	cfg.Middleware.Middlewares = []MiddlewareFunc{
-		RequestIDMiddleware(nil),
-	}
-
-	client, err := New(cfg)
-	if err != nil {
-		t.Fatalf("failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	_, err = client.Get(ts.URL)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-
-	if receivedID == "" {
-		t.Error("expected request ID to be set")
 	}
 }
 
@@ -1135,30 +1083,6 @@ func TestSanitizeCallbackError(t *testing.T) {
 func TestMiddleware_BoundaryConditions(t *testing.T) {
 	t.Parallel()
 
-	t.Run("TimeoutMiddleware nil config (disabled)", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer ts.Close()
-
-		cfg := testConfig()
-		cfg.Middleware.Middlewares = []MiddlewareFunc{
-			TimeoutMiddleware(nil),
-		}
-		client, err := New(cfg)
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
-		defer client.Close()
-
-		// Nil config = Duration 0 = pass-through
-		ctx := context.Background()
-		_, err = client.Request(ctx, "GET", ts.URL)
-		if err != nil {
-			t.Fatalf("nil-config timeout should pass through: %v", err)
-		}
-	})
-
 	t.Run("Chain with nil middleware slice", func(t *testing.T) {
 		handler := Chain()
 		if handler == nil {
@@ -1166,25 +1090,187 @@ func TestMiddleware_BoundaryConditions(t *testing.T) {
 		}
 	})
 
-	t.Run("MetricsMiddleware with nil config", func(t *testing.T) {
-		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer ts.Close()
+	// Nil-config middleware constructors are covered table-driven in
+	// TestMiddleware_NilConfig.
+}
 
-		cfg := testConfig()
-		cfg.Middleware.Middlewares = []MiddlewareFunc{
-			MetricsMiddleware(nil),
-		}
-		client, err := New(cfg)
-		if err != nil {
-			t.Fatalf("failed to create client: %v", err)
-		}
-		defer client.Close()
+// TestTimeoutMiddleware_RejectsStreaming verifies the middleware refuses
+// streaming requests up front instead of letting the deferred cancel() abort
+// the body stream mid-read with a misleading "context canceled" error.
+func TestTimeoutMiddleware_RejectsStreaming(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
 
-		_, err = client.Get(ts.URL)
-		if err != nil {
-			t.Fatalf("request should succeed with nil metrics config: %v", err)
-		}
-	})
+	cfg := testConfig()
+	cfg.Middleware.Middlewares = []MiddlewareFunc{
+		TimeoutMiddleware(&TimeoutMiddlewareConfig{Duration: 5 * time.Second}),
+	}
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	defer client.Close()
+
+	_, err = client.Get(ts.URL, WithStreamBody(true))
+	if err == nil {
+		t.Fatal("expected error for streaming request through TimeoutMiddleware, got nil")
+	}
+	if !strings.Contains(err.Error(), "incompatible with streaming") {
+		t.Errorf("error should explain the incompatibility, got: %v", err)
+	}
+}
+
+// TestSanitizeCallbackError_PreservesChain verifies the sanitized error keeps
+// errors.Is/Unwrap access to the original while its message is redacted.
+func TestSanitizeCallbackError_PreservesChain(t *testing.T) {
+	raw := "https://user:secretpw@example.com/path"
+	sanitized := "https://user:xxxxx@example.com/path"
+	inner := fmt.Errorf("request to %s failed: %w", raw, context.DeadlineExceeded)
+
+	got := sanitizeCallbackError(inner, raw, sanitized)
+	if got == nil {
+		t.Fatal("expected sanitized error, got nil")
+	}
+	if msg := got.Error(); strings.Contains(msg, "secretpw") {
+		t.Errorf("message still contains credentials: %q", msg)
+	}
+	if !errors.Is(got, context.DeadlineExceeded) {
+		t.Errorf("errors.Is must reach the original sentinel through the sanitized wrapper, got: %v", got)
+	}
+
+	// Passthrough cases: nil error, identical URLs, or no URL in message.
+	if err := sanitizeCallbackError(nil, raw, sanitized); err != nil {
+		t.Errorf("nil error should pass through, got %v", err)
+	}
+	plain := errors.New("unrelated failure")
+	if err := sanitizeCallbackError(plain, raw, sanitized); !errors.Is(err, plain) {
+		t.Errorf("message without raw URL should pass through unchanged, got %v", err)
+	}
+}
+
+// TestBuildMiddlewareChain_RequestReplacement covers the facade's fallback
+// path for a middleware that replaces the request with a non-*engine.Request
+// RequestMutator: every accessor-visible field (method, URL, headers, query,
+// body) must still be forwarded to the engine, and a nil request context must
+// fall back to the call context.
+func TestBuildMiddlewareChain_RequestReplacement(t *testing.T) {
+	var gotMethod, gotHeader, gotQuery, gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotHeader = r.Header.Get("X-Replaced")
+		gotQuery = r.URL.Query().Get("q")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	replaced := &mockRequest{
+		method:      "POST",
+		url:         server.URL,
+		headers:     map[string]string{"X-Replaced": "yes"},
+		queryParams: map[string]any{"q": "replaced"},
+		body:        "raw-body", // string body: forwarded verbatim, no codec ambiguity
+		// ctx intentionally nil: exercises the reqCtx = ctx fallback
+	}
+
+	cfg := testConfig()
+	cfg.Middleware.Middlewares = []MiddlewareFunc{
+		func(next Handler) Handler {
+			return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
+				return next(ctx, replaced)
+			}
+		},
+	}
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer client.Close()
+
+	if _, err := client.Get(server.URL); err != nil {
+		t.Fatalf("request through replaced mutator failed: %v", err)
+	}
+
+	if gotMethod != "POST" {
+		t.Errorf("method = %q, want POST (replacement ignored)", gotMethod)
+	}
+	if gotHeader != "yes" {
+		t.Errorf("X-Replaced header not forwarded: %q", gotHeader)
+	}
+	if gotQuery != "replaced" {
+		t.Errorf("query param not forwarded: %q", gotQuery)
+	}
+	if gotBody != "raw-body" {
+		t.Errorf("body not forwarded: %q, want raw-body", gotBody)
+	}
+}
+
+// wrapperMutator wraps a RequestMutator by embedding it: every method
+// delegates to the original request, but the wrapper itself is not a
+// *engine.Request — the shape a request-replacing middleware produces.
+type wrapperMutator struct {
+	RequestMutator
+}
+
+// TestMiddlewareChain_RequestReplacement_ConcurrentHeaders is the concurrency
+// regression test for the request-replacement fallback path. A delegating
+// wrapper's Headers() returns the original engineReq's POOLED map; before the
+// fallback switched to copying, the engine's putRequest and the facade's
+// deferred ReleaseRequest both returned that same map to headersMapPool, so
+// two concurrent requests could acquire the identical map — concurrent map
+// writes plus header cross-talk. Each worker must observe only its own
+// echoed X-Worker value; run with -race.
+func TestMiddlewareChain_RequestReplacement_ConcurrentHeaders(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(r.Header.Get("X-Worker")))
+	}))
+	defer server.Close()
+
+	cfg := testConfig()
+	cfg.Middleware.Middlewares = []MiddlewareFunc{
+		func(next Handler) Handler {
+			return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
+				return next(ctx, &wrapperMutator{RequestMutator: req})
+			}
+		},
+	}
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer client.Close()
+
+	const workers = 8
+	const iterations = 50
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, workers)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			want := strconv.Itoa(id)
+			for i := 0; i < iterations; i++ {
+				res, err := client.Get(server.URL, WithHeader("X-Worker", want))
+				if err != nil {
+					errCh <- fmt.Errorf("worker %d: %w", id, err)
+					return
+				}
+				if got := res.Body(); got != want {
+					errCh <- fmt.Errorf("worker %d iter %d: echoed header %q, want %q (pooled map cross-talk)", id, i, got, want)
+					return
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Error(err)
+	}
 }

@@ -10,17 +10,20 @@ This guide covers comprehensive error handling patterns and best practices for H
 - [Error Types](#error-types)
 - [Response Status Checking](#response-status-checking)
 - [Error Handling Patterns](#error-handling-patterns)
+- [Retry Behavior](#retry-behavior)
 - [Timeout Errors](#timeout-errors)
 - [Network Errors](#network-errors)
+- [Error Type Reference](#error-type-reference)
 - [Best Practices](#best-practices)
+- [Complete Example](#complete-example)
 
 ## Overview
 
 HTTPC provides multiple layers of error handling:
 
-1. **Network-level errors** - Connection failures, timeouts, DNS errors
-2. **HTTP-level errors** - Status codes (4xx, 5xx)
-3. **Application-level errors** - Circuit breaker, validation errors
+1. **Network-level errors** - Connection failures, timeouts, DNS errors (returned as `*ClientError`)
+2. **HTTP status codes** - 4xx/5xx responses are NOT returned as errors; check `result.IsSuccess()` / `IsClientError()` / `IsServerError()` instead
+3. **Validation errors** - URL parsing failures and redirect policy rejections (limit exceeded, circular redirect, blocked/whitelisted target) are classified as `ErrorTypeValidation`; note that request-option and pre-flight validation failures (e.g., an invalid cookie passed to `WithCookie`) return a plain wrapped `error`, **not** a `*ClientError`
 4. **Response parsing errors** - JSON/XML unmarshaling failures
 
 ## Error Types
@@ -270,9 +273,9 @@ func fetchWithFallback(client httpc.Client, primaryURL, fallbackURL string) ([]b
 ## Retry Behavior
 
 HTTPC automatically retries failed requests based on the configuration. The retry logic handles:
-- Network errors (connection refused, timeout, DNS failures)
+- Network errors (connection refused, timeout; DNS failures only when temporary or timeout-class — persistent "no such host" errors are not retried)
 - Retryable HTTP status codes (408, 429, 500, 502, 503, 504)
-- Exponential backoff with jitter
+- Exponential backoff with jitter (`Retry-After` headers take precedence when present, capped at 60s)
 
 ### Configuring Retry Behavior
 
@@ -425,12 +428,12 @@ Use `clientErr.Type` to classify errors after using `errors.As`:
 | `httpc.ErrorTypeContextCanceled` | Context was canceled by caller |
 | `httpc.ErrorTypeResponseRead` | Error reading response body |
 | `httpc.ErrorTypeTransport` | HTTP transport-level error |
-| `httpc.ErrorTypeRetryExhausted` | All retry attempts exhausted |
+| `httpc.ErrorTypeRetryExhausted` | Reserved for retry exhaustion; in practice, when retries are exhausted the last error is returned with its original type kept — use `clientErr.Attempts` or `clientErr.IsRetryable()` to detect exhaustion instead |
 | `httpc.ErrorTypeTLS` | TLS handshake or protocol error |
 | `httpc.ErrorTypeCertificate` | Certificate validation error |
 | `httpc.ErrorTypeDNS` | DNS resolution error |
 | `httpc.ErrorTypeValidation` | Input validation error (URL, headers, etc.) |
-| `httpc.ErrorTypeHTTP` | HTTP protocol error |
+| `httpc.ErrorTypeHTTP` | HTTP-level error (4xx/5xx) surfaced through an error path; normal 4xx/5xx responses are returned as `Result`, not errors |
 
 ### Sentinel Errors
 
@@ -450,6 +453,7 @@ HTTPC defines sentinel errors for specific failure conditions:
 | `httpc.ErrFileExists` | File already exists (overwrite not enabled) |
 | `httpc.ErrResponseBodyEmpty` | Response body is empty |
 | `httpc.ErrResponseBodyTooLarge` | Response body exceeds size limit |
+| `httpc.ErrStreamBodyRequiresDownload` | `WithStreamBody` used with a standard request method (Get/Post/.../Request); streaming requires `Download` |
 
 ### ClientError Fields
 
@@ -463,8 +467,8 @@ if errors.As(err, &clientErr) {
     fmt.Printf("Cause: %v\n", clientErr.Cause)          // Underlying error (use with errors.Is/As)
     fmt.Printf("URL: %s\n", clientErr.URL)              // Request URL (sanitized)
     fmt.Printf("Method: %s\n", clientErr.Method)        // HTTP method
-    fmt.Printf("Host: %s\n", clientErr.Host)            // Target host
-    fmt.Printf("Attempts: %d\n", clientErr.Attempts)    // Retry attempts made
+    fmt.Printf("Host: %s\n", clientErr.Host)            // Reserved; currently never set by the engine
+    fmt.Printf("Attempts: %d\n", clientErr.Attempts)    // Total attempts made, including the first
     fmt.Printf("StatusCode: %d\n", clientErr.StatusCode) // HTTP status (if applicable)
     fmt.Printf("Retryable: %v\n", clientErr.IsRetryable()) // Whether error is retryable
     fmt.Printf("Type: %d\n", clientErr.Type)            // ErrorType constant (int)

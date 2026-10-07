@@ -21,29 +21,25 @@ const urlCacheSize = 1024
 type Validator struct {
 	config        *Config
 	validatedURLs sync.Map // url string → struct{}; avoids redundant url.Parse for repeated URLs
-	urlKeys       []string // tracks insertion order for LRU eviction
+	urlKeys       []string // insertion order for FIFO eviction (cache hits do NOT refresh position)
 	urlMu         sync.Mutex
-}
-
-// Compile-time interface check for requestValidator
-var _ requestValidator = (*Validator)(nil)
-
-// requestValidator defines the interface for request validation.
-type requestValidator interface {
-	ValidateRequest(req *Request) error
 }
 
 // Config defines security validation settings.
 type Config struct {
-	ValidateURL         bool
-	ValidateHeaders     bool
-	MaxResponseBodySize int64
-	MaxRequestBodySize  int64
-	AllowPrivateIPs     bool
-	ExemptNets          []*net.IPNet
+	ValidateURL        bool
+	ValidateHeaders    bool
+	MaxRequestBodySize int64
+	AllowPrivateIPs    bool
+	ExemptNets         []*net.IPNet
 }
 
 // Request represents a security validation request with method, URL, headers, and body.
+//
+// NOTE: Method and QueryParams are populated by the engine but are currently
+// NOT read by ValidateRequest (validation covers URL, headers, and body size
+// only). They are kept as future extension points for method-specific rules
+// and query-parameter checks.
 type Request struct {
 	Method      string
 	URL         string
@@ -56,13 +52,12 @@ type Request struct {
 	AllowPrivateIPs *bool
 }
 
-// NewValidator creates a new Validator with default security settings.
-func NewValidator() *Validator {
+// newValidator creates a new Validator with default security settings.
+func newValidator() *Validator {
 	secConfig := &Config{
-		ValidateURL:         true,
-		ValidateHeaders:     true,
-		MaxResponseBodySize: 50 * 1024 * 1024,
-		AllowPrivateIPs:     false,
+		ValidateURL:     true,
+		ValidateHeaders: true,
+		AllowPrivateIPs: false,
 	}
 
 	return &Validator{
@@ -73,13 +68,24 @@ func NewValidator() *Validator {
 // NewValidatorWithConfig creates a new Validator with the given security configuration.
 func NewValidatorWithConfig(config *Config) *Validator {
 	if config == nil {
-		return NewValidator()
+		return newValidator()
 	}
 
 	cfg := *config
 	if config.ExemptNets != nil {
+		// Deep copy: copying only the slice of pointers would leave the
+		// caller free to mutate the shared *net.IPNet values concurrently
+		// with validation (CIDR.Contains reads IP and Mask), racing every
+		// in-flight request. Copy the pointed-to values so the validator
+		// owns its snapshot.
 		cfg.ExemptNets = make([]*net.IPNet, len(config.ExemptNets))
-		copy(cfg.ExemptNets, config.ExemptNets)
+		for i, n := range config.ExemptNets {
+			if n == nil {
+				continue
+			}
+			cn := *n
+			cfg.ExemptNets[i] = &cn
+		}
 	}
 
 	return &Validator{
@@ -181,7 +187,7 @@ func (v *Validator) validateHost(host string, override *bool) error {
 
 	// Do not resolve DNS here; the connection pool dialer resolves and
 	// validates to prevent DNS rebinding TOCTOU.
-	return validation.ValidateSSRFHost(host, v.config.ExemptNets, false)
+	return validation.ValidateSSRFHost(host, v.config.ExemptNets)
 }
 
 func (v *Validator) validateHeader(key, value string) error {
@@ -243,8 +249,8 @@ func validateCommonHeaderValue(key, value string) error {
 }
 
 // validateRequestBodySize checks the request body against the configured size limit.
-// Only validates when MaxRequestBodySize is explicitly set; does not fall back to
-// MaxResponseBodySize since they serve different purposes.
+// Only validates when MaxRequestBodySize is explicitly set. (Response body size
+// limits are enforced by the engine on its own config, not here.)
 func (v *Validator) validateRequestBodySize(body any) error {
 	limit := v.config.MaxRequestBodySize
 	if limit <= 0 {

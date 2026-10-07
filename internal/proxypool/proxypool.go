@@ -8,9 +8,9 @@
 // (half-open probe) after a cooldown.
 //
 // HTTP status codes (e.g. 403) are NOT treated as proxy failures here — they
-// are target-specific. Status-based rotation is handled at the retry layer by
-// re-invoking Select, which naturally returns a different proxy under
-// round-robin/random.
+// are target-specific. Status-based rotation is handled at the retry layer
+// via deterministic SelectIndex(base+attempt), which advances one pool entry
+// per retry attempt regardless of strategy.
 package proxypool
 
 import (
@@ -68,7 +68,7 @@ type Config struct {
 // entry tracks the live state of a single proxy.
 type entry struct {
 	url  *url.URL // parsed proxy URL returned by Select
-	host string   // url.Host (host:port); the key for ReportFailure/ReportSuccess
+	host string   // canonical dial address (host:port, default port appended); the key for ReportFailure/ReportSuccess
 
 	failures  atomic.Int64 // consecutive failure count; reset to 0 on success
 	openUntil atomic.Int64 // unix-nano timestamp until which the circuit is open; 0 = closed
@@ -111,16 +111,25 @@ func New(cfg Config) (*Pool, error) {
 	for _, raw := range cfg.Proxies {
 		u, err := validation.ValidateProxyURL(raw)
 		if err != nil {
-			return nil, fmt.Errorf("proxy pool entry %q: %w", raw, err)
+			// SECURITY: sanitize before echoing — a misconfigured proxy URL
+			// containing userinfo would otherwise print its password into
+			// application logs.
+			return nil, fmt.Errorf("proxy pool entry %q: %w", validation.SanitizeURL(raw), err)
 		}
+		// Key every entry by the canonical address net/http actually dials
+		// (default port appended when the URL omits one). The dialer reports
+		// failures/successes with that same address, so the keys must match or
+		// circuit breaking silently never fires (e.g. "socks5://p" dials
+		// "p:1080" but was previously keyed as "p").
+		host := validation.CanonicalProxyAddr(u)
 		// Collapse duplicates by host:port — the same proxy listed twice would
 		// skew round-robin distribution and double-count failures.
-		if _, exists := byHost[u.Host]; exists {
+		if _, exists := byHost[host]; exists {
 			continue
 		}
-		e := &entry{url: u, host: u.Host}
+		e := &entry{url: u, host: host}
 		entries = append(entries, e)
-		byHost[u.Host] = e
+		byHost[host] = e
 	}
 
 	if len(entries) == 0 {
@@ -138,7 +147,7 @@ func New(cfg Config) (*Pool, error) {
 
 // Select returns a proxy URL for the given request, skipping any proxy whose
 // circuit is currently open. If every circuit is open it returns the proxy
-// closest to recovery (earliest open-unil timestamp) as a best-effort fallback
+// closest to recovery (earliest open-until timestamp) as a best-effort fallback
 // rather than failing outright.
 //
 // The request parameter is accepted to satisfy the http.Transport.Proxy
@@ -185,9 +194,14 @@ func (p *Pool) selectRoundRobin(now int64) *url.URL {
 func (p *Pool) selectRandom(now int64) *url.URL {
 	n := len(p.entries)
 
+	// Random start + sequential scan. Bounded random probing (n draws with
+	// replacement) misses the only healthy entry with probability
+	// ((n-m)/n)^n — ~35% for n=10, m=1 — and then the fallback below returns
+	// a known-dead proxy. The rotation scan keeps the random entry point but
+	// guarantees a healthy proxy is returned whenever one exists.
+	start := rand.IntN(n)
 	for i := 0; i < n; i++ {
-		e := p.entries[rand.IntN(n)]
-		if e.openUntil.Load() <= now {
+		if e := p.entries[(start+i)%n]; e.openUntil.Load() <= now {
 			return e.url
 		}
 	}
@@ -254,9 +268,18 @@ func (p *Pool) SelectIndex(attempt int) *url.URL {
 	return fallback.url
 }
 
-// ReportFailure records a connection-level failure (dial/TLS) for the proxy at
-// the given host:port. After FailureThreshold consecutive failures the proxy's
-// circuit opens and it is temporarily skipped by Select for Cooldown.
+// ReportFailure records a connection-level failure for the proxy at the given
+// canonical host:port (as net/http dials it — see CanonicalProxyAddr). After
+// FailureThreshold consecutive failures the proxy's circuit opens and it is
+// temporarily skipped by Select for Cooldown.
+//
+// SCOPE: this is called from the connection pool's DialContext callback, so it
+// observes first-hop TCP dial outcomes ONLY. Failures that occur after the
+// dial returns — TLS handshake errors to an https:// proxy, CONNECT refusals
+// (407/502), socks5 greeting failures — are structurally invisible here and
+// do NOT circuit-break the proxy; a successful TCP dial reports success even
+// if the proxy then rejects every CONNECT. Use Connection.ProxyRotateOnStatus
+// for status-based rotation instead.
 //
 // Only connection-level failures should be reported here. HTTP status codes
 // (e.g. 403) are target-specific and must NOT circuit-break a proxy; they are
@@ -282,9 +305,11 @@ func (p *Pool) ReportSuccess(host string) {
 	e.openUntil.Store(0)
 }
 
-// Hosts returns the host:port of every proxy in the pool, including those
-// whose circuit is currently open. Used to seed SSRF exemptions so that proxy
-// connections are never blocked by private-IP validation.
+// Hosts returns the canonical host:port dial address of every proxy in the
+// pool, including those whose circuit is currently open. Used to seed SSRF
+// exemptions so that proxy connections are never blocked by private-IP
+// validation. The addresses match what net/http dials (default port appended
+// for portless entries), which is what the dial callback compares against.
 func (p *Pool) Hosts() []string {
 	hosts := make([]string, len(p.entries))
 	for i, e := range p.entries {

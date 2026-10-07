@@ -26,7 +26,7 @@ import (
 // ErrPoolExhausted is returned when the connection pool has reached its
 // maximum capacity and cannot accept new connections. Callers can detect
 // this condition with errors.Is(err, connection.ErrPoolExhausted).
-var ErrPoolExhausted = fmt.Errorf("connection pool exhausted")
+var ErrPoolExhausted = errors.New("connection pool exhausted")
 
 // ErrProxyConnectionFailed wraps errors that occur while connecting to a
 // proxy server (dial failure, invalid address, refused connection, etc.).
@@ -40,15 +40,6 @@ var httpcDebug = sync.OnceValue(func() bool {
 	return os.Getenv("HTTPC_DEBUG") != ""
 })
 
-// hostConnMaxAge is the maximum age for a hostStats entry before it is
-// eligible for eviction. Stale entries (no recent connections) are removed
-// during periodic cleanup to prevent unbounded map growth.
-const hostConnMaxAge = 30 * time.Minute
-
-// maxHostEntries is the maximum number of per-host tracking entries.
-// When exceeded, aggressive eviction runs regardless of the normal interval.
-const maxHostEntries = 10000
-
 // PoolManager provides intelligent connection pool management with monitoring
 type PoolManager struct {
 	config *Config
@@ -58,20 +49,26 @@ type PoolManager struct {
 	proxyAddrs  []string
 	proxyPool   *proxypool.Pool
 
-	activeConns   int64
-	totalConns    int64
-	rejectedConns int64
-
-	hostConns sync.Map
-
-	// hostCount tracks the approximate number of entries in hostConns.
-	// Used for O(1) maxHostEntries enforcement instead of expensive sync.Map.Range counting.
-	// May drift slightly under high concurrency — acceptable for a memory-limit heuristic.
-	hostCount atomic.Int64
+	// atomic.Int64 (not plain int64 + atomic funcs) guarantees 8-byte
+	// alignment on 32-bit platforms, where interior struct fields are only
+	// 4-aligned and atomic 64-bit ops would panic.
+	activeConns   atomic.Int64
+	totalConns    atomic.Int64
+	rejectedConns atomic.Int64
+	// acceptedConns is a monotonically increasing count of successfully
+	// established connections (unlike totalConns, which is a gauge that
+	// decreases as connections close). Used by GetMetrics for a meaningful
+	// admission-hit rate.
+	acceptedConns atomic.Int64
 
 	closed int32
 
-	lastEviction int64 // Unix timestamp of last eviction run (atomic)
+	// NOTE: a per-host stats map (hostStats/hostConns/evictStaleHosts) was
+	// removed — it was write-only (GetMetrics reports aggregate counters
+	// only), cost a sync.Map load + atomics on every dial, and keyed entries
+	// by resolved IP on the standard path (one logical host with N A/AAAA
+	// records created N entries). Aggregate counters cover everything any
+	// consumer reads.
 }
 
 // certPinner defines the interface for certificate pinning
@@ -80,6 +77,9 @@ type certPinner interface {
 }
 
 // Config defines connection pool configuration.
+// Treated as immutable once passed to NewPoolManager: scalar fields are frozen
+// via a shallow copy at construction; reference fields (ProxyPool, ExemptNets,
+// TLSConfig, CookieJar) are shared and must not be mutated afterwards.
 type Config struct {
 	MaxIdleConns        int
 	MaxIdleConnsPerHost int
@@ -117,9 +117,13 @@ type Config struct {
 
 	ExemptNets []*net.IPNet
 
-	DisableCompression bool
-	DisableKeepAlives  bool
-	ForceAttemptHTTP2  bool
+	// Note: there is deliberately no DisableCompression field — the transport
+	// always disables automatic decompression (the engine handles it manually,
+	// including the decompression-bomb limit), so a config knob for it was
+	// dead API surface and has been removed.
+
+	DisableKeepAlives bool
+	ForceAttemptHTTP2 bool
 
 	CookieJar http.CookieJar
 
@@ -134,21 +138,14 @@ type Config struct {
 // SetCertPinner sets the certificate pinner for TLS certificate verification.
 func (c *Config) SetCertPinner(p certPinner) { c.certPinner = p }
 
-// hostStats tracks per-host connection statistics.
+// metrics provides connection pool performance metrics.
 //
-// Only fields that are actually consumed are maintained here. Per-host dial
-// latency and failed-connection counts were previously tracked but never
-// surfaced — GetMetrics reports aggregate pool counters (total/active/
-// rejected), not per-host figures — so they were removed to avoid a
-// per-connection mutex Lock/Unlock and atomic op in the dial hot path.
-type hostStats struct {
-	Host        string
-	ActiveConns int64
-	TotalConns  int64
-	LastUsed    int64 // Unix timestamp
-}
-
-// metrics provides connection pool performance metrics
+// TotalConnections is the cumulative count of successfully established
+// connections (monotonic); the current number of open connections is
+// ActiveConnections. ConnectionHitRate = Total/(Total+Rejected), i.e. the
+// share of dial attempts the pool admitted (the old implementation mixed the
+// live-connection gauge with the monotonic rejection counter, making the rate
+// drift and jitter).
 type metrics struct {
 	ActiveConnections   int64
 	TotalConnections    int64
@@ -178,9 +175,8 @@ func DefaultConfig() *Config {
 
 		EnableHTTP2: true,
 
-		DisableCompression: false,
-		DisableKeepAlives:  false,
-		ForceAttemptHTTP2:  true,
+		DisableKeepAlives: false,
+		ForceAttemptHTTP2: true,
 
 		AllowPrivateIPs: false,
 	}
@@ -191,6 +187,14 @@ func NewPoolManager(config *Config) (*PoolManager, error) {
 	if config == nil {
 		config = DefaultConfig()
 	}
+
+	// Freeze scalar fields with a shallow copy: the dialer and TLS callback
+	// read config fields on every connection, so a caller mutating them after
+	// construction would race with concurrent dialing. Reference fields
+	// (ProxyPool, ExemptNets, TLSConfig, CookieJar) remain shared and must be
+	// treated as immutable once passed in.
+	frozen := *config
+	config = &frozen
 
 	pm := &PoolManager{
 		config: config,
@@ -245,8 +249,17 @@ func NewPoolManager(config *Config) (*PoolManager, error) {
 		// SSRF validation targets request URLs (attacker-controlled), not developer-chosen
 		// infrastructure. A developer who can set ProxyURL can already bypass SSRF by
 		// connecting directly, so blocking proxy hosts adds no meaningful security.
-		pm.proxyAddrs = append(pm.proxyAddrs, proxyURL.Host)
-		transport.Proxy = http.ProxyURL(proxyURL)
+		// Canonicalize to the address net/http actually dials (default port
+		// appended for portless URLs) — isProxyAddr compares against exactly
+		// that, and the raw url.Host would never match for portless entries.
+		pm.proxyAddrs = append(pm.proxyAddrs, validation.CanonicalProxyAddr(proxyURL))
+		// Equivalent to http.ProxyURL(proxyURL), but records the selection
+		// into the per-request ProxyRecorder (see WithProxyRecorder) so the
+		// engine can surface which proxy served the request.
+		transport.Proxy = func(req *http.Request) (*url.URL, error) {
+			proxyRecorderFromContext(req.Context()).record(proxyURL)
+			return proxyURL, nil
+		}
 	} else if len(config.ProxyPool) > 0 {
 		// Proxy pool: distribute requests across multiple proxies with passive
 		// circuit breaking. transport.Proxy delegates to pool.Select, which
@@ -272,16 +285,21 @@ func NewPoolManager(config *Config) (*PoolManager, error) {
 		// each retry attempt lands on a different proxy even when redirect-
 		// following within a single attempt consumes extra Proxy calls.
 		transport.Proxy = func(req *http.Request) (*url.URL, error) {
-			if attempt, ok := ProxyAttemptFromContext(req.Context()); ok {
+			rec := proxyRecorderFromContext(req.Context())
+			if attempt, ok := proxyAttemptFromContext(req.Context()); ok {
 				u := pool.SelectIndex(attempt)
+				rec.record(u)
 				if httpcDebug() {
 					fmt.Fprintf(os.Stderr, "[httpc] proxy SelectIndex(%d) → %s\n", attempt, u.Host)
 				}
 				return u, nil
 			}
 			u, err := pool.Select(req)
-			if httpcDebug() && err == nil {
-				fmt.Fprintf(os.Stderr, "[httpc] proxy Select(round-robin) → %s\n", u.Host)
+			if err == nil {
+				rec.record(u)
+				if httpcDebug() {
+					fmt.Fprintf(os.Stderr, "[httpc] proxy Select(round-robin) → %s\n", u.Host)
+				}
 			}
 			return u, err
 		}
@@ -305,10 +323,14 @@ func NewPoolManager(config *Config) (*PoolManager, error) {
 			// Connection.ProxyURL explicitly (always exempted) or AllowPrivateIPs.
 			transport.Proxy = proxyFunc
 			for _, scheme := range []string{"http", "https"} {
-				testURL, _ := url.Parse(scheme + "://example.com")
+				testURL, _ := url.Parse(scheme + "://example.com") // literal URL; Parse cannot fail
 				if pu, err := proxyFunc(&http.Request{URL: testURL}); err == nil && pu != nil {
-					if !slices.Contains(pm.proxyAddrs, pu.Host) {
-						pm.proxyAddrs = append(pm.proxyAddrs, pu.Host)
+					// Canonical dial address (see the ProxyURL branch above):
+					// the dial callback compares against what net/http dials,
+					// not the raw url.Host.
+					canonical := validation.CanonicalProxyAddr(pu)
+					if !slices.Contains(pm.proxyAddrs, canonical) {
+						pm.proxyAddrs = append(pm.proxyAddrs, canonical)
 					}
 				}
 			}
@@ -337,10 +359,10 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 
 		// Atomically reserve a connection slot to prevent TOCTOU race
 		if pm.config.MaxTotalConns > 0 {
-			newCount := atomic.AddInt64(&pm.totalConns, 1)
+			newCount := pm.totalConns.Add(1)
 			if newCount > int64(pm.config.MaxTotalConns) {
-				atomic.AddInt64(&pm.totalConns, -1)
-				atomic.AddInt64(&pm.rejectedConns, 1)
+				pm.totalConns.Add(-1)
+				pm.rejectedConns.Add(1)
 				return nil, fmt.Errorf("%w (max %d)", ErrPoolExhausted, pm.config.MaxTotalConns)
 			}
 		}
@@ -348,15 +370,14 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 		// the proxy address is explicitly configured by the user.
 		if pm.isProxyAddr(address) {
 			conn, err := dialer.DialContext(ctx, network, address)
-			stats := pm.updateConnectionMetrics(address, err == nil)
 
 			if err != nil {
 				if pm.proxyPool != nil {
 					pm.proxyPool.ReportFailure(address)
 				}
-				atomic.AddInt64(&pm.rejectedConns, 1)
+				pm.rejectedConns.Add(1)
 				if pm.config.MaxTotalConns > 0 {
-					atomic.AddInt64(&pm.totalConns, -1)
+					pm.totalConns.Add(-1)
 				}
 				return nil, fmt.Errorf("%w: %w", ErrProxyConnectionFailed, err)
 			}
@@ -364,12 +385,11 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 			if pm.proxyPool != nil {
 				pm.proxyPool.ReportSuccess(address)
 			}
-			atomic.AddInt64(&pm.activeConns, 1)
+			pm.acceptedConns.Add(1)
+			pm.activeConns.Add(1)
 			return &trackedConn{
-				Conn:  conn,
-				pm:    pm,
-				host:  address,
-				stats: stats,
+				Conn: conn,
+				pm:   pm,
 			}, nil
 		}
 
@@ -392,9 +412,9 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 			// Use DoH resolver for DNS lookup
 			ips, err := pm.dohResolver.LookupIPAddr(ctx, host)
 			if err != nil {
-				atomic.AddInt64(&pm.rejectedConns, 1)
+				pm.rejectedConns.Add(1)
 				if pm.config.MaxTotalConns > 0 {
-					atomic.AddInt64(&pm.totalConns, -1)
+					pm.totalConns.Add(-1)
 				}
 				return nil, fmt.Errorf("DoH DNS resolution failed: %w", err)
 			}
@@ -407,87 +427,100 @@ func (pm *PoolManager) createDialer() func(context.Context, string, string) (net
 			if !allowPrivateIPs {
 				allowedIPs := validation.FilterAllowedIPs(resolvedIPs, pm.config.ExemptNets)
 				if len(allowedIPs) == 0 {
-					atomic.AddInt64(&pm.rejectedConns, 1)
+					pm.rejectedConns.Add(1)
 					if pm.config.MaxTotalConns > 0 {
-						atomic.AddInt64(&pm.totalConns, -1)
+						pm.totalConns.Add(-1)
 					}
 					return nil, fmt.Errorf("SSRF protection: domain resolves only to blocked addresses")
 				}
 				resolvedIPs = allowedIPs
 			}
 
-			// Try to connect to each allowed IP until one succeeds
-			var lastErr error
+			// Try to connect to each allowed IP until one succeeds. lastErr is
+			// seeded so an empty candidate list cannot render as %!w(<nil>).
+			lastErr := errors.New("no resolved addresses")
 			for _, ip := range resolvedIPs {
 				ipAddress := net.JoinHostPort(ip.String(), port)
 				conn, err := dialer.DialContext(ctx, network, ipAddress)
-				stats := pm.updateConnectionMetrics(address, err == nil)
 
 				if err == nil {
-					atomic.AddInt64(&pm.activeConns, 1)
+					pm.acceptedConns.Add(1)
+					pm.activeConns.Add(1)
 					return &trackedConn{
-						Conn:  conn,
-						pm:    pm,
-						host:  address,
-						stats: stats,
+						Conn: conn,
+						pm:   pm,
 					}, nil
 				}
 				lastErr = err
 			}
 
-			atomic.AddInt64(&pm.rejectedConns, 1)
+			pm.rejectedConns.Add(1)
 			if pm.config.MaxTotalConns > 0 {
-				atomic.AddInt64(&pm.totalConns, -1)
+				pm.totalConns.Add(-1)
 			}
 			return nil, fmt.Errorf("connection failed after trying %d IPs: %w", len(resolvedIPs), lastErr)
 		}
 
 		// Standard path without DoH
-		// SECURITY: Resolve DNS, validate all IPs, then dial the validated IP directly
-		// to prevent DNS rebinding TOCTOU attacks where an attacker-controlled DNS
-		// server returns a different IP between validation and actual connection.
+		// SECURITY: Resolve DNS, validate all IPs, then dial a validated IP
+		// directly to prevent DNS rebinding TOCTOU attacks where an
+		// attacker-controlled DNS server returns a different IP between
+		// validation and actual connection.
+		var candidates []string
 		if !allowPrivateIPs {
-			validatedAddr, err := pm.resolveAndValidateAddress(ctx, address)
+			validatedAddrs, err := pm.resolveAndValidateAddress(ctx, address)
 			if err != nil {
-				atomic.AddInt64(&pm.rejectedConns, 1)
+				pm.rejectedConns.Add(1)
 				if pm.config.MaxTotalConns > 0 {
-					atomic.AddInt64(&pm.totalConns, -1)
+					pm.totalConns.Add(-1)
 				}
 				return nil, fmt.Errorf("SSRF protection: %w", err)
 			}
-			address = validatedAddr
+			candidates = validatedAddrs
+		} else {
+			candidates = []string{address}
 		}
 
-		conn, err := dialer.DialContext(ctx, network, address)
-		stats := pm.updateConnectionMetrics(address, err == nil)
-
-		if err != nil {
-			atomic.AddInt64(&pm.rejectedConns, 1)
-			if pm.config.MaxTotalConns > 0 {
-				atomic.AddInt64(&pm.totalConns, -1)
+		// Try every validated IP in turn (e.g. IPv6 unreachable → IPv4
+		// fallback), mirroring the DoH path above. All candidates passed SSRF
+		// validation, so dialing any of them is rebinding-safe.
+		var conn net.Conn
+		// Seeded so an empty candidate list cannot render as %!w(<nil>).
+		lastErr := errors.New("no validated addresses to dial")
+		for _, addr := range candidates {
+			conn, lastErr = dialer.DialContext(ctx, network, addr)
+			if conn != nil {
+				break
 			}
-			return nil, fmt.Errorf("connection failed: %w", err)
 		}
 
-		atomic.AddInt64(&pm.activeConns, 1)
+		if conn == nil {
+			pm.rejectedConns.Add(1)
+			if pm.config.MaxTotalConns > 0 {
+				pm.totalConns.Add(-1)
+			}
+			return nil, fmt.Errorf("connection failed after trying %d address(es): %w", len(candidates), lastErr)
+		}
+
+		pm.acceptedConns.Add(1)
+		pm.activeConns.Add(1)
 
 		return &trackedConn{
-			Conn:  conn,
-			pm:    pm,
-			host:  address,
-			stats: stats,
+			Conn: conn,
+			pm:   pm,
 		}, nil
 	}
 }
 
 // resolveAndValidateAddress resolves the given address and validates all resulting IPs
-// against SSRF protection rules. It returns a validated "ip:port" string that should be
-// dialed directly to prevent DNS rebinding TOCTOU attacks.
+// against SSRF protection rules. It returns validated "ip:port" candidates that should
+// be dialed directly to prevent DNS rebinding TOCTOU attacks; callers may try each
+// candidate in turn (IPv6 → IPv4 failover) since all of them passed validation.
 //
-// SECURITY: By resolving DNS once and dialing the validated IP directly (instead of
+// SECURITY: By resolving DNS once and dialing a validated IP directly (instead of
 // the original hostname), we eliminate the window where an attacker-controlled DNS
 // server could return a different (private) IP on the second resolution.
-func (pm *PoolManager) resolveAndValidateAddress(ctx context.Context, address string) (string, error) {
+func (pm *PoolManager) resolveAndValidateAddress(ctx context.Context, address string) ([]string, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
 		host = address
@@ -497,9 +530,9 @@ func (pm *PoolManager) resolveAndValidateAddress(ctx context.Context, address st
 	// If the address is already an IP, validate it directly
 	if ip := net.ParseIP(host); ip != nil {
 		if err := validation.ValidateIPWithExemptions(ip, pm.config.ExemptNets); err != nil {
-			return "", err
+			return nil, err
 		}
-		return address, nil
+		return []string{address}, nil
 	}
 
 	// For domain names, resolve and filter to allowed IPs.
@@ -517,7 +550,7 @@ func (pm *PoolManager) resolveAndValidateAddress(ctx context.Context, address st
 	defer dnsCancel()
 	ipAddrs, err := net.DefaultResolver.LookupIPAddr(dnsCtx, host)
 	if err != nil {
-		return "", fmt.Errorf("DNS resolution failed for SSRF validation of %s: %w", host, err)
+		return nil, fmt.Errorf("DNS resolution failed for SSRF validation of %s: %w", host, err)
 	}
 	ips := make([]net.IP, len(ipAddrs))
 	for i, addr := range ipAddrs {
@@ -528,11 +561,16 @@ func (pm *PoolManager) resolveAndValidateAddress(ctx context.Context, address st
 	// where a domain may resolve to both public and private IPs.
 	allowedIPs := validation.FilterAllowedIPs(ips, pm.config.ExemptNets)
 	if len(allowedIPs) == 0 {
-		return "", fmt.Errorf("domain %s resolves only to blocked addresses", host)
+		return nil, fmt.Errorf("domain %s resolves only to blocked addresses", host)
 	}
 
-	// Return the first allowed IP for direct dialing to prevent DNS rebinding
-	return net.JoinHostPort(allowedIPs[0].String(), port), nil
+	// Return every allowed IP for direct dialing to prevent DNS rebinding:
+	// callers dial the validated IP literals (never the hostname).
+	addrs := make([]string, 0, len(allowedIPs))
+	for _, ip := range allowedIPs {
+		addrs = append(addrs, net.JoinHostPort(ip.String(), port))
+	}
+	return addrs, nil
 }
 
 func (pm *PoolManager) isProxyAddr(address string) bool {
@@ -543,9 +581,20 @@ func (pm *PoolManager) createTLSConfig() *tls.Config {
 	// If a custom TLS config is provided, use it (but add cert pinning if configured)
 	if pm.config.TLSConfig != nil {
 		tlsConfig := pm.config.TLSConfig.Clone()
-		// Add certificate pinning verification if configured
+		// Add certificate pinning verification if configured. Chain onto any
+		// user-supplied VerifyPeerCertificate callback instead of replacing
+		// it: custom CA validation or mTLS hooks must keep working.
 		if pm.config.certPinner != nil {
-			tlsConfig.VerifyPeerCertificate = pm.createVerifyPeerCertificate()
+			orig := tlsConfig.VerifyPeerCertificate
+			pinVerify := pm.createVerifyPeerCertificate()
+			tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+				if orig != nil {
+					if err := orig(rawCerts, verifiedChains); err != nil {
+						return err
+					}
+				}
+				return pinVerify(rawCerts, verifiedChains)
+			}
 		}
 		return tlsConfig
 	}
@@ -602,8 +651,6 @@ func (pm *PoolManager) createVerifyPeerCertificate() func(rawCerts [][]byte, ver
 type trackedConn struct {
 	net.Conn
 	pm        *PoolManager
-	host      string
-	stats     *hostStats // captured at creation for direct Close() updates
 	closeOnce sync.Once
 	closed    int32 // Atomic flag for fast double-close detection
 }
@@ -617,111 +664,19 @@ func (tc *trackedConn) Close() error {
 	var closeErr error
 	tc.closeOnce.Do(func() {
 		atomic.StoreInt32(&tc.closed, 1)
-		// Skip counter decrements if the pool is already closed — the pool's
-		// own Close() has already cleared hostConns and reset counters.
-		if atomic.LoadInt32(&tc.pm.closed) == 0 {
-			atomic.AddInt64(&tc.pm.activeConns, -1)
-			if tc.pm.config.MaxTotalConns > 0 {
-				atomic.AddInt64(&tc.pm.totalConns, -1)
-			}
-			if tc.stats != nil {
-				atomic.AddInt64(&tc.stats.ActiveConns, -1)
-			}
+		// Counter decrements are unconditional. closeOnce guarantees they run
+		// exactly once per connection, and every dial-time increment has this
+		// matching decrement even when the pool is closed in between — keeping
+		// the accounting balanced. (The previous "skip if pool closed" guard
+		// was a TOCTOU: a Close that raced past the closed load, followed by
+		// PoolManager.Close's counter reset, drove the counters negative.)
+		tc.pm.activeConns.Add(-1)
+		if tc.pm.config.MaxTotalConns > 0 {
+			tc.pm.totalConns.Add(-1)
 		}
 		closeErr = tc.Conn.Close()
 	})
 	return closeErr
-}
-
-// updateConnectionMetrics efficiently updates per-host connection statistics.
-// Returns the hostStats pointer so callers can capture it for trackedConn.
-func (pm *PoolManager) updateConnectionMetrics(host string, success bool) *hostStats {
-	// Trigger lazy eviction of stale host entries to prevent unbounded map growth.
-	pm.evictStaleHosts()
-
-	// Fast path: check if host already tracked before allocating.
-	if existing, ok := pm.hostConns.Load(host); ok {
-		stats, ok := existing.(*hostStats)
-		if !ok || stats == nil {
-			return nil // Defensive: skip update if type assertion fails
-		}
-		pm.updateHostStats(stats, success)
-		return stats
-	}
-
-	// Slow path: new host — allocate and store
-	value, loaded := pm.hostConns.LoadOrStore(host, &hostStats{
-		Host:     host,
-		LastUsed: time.Now().Unix(),
-	})
-
-	// Track new entries via atomic counter for O(1) enforcement of maxHostEntries.
-	if !loaded {
-		if pm.hostCount.Add(1) > int64(maxHostEntries) {
-			pm.evictStaleHosts()
-		}
-	}
-
-	// Safe type assertion with defensive check
-	stats, ok := value.(*hostStats)
-	if !ok || stats == nil {
-		return nil // Defensive: skip update if type assertion fails
-	}
-
-	pm.updateHostStats(stats, success)
-	return stats
-}
-
-// updateHostStats applies connection metrics to an existing hostStats entry.
-func (pm *PoolManager) updateHostStats(stats *hostStats, success bool) {
-	if success {
-		atomic.AddInt64(&stats.TotalConns, 1)
-		atomic.AddInt64(&stats.ActiveConns, 1)
-	}
-	atomic.StoreInt64(&stats.LastUsed, time.Now().Unix())
-}
-
-// evictStaleHosts removes hostStats entries that haven't been used recently.
-// Uses atomic CAS to ensure only one goroutine performs eviction at a time,
-// avoiding contention in the hot path. Eviction runs at most once per minute.
-func (pm *PoolManager) evictStaleHosts() {
-	const evictionInterval int64 = 60 // seconds between eviction runs
-	now := time.Now().Unix()
-
-	last := atomic.LoadInt64(&pm.lastEviction)
-	if now-last < evictionInterval {
-		return
-	}
-
-	if !atomic.CompareAndSwapInt64(&pm.lastEviction, last, now) {
-		return // Another goroutine is already evicting
-	}
-
-	cutoff := now - int64(hostConnMaxAge/time.Second)
-	pm.hostConns.Range(func(key, value any) bool {
-		if stats, ok := value.(*hostStats); ok && stats != nil {
-			if atomic.LoadInt64(&stats.LastUsed) < cutoff && atomic.LoadInt64(&stats.ActiveConns) == 0 {
-				// Use LoadAndDelete to atomically remove the entry. If a concurrent
-				// connection incremented ActiveConns between the check above and here,
-				// re-insert the entry to avoid orphaning in-use stats.
-				if oldStats, loaded := pm.hostConns.LoadAndDelete(key); loaded {
-					pm.hostCount.Add(-1)
-					if s, ok := oldStats.(*hostStats); ok && atomic.LoadInt64(&s.ActiveConns) > 0 {
-						// Re-insert with LoadOrStore so we never clobber a fresher
-						// entry a concurrent connection stored after our delete, and
-						// never double-count hostCount: only bump if our oldStats won.
-						// LoadOrStore's second return is `loaded` (true = a different
-						// entry already existed, ours was NOT stored), so we bump only
-						// when ours was actually stored: !alreadyPresent.
-						if _, alreadyPresent := pm.hostConns.LoadOrStore(key, oldStats); !alreadyPresent {
-							pm.hostCount.Add(1) // oldStats was re-inserted: undo the decrement above
-						}
-					}
-				}
-			}
-		}
-		return true
-	})
 }
 
 // GetTransport returns the shared *http.Transport used for pooled connections.
@@ -752,21 +707,30 @@ func (pm *PoolManager) NextProxyIndex() (int, bool) {
 	return pm.proxyPool.NextIndex(), true
 }
 
+// HasProxy reports whether requests are routed through an explicitly
+// configured proxy — a manual ProxyURL or a proxy pool. System-proxy detection
+// is not covered because its selection is resolved dynamically per request.
+// The engine uses this to attach a ProxyRecorder only when a proxy may be
+// selected, keeping the direct-connection path allocation-free.
+func (pm *PoolManager) HasProxy() bool {
+	return pm.proxyPool != nil || pm.config.ProxyURL != ""
+}
+
 // GetMetrics returns a snapshot of current connection pool statistics,
 // including active, total, and rejected connection counts and the connection
 // hit rate.
 func (pm *PoolManager) GetMetrics() metrics {
-	total := atomic.LoadInt64(&pm.totalConns)
-	rejected := atomic.LoadInt64(&pm.rejectedConns)
-	active := atomic.LoadInt64(&pm.activeConns)
+	accepted := pm.acceptedConns.Load()
+	rejected := pm.rejectedConns.Load()
+	active := pm.activeConns.Load()
 	hitRate := 0.0
-	if total+rejected > 0 {
-		hitRate = float64(total) / float64(total+rejected)
+	if accepted+rejected > 0 {
+		hitRate = float64(accepted) / float64(accepted+rejected)
 	}
 
 	return metrics{
 		ActiveConnections:   active,
-		TotalConnections:    total,
+		TotalConnections:    accepted,
 		RejectedConnections: rejected,
 		ConnectionHitRate:   hitRate,
 		LastUpdate:          time.Now().Unix(),
@@ -794,19 +758,11 @@ func (pm *PoolManager) Close() error {
 		pm.transport.CloseIdleConnections()
 	}
 
-	// Clean up per-host connection tracking map to prevent memory leak
-	pm.hostConns.Range(func(key, _ any) bool {
-		pm.hostConns.Delete(key)
-		return true
-	})
-	pm.hostCount.Store(0)
-	// Reset aggregate connection counters. trackedConn.Close() skips its
-	// activeConns/totalConns decrement once closed==1, so connections established
-	// concurrently with Close would otherwise leave phantom counts in
-	// GetMetrics(). No subsequent decrement can run (the dialer rejects new
-	// dials once closed), so resetting here cannot drive the counters negative.
-	atomic.StoreInt64(&pm.activeConns, 0)
-	atomic.StoreInt64(&pm.totalConns, 0)
+	// Aggregate counters are intentionally NOT reset here: trackedConn.Close()
+	// decrements unconditionally (closeOnce guards the single run), so gauges
+	// converge to zero on their own as connections close — including ones that
+	// outlive this call. A reset here could interleave with a decrement that
+	// already passed its guard, driving counters negative.
 
 	return closeErr
 }

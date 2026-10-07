@@ -388,16 +388,9 @@ func TestConfig_InternalHelpers(t *testing.T) {
 		}
 	})
 
-	t.Run("isTestEnvironment false positive", func(t *testing.T) {
-		// Verify the check is based on os.Args[0] containing ".test"
-		original := os.Args[0]
-		os.Args[0] = "myapp"
-		defer func() { os.Args[0] = original }()
-
-		// Even with modified Args, isTestEnvironment should check the actual binary
-		// This test ensures the function doesn't just check a global that could be wrong
-		_ = isTestEnvironment()
-	})
+	// The non-test-environment branch (os.Args[0] without ".test") is exercised
+	// with real assertions in TestNewFromPreparedConfig_InsecureSkipVerifyWarn
+	// (client_test.go) and TestWarnTestingConfigInProduction.
 }
 
 // ----------------------------------------------------------------------------
@@ -677,6 +670,33 @@ func TestValidateConfig_AdditionalBoundaries(t *testing.T) {
 				t.Errorf("ValidateConfig() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// ----------------------------------------------------------------------------
+// (*Config).Validate — method form of validation
+// ----------------------------------------------------------------------------
+
+func TestConfigValidate(t *testing.T) {
+	var nilConfig *Config
+	if err := nilConfig.Validate(); err == nil {
+		t.Error("expected error for nil receiver")
+	}
+
+	def := DefaultConfig()
+	if err := def.Validate(); err != nil {
+		t.Errorf("DefaultConfig() should be valid, got %v", err)
+	}
+
+	cfg := DefaultConfig()
+	cfg.Timeouts.Request = -1 * time.Second
+	methodErr := cfg.Validate()
+	funcErr := ValidateConfig(&cfg)
+	if methodErr == nil || funcErr == nil {
+		t.Fatalf("expected errors, got Validate()=%v, ValidateConfig()=%v", methodErr, funcErr)
+	}
+	if methodErr.Error() != funcErr.Error() {
+		t.Errorf("Validate() and ValidateConfig() disagree: %q vs %q", methodErr, funcErr)
 	}
 }
 

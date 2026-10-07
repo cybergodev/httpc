@@ -62,9 +62,18 @@ func TestValidateCookieSecurity(t *testing.T) {
 			errMatch: "cookie is nil",
 		},
 		{
-			name:    "nil config",
+			// Fail closed: a nil security config is a caller error; the
+			// zero-value config below is the legitimate "no requirements".
+			name:     "nil config",
+			cookie:   &http.Cookie{Name: "test", Value: "value"},
+			config:   nil,
+			wantErr:  true,
+			errMatch: "config is nil",
+		},
+		{
+			name:    "zero-value config means no requirements",
 			cookie:  &http.Cookie{Name: "test", Value: "value"},
-			config:  nil,
+			config:  &CookieSecurityConfig{},
 			wantErr: false,
 		},
 		{
@@ -156,80 +165,70 @@ func TestSameSiteConversions(t *testing.T) {
 // requirements and cookie configurations.
 func TestValidateSameSite(t *testing.T) {
 	tests := []struct {
-		name      string
-		cookie    *http.Cookie
-		required  string
-		allowNone bool
-		wantErr   bool
+		name     string
+		cookie   *http.Cookie
+		required string
+		wantErr  bool
 	}{
 		{
-			name:      "Strict cookie with Strict requirement",
-			cookie:    &http.Cookie{Name: "test", SameSite: http.SameSiteStrictMode},
-			required:  "Strict",
-			allowNone: false,
-			wantErr:   false,
+			name:     "Strict cookie with Strict requirement",
+			cookie:   &http.Cookie{Name: "test", SameSite: http.SameSiteStrictMode},
+			required: "Strict",
+			wantErr:  false,
 		},
 		{
-			name:      "Lax cookie with Lax requirement",
-			cookie:    &http.Cookie{Name: "test", SameSite: http.SameSiteLaxMode},
-			required:  "Lax",
-			allowNone: false,
-			wantErr:   false,
+			name:     "Lax cookie with Lax requirement",
+			cookie:   &http.Cookie{Name: "test", SameSite: http.SameSiteLaxMode},
+			required: "Lax",
+			wantErr:  false,
 		},
 		{
-			name:      "None cookie with None requirement but allowNone=false",
-			cookie:    &http.Cookie{Name: "test", SameSite: http.SameSiteNoneMode},
-			required:  "None",
-			allowNone: false,
-			wantErr:   true,
+			name:     "None cookie with None requirement (allowNone policy is caller-side)",
+			cookie:   &http.Cookie{Name: "test", SameSite: http.SameSiteNoneMode},
+			required: "None",
+			wantErr:  false,
 		},
 		{
-			name:      "None cookie with None requirement and allowNone=true",
-			cookie:    &http.Cookie{Name: "test", SameSite: http.SameSiteNoneMode},
-			required:  "None",
-			allowNone: true,
-			wantErr:   false,
+			name:     "None cookie with None requirement",
+			cookie:   &http.Cookie{Name: "test", SameSite: http.SameSiteNoneMode},
+			required: "None",
+			wantErr:  false,
 		},
 		{
-			name:      "Default mode cookie with Lax requirement accepted",
-			cookie:    &http.Cookie{Name: "test", SameSite: http.SameSiteDefaultMode},
-			required:  "Lax",
-			allowNone: false,
-			wantErr:   false,
+			name:     "Default mode cookie with Lax requirement accepted",
+			cookie:   &http.Cookie{Name: "test", SameSite: http.SameSiteDefaultMode},
+			required: "Lax",
+			wantErr:  false,
 		},
 		{
-			name:      "Default mode cookie with Strict requirement rejected",
-			cookie:    &http.Cookie{Name: "test", SameSite: http.SameSiteDefaultMode},
-			required:  "Strict",
-			allowNone: false,
-			wantErr:   true,
+			name:     "Default mode cookie with Strict requirement rejected",
+			cookie:   &http.Cookie{Name: "test", SameSite: http.SameSiteDefaultMode},
+			required: "Strict",
+			wantErr:  true,
 		},
 		{
-			name:      "Mismatch Strict cookie with Lax requirement",
-			cookie:    &http.Cookie{Name: "test", SameSite: http.SameSiteStrictMode},
-			required:  "Lax",
-			allowNone: false,
-			wantErr:   true,
+			name:     "Mismatch Strict cookie with Lax requirement",
+			cookie:   &http.Cookie{Name: "test", SameSite: http.SameSiteStrictMode},
+			required: "Lax",
+			wantErr:  true,
 		},
 		{
-			name:      "Zero SameSite with Lax requirement accepted as default",
-			cookie:    &http.Cookie{Name: "test", SameSite: 0},
-			required:  "lax",
-			allowNone: false,
-			wantErr:   false,
+			name:     "Zero SameSite with Lax requirement accepted as default",
+			cookie:   &http.Cookie{Name: "test", SameSite: 0},
+			required: "lax",
+			wantErr:  false,
 		},
 		{
-			name:      "Zero SameSite with Strict requirement rejected",
-			cookie:    &http.Cookie{Name: "test", SameSite: 0},
-			required:  "strict",
-			allowNone: false,
-			wantErr:   true,
+			name:     "Zero SameSite with Strict requirement rejected",
+			cookie:   &http.Cookie{Name: "test", SameSite: 0},
+			required: "strict",
+			wantErr:  true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := validateSameSite(tt.cookie, tt.required, tt.allowNone)
+			err := validateSameSite(tt.cookie, tt.required)
 			if tt.wantErr && err == nil {
 				t.Error("expected error, got nil")
 			}
@@ -238,4 +237,43 @@ func TestValidateSameSite(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestValidateCookieSecurity_SameSiteNoneSecure pins the previously untested
+// RequireSecureForSameSiteNone flag (RFC 6265bis: SameSite=None requires
+// Secure), on and off.
+func TestValidateCookieSecurity_SameSiteNoneSecure(t *testing.T) {
+	noneCookie := &http.Cookie{
+		Name:     "sid",
+		SameSite: http.SameSiteNoneMode,
+		Secure:   false,
+	}
+
+	t.Run("SameSite=None without Secure rejected when required", func(t *testing.T) {
+		cfg := DefaultCookieSecurityConfig()
+		cfg.AllowSameSiteNone = true
+		cfg.RequireSecureForSameSiteNone = true
+		err := ValidateCookieSecurity(noneCookie, cfg)
+		if err == nil || !strings.Contains(err.Error(), "requires Secure") {
+			t.Errorf("expected SameSite=None-requires-Secure error, got: %v", err)
+		}
+	})
+
+	t.Run("SameSite=None without Secure allowed when flag off", func(t *testing.T) {
+		cfg := DefaultCookieSecurityConfig()
+		cfg.AllowSameSiteNone = true
+		cfg.RequireSecureForSameSiteNone = false
+		if err := ValidateCookieSecurity(noneCookie, cfg); err != nil {
+			t.Errorf("expected no error with flag off, got: %v", err)
+		}
+	})
+
+	t.Run("SameSite=None with Secure passes", func(t *testing.T) {
+		cfg := DefaultCookieSecurityConfig()
+		cfg.AllowSameSiteNone = true
+		ok := &http.Cookie{Name: "sid", SameSite: http.SameSiteNoneMode, Secure: true}
+		if err := ValidateCookieSecurity(ok, cfg); err != nil {
+			t.Errorf("expected no error, got: %v", err)
+		}
+	})
 }

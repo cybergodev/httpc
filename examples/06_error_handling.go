@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Error Handling Examples ===\n ")
+	fmt.Println("=== Error Handling Examples ===")
 
 	// Example 1: Basic error handling
 	demonstrateBasicErrors()
@@ -66,7 +66,9 @@ func demonstrateBasicErrors() {
 	fmt.Printf("Request successful: %d\n\n", resp.StatusCode())
 }
 
-// demonstrateHTTPErrors shows HTTP status code error handling
+// demonstrateHTTPErrors shows HTTP status code error handling.
+// httpbin.org/status/N replies with the exact status code requested, so each
+// branch below is exercised with a real response.
 func demonstrateHTTPErrors() {
 	fmt.Println("--- Example 2: HTTP Status Errors ---")
 
@@ -77,42 +79,48 @@ func demonstrateHTTPErrors() {
 	}
 	defer client.Close()
 
-	// Simulate different status codes
-	testURL := "https://echo.hoppscotch.io"
-
-	resp, err := client.Get(testURL)
-	if err != nil {
-		log.Printf("Request error: %v\n", err)
-		return
+	statusURLs := []string{
+		"https://httpbin.org/status/404", // Not Found
+		"https://httpbin.org/status/429", // Too Many Requests
+		"https://httpbin.org/status/503", // Service Unavailable
 	}
 
-	// Detailed status code checking
-	switch {
-	case resp.IsSuccess():
-		// 2xx - Success
-		fmt.Println("Success (2xx)")
-	case resp.IsRedirect():
-		// 3xx - Redirection
-		fmt.Printf("Redirect (3xx): %s\n", resp.Response.Headers.Get("Location"))
-	case resp.IsClientError():
-		// 4xx - Client error
-		fmt.Printf("Client error (4xx): %d\n", resp.StatusCode())
-		switch resp.StatusCode() {
-		case 400:
-			fmt.Println("  Bad Request")
-		case 401:
-			fmt.Println("  Unauthorized - check authentication")
-		case 403:
-			fmt.Println("  Forbidden - insufficient permissions")
-		case 404:
-			fmt.Println("  Not Found")
-		case 429:
-			fmt.Println("  Too Many Requests - rate limited")
+	for _, url := range statusURLs {
+		resp, err := client.Get(url)
+		if err != nil {
+			log.Printf("Request error: %v\n", err)
+			return
 		}
-	case resp.IsServerError():
-		// 5xx - Server error
-		fmt.Printf("Server error (5xx): %d\n", resp.StatusCode())
-		fmt.Println("  Server is experiencing issues, retry may help")
+
+		// Detailed status code checking
+		switch {
+		case resp.IsSuccess():
+			// 2xx - Success
+			fmt.Printf("%d: Success (2xx)\n", resp.StatusCode())
+		case resp.IsRedirect():
+			// 3xx - Redirection
+			fmt.Printf("%d: Redirect (3xx): %s\n", resp.StatusCode(),
+				resp.Response.Headers.Get("Location"))
+		case resp.IsClientError():
+			// 4xx - Client error
+			fmt.Printf("%d: Client error (4xx)\n", resp.StatusCode())
+			switch resp.StatusCode() {
+			case 400:
+				fmt.Println("  Bad Request")
+			case 401:
+				fmt.Println("  Unauthorized - check authentication")
+			case 403:
+				fmt.Println("  Forbidden - insufficient permissions")
+			case 404:
+				fmt.Println("  Not Found")
+			case 429:
+				fmt.Println("  Too Many Requests - rate limited")
+			}
+		case resp.IsServerError():
+			// 5xx - Server error
+			fmt.Printf("%d: Server error (5xx)\n", resp.StatusCode())
+			fmt.Println("  Server is experiencing issues, retry may help")
+		}
 	}
 	fmt.Println()
 }
@@ -182,7 +190,9 @@ func demonstrateContextCancellation() {
 	fmt.Printf("Request completed: %d\n\n", resp.StatusCode())
 }
 
-// demonstrateParsingErrors shows JSON/XML parsing error handling
+// demonstrateParsingErrors shows JSON parsing error handling.
+// httpbin.org/html returns an HTML document, so Unmarshal into a struct
+// fails — a real, observable parsing error.
 func demonstrateParsingErrors() {
 	fmt.Println("--- Example 5: Parsing Errors ---")
 
@@ -193,13 +203,13 @@ func demonstrateParsingErrors() {
 	}
 	defer client.Close()
 
-	resp, err := client.Get("https://echo.hoppscotch.io")
+	resp, err := client.Get("https://httpbin.org/html")
 	if err != nil {
 		log.Printf("Request failed: %v\n", err)
 		return
 	}
 
-	// Try to parse as JSON
+	// Try to parse an HTML body as JSON
 	type User struct {
 		ID   int    `json:"id"`
 		Name string `json:"name"`
@@ -220,7 +230,7 @@ func demonstrateParsingErrors() {
 
 // demonstrateComprehensivePattern shows comprehensive error handling
 func demonstrateComprehensivePattern() {
-	fmt.Println("=== Comprehensive Error Handling Pattern ===\n ")
+	fmt.Println("--- Example 6: Comprehensive Error Handling Pattern ---")
 
 	result, err := fetchUserData(123)
 	if err != nil {
@@ -252,7 +262,7 @@ func fetchUserData(userID int) (map[string]any, error) {
 		httpc.WithMaxRetries(2),
 	)
 	if err != nil {
-		// Check specific error types using Code() string
+		// Classify the failure cause for the caller
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, fmt.Errorf("request timed out after 10s: %w", err)
 		}

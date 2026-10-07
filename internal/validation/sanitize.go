@@ -15,7 +15,7 @@ var sensitiveQueryParamNames = map[string]bool{
 	"token": true, "access_token": true, "refresh_token": true,
 	"id_token": true, "idtoken": true, "bearer": true,
 	// API keys and secrets
-	"api_key": true, "apikey": true,
+	"api_key": true, "apikey": true, "api-key": true,
 	"secret": true, "secret_key": true, "client_secret": true,
 	"private_key": true, "privatekey": true, "private-key": true,
 	// Passwords and credentials
@@ -65,7 +65,7 @@ func isSensitiveQueryParamCI(name string) bool {
 // IsSensitiveQueryParam reports whether the given query parameter name is
 // considered sensitive and should be redacted from logs and cache keys.
 func IsSensitiveQueryParam(name string) bool {
-	return sensitiveQueryParamNames[asciiToLower(name)]
+	return isSensitiveQueryParamCI(name)
 }
 
 // redactSensitiveParams replaces values of sensitive query parameters with [REDACTED].
@@ -84,8 +84,7 @@ func redactSensitiveParams(rawQuery string) string {
 
 		// Split into key=value at the first =
 		param := rawQuery[start:end]
-		if eqIdx := strings.IndexByte(param, '='); eqIdx >= 0 {
-			key := param[:eqIdx]
+		if key, _, found := strings.Cut(param, "="); found {
 			if isSensitiveQueryParamCI(key) {
 				b.WriteString(key)
 				b.WriteString("=[REDACTED]")
@@ -120,7 +119,12 @@ func redactSensitiveParams(rawQuery string) string {
 // ***:***@host. Sensitive query parameters (token, api_key, password, etc.) have
 // their values replaced with [REDACTED].
 //
-// Returns the original string if the URL cannot be parsed.
+// SECURITY: this function must FAIL CLOSED. It exists to keep credentials out
+// of logs and error messages, so an input that url.Parse rejects — or parses
+// into an opaque form that hides userinfo — is best-effort redacted by
+// redactUnparseableURL instead of being returned verbatim (returning the raw
+// string would leak user:pass@... precisely on the malformed inputs most
+// likely to come from untrusted sources).
 //
 // This function is used to prevent credential leakage in:
 //   - Log messages
@@ -149,17 +153,15 @@ func SanitizeURL(urlStr string) string {
 
 	// If there are query params, check if any are sensitive before parsing.
 	// This avoids the expensive url.Parse + query encode cycle for non-sensitive URLs.
-	if idx := strings.IndexByte(urlStr, '?'); idx >= 0 {
-		if HasSensitiveQueryParams(urlStr[idx+1:]) {
-			// Fall through to full parsing below
-		} else if !strings.ContainsAny(urlStr, "@# ") {
+	if _, query, found := strings.Cut(urlStr, "?"); found {
+		if !HasSensitiveQueryParams(query) && !strings.ContainsAny(urlStr, "@# ") {
 			return urlStr
 		}
 	}
 
 	parsedURL, err := url.Parse(urlStr)
 	if err != nil {
-		return urlStr
+		return redactUnparseableURL(urlStr)
 	}
 
 	// Redact sensitive query parameters directly on raw query string
@@ -172,6 +174,12 @@ func SanitizeURL(urlStr string) string {
 	parsedURL.Fragment = ""
 	parsedURL.RawFragment = ""
 	if parsedURL.User == nil {
+		// Opaque URLs ("user:pass@host/path" parses as Scheme="user",
+		// Opaque="pass@host/path", User=nil) carry the password verbatim in
+		// Opaque. Redact it instead of returning parsedURL.String() as-is.
+		if parsedURL.Opaque != "" && strings.Contains(parsedURL.Opaque, "@") {
+			return redactUnparseableURL(urlStr)
+		}
 		return parsedURL.String()
 	}
 
@@ -182,8 +190,14 @@ func SanitizeURL(urlStr string) string {
 	estimatedLen := 18 + len(parsedURL.Scheme) + len(parsedURL.Host) + len(parsedURL.Path) + len(parsedURL.RawQuery)
 	b := getSanitizeBuilder()
 	b.Grow(estimatedLen)
-	b.WriteString(parsedURL.Scheme)
-	b.WriteString("://")
+	if parsedURL.Scheme != "" {
+		b.WriteString(parsedURL.Scheme)
+		b.WriteString("://")
+	} else {
+		// Scheme-less URLs (e.g. "//u:p@h/p"): keep the protocol-relative
+		// "//" form instead of emitting a malformed "://..." prefix.
+		b.WriteString("//")
+	}
 	if hasPassword {
 		b.WriteString("***:***")
 	} else {
@@ -201,6 +215,50 @@ func SanitizeURL(urlStr string) string {
 	return result
 }
 
+// redactUnparseableURL best-effort redacts credentials in a URL string that
+// url.Parse rejected (or that parsed into an opaque form). Without a parsed
+// structure the only reliable signal is the '@' separating userinfo from the
+// host, so everything from the scheme separator up to the LAST '@' is
+// replaced with "***@". Sensitive query parameters are redacted when a query
+// string is present. The result is safe for logging even though it may not be
+// a parseable URL — diagnostics beat a verbatim credential leak.
+func redactUnparseableURL(s string) string {
+	at := strings.LastIndexByte(s, '@')
+	if at < 0 {
+		// No userinfo separator: nothing that looks like a credential.
+		return s
+	}
+
+	// Preserve the scheme ("https://") if it precedes the credentials.
+	prefix := ""
+	if i := strings.Index(s, "://"); i >= 0 && i+3 <= at {
+		prefix = s[:i+3]
+		s = s[i+3:]
+		at -= i + 3
+	} else if i := strings.Index(s, ":"); i >= 0 && i+1 <= at && !strings.Contains(s[:i], "/") {
+		// Opaque-style "scheme:userinfo@rest" (no "//"): keep "scheme:".
+		prefix = s[:i+1]
+		s = s[i+1:]
+		at -= i + 1
+	}
+
+	// An '@' lying after the first path separator is an ordinary path byte,
+	// not the userinfo delimiter — userinfo cannot contain '/'. Truncating
+	// there would mangle "http://host/p@th\x01" into "http://***@th\x01";
+	// with no userinfo-shaped credential, return the string intact.
+	if slash := strings.IndexByte(s, '/'); slash >= 0 && slash < at {
+		return prefix + s
+	}
+
+	redacted := prefix + "***@" + s[at+1:]
+	if idx := strings.IndexByte(redacted, '?'); idx >= 0 {
+		if q := redacted[idx+1:]; HasSensitiveQueryParams(q) {
+			redacted = redacted[:idx+1] + redactSensitiveParams(q)
+		}
+	}
+	return redacted
+}
+
 // sanitizeBuilderPool reduces allocations for strings.Builder in SanitizeURL.
 var sanitizeBuilderPool = sync.Pool{
 	New: func() any {
@@ -211,23 +269,26 @@ var sanitizeBuilderPool = sync.Pool{
 // HasSensitiveQueryParams checks if any key-value pair in the query string
 // has a sensitive parameter name. Uses byte-level ASCII lowercase to avoid
 // allocations from strings.ToLower.
+// HasSensitiveQueryParams reports whether any parameter key in the raw query
+// string looks sensitive. Parsing is segment-based (&-split, then strip the
+// value after '=') so it matches redactSensitiveParams exactly: a bare key
+// without '=' is still treated as a key.
 func HasSensitiveQueryParams(query string) bool {
-	for {
-		// Extract key before '='
-		eqIdx := strings.IndexByte(query, '=')
-		if eqIdx < 0 {
-			break
+	for len(query) > 0 {
+		segment := query
+		if ampIdx := strings.IndexByte(query, '&'); ampIdx >= 0 {
+			segment = query[:ampIdx]
+			query = query[ampIdx+1:]
+		} else {
+			query = ""
 		}
-		key := query[:eqIdx]
+		key := segment
+		if eqIdx := strings.IndexByte(segment, '='); eqIdx >= 0 {
+			key = segment[:eqIdx]
+		}
 		if isSensitiveQueryParamCI(key) {
 			return true
 		}
-		// Advance to next parameter
-		ampIdx := strings.IndexByte(query, '&')
-		if ampIdx < 0 {
-			break
-		}
-		query = query[ampIdx+1:]
 	}
 	return false
 }

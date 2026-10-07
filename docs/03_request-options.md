@@ -11,6 +11,7 @@ This guide covers all available request options in HTTPC for customizing HTTP re
 - [Authentication](#authentication)
 - [Query Parameters](#query-parameters)
 - [Request Body](#request-body)
+- [File Upload](#file-upload)
 - [Timeout & Context](#timeout--context)
 - [Retry Options](#retry-options)
 - [SSRF Override](#ssrf-override)
@@ -18,6 +19,7 @@ This guide covers all available request options in HTTPC for customizing HTTP re
 - [Request Callbacks](#request-callbacks)
 - [Advanced Body Options](#advanced-body-options)
 - [Complete Reference](#complete-reference)
+- [Best Practices](#best-practices)
 
 ## Overview
 
@@ -306,18 +308,21 @@ resp, err := client.Get(url,
 )
 
 // With deadline
-ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-defer cancel()
+timeoutCtx, timeoutCancel := context.WithTimeout(context.Background(), 1*time.Minute)
+defer timeoutCancel()
 
-resp, err := client.Get(url,
-    httpc.WithContext(ctx),
+resp, err = client.Get(url,
+    httpc.WithContext(timeoutCtx),
 )
 ```
 
 ### Context with Values
 
 ```go
-ctx := context.WithValue(context.Background(), "request-id", "12345")
+// Use a custom key type — never a bare string — as the context key
+type ctxKey string
+
+ctx := context.WithValue(context.Background(), ctxKey("request-id"), "12345")
 
 resp, err := client.Get(url,
     httpc.WithContext(ctx),
@@ -478,26 +483,36 @@ resp, err := client.Get(url,
 
 ### Cookie Security Validation
 
-Validate cookie security attributes (Secure, HttpOnly, SameSite):
+Validate cookie security attributes (Secure, HttpOnly, SameSite) per request with `WithSecureCookie`. It validates the cookies already added to the request, so it must be placed **after** the cookie options:
 
 ```go
-// Cookie security validation is configured via SecurityConfig at the client level
-config := httpc.DefaultConfig()
-config.Security.CookieSecurity = httpc.StrictCookieSecurityConfig()
-// Or customize individually:
-// config.Security.CookieSecurity = httpc.DefaultCookieSecurityConfig()
-// config.Security.CookieSecurity.RequireSecure = true
+// Strict preset: requires Secure, HttpOnly, and SameSite=Strict
+security := httpc.StrictCookieSecurityConfig()
+// Or start from defaults and customize:
+// security := httpc.DefaultCookieSecurityConfig()
+// security.RequireSecure = true
 
-client, err := httpc.New(config)
-if err != nil {
-    log.Fatal(err)
-}
-
-// Cookies sent through this client will be validated against the security config
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"}),
+    httpc.WithCookie(http.Cookie{
+        Name:     "session",
+        Value:    "abc123",
+        Secure:   true,
+        HttpOnly: true,
+        SameSite: http.SameSiteStrictMode,
+    }),
+    httpc.WithSecureCookie(security), // must come after the cookie options
 )
 ```
+
+For session-level validation that applies to every cookie regardless of option order, configure `SessionConfig.CookieSecurity` (see the [Cookie Management guide](06_cookie-api.md)):
+
+```go
+cfg := httpc.DefaultSessionConfig()
+cfg.CookieSecurity = httpc.StrictCookieSecurityConfig()
+sm, err := httpc.NewSessionManager(cfg)
+```
+
+> **Note**: the client-level `Config.Security.CookieSecurity` field is currently not wired into request processing — setting it has no effect. Use `WithSecureCookie` (per request) or `SessionConfig.CookieSecurity` (per session) instead.
 
 ## Request Callbacks
 
@@ -555,7 +570,7 @@ result, err := client.Post(url,
 )
 
 // Explicit body type — pass exactly one kind to override auto-detection
-result, err := client.Post(url, httpc.WithBody(data, httpc.BodyJSON))
+result, err = client.Post(url, httpc.WithBody(data, httpc.BodyJSON))
 result, err = client.Post(url, httpc.WithBody(data, httpc.BodyXML))
 result, err = client.Post(url, httpc.WithBody(data, httpc.BodyForm))
 result, err = client.Post(url, httpc.WithBody(data, httpc.BodyBinary))
@@ -563,7 +578,10 @@ result, err = client.Post(url, httpc.WithBody(data, httpc.BodyMultipart))
 ```
 
 > **Note:** Only one `WithBody` (or body-setting option like `WithJSON`/`WithXML`)
-> should be used per request. If multiple are passed, the last one wins.
+> should be used per request. If multiple are passed, the last one wins —
+> except `WithFile`, which **merges** into an existing `*FormData` body (a file
+> with the same field name overwrites the previous one) and only replaces the
+> body if none was set.
 
 **Auto-detection rules:**
 - `string` → text/plain; charset=utf-8
@@ -594,8 +612,10 @@ result, err = client.Post(url, httpc.WithBody(data, httpc.BodyMultipart))
 | `WithFile(field, name, content)` | Single file          | `WithFile("file", "doc.pdf", data)`     |
 | `WithFormData(fd)`               | Multipart form       | `WithFormData(&FormData{...})`          |
 | `WithTimeout(duration)`          | Request timeout      | `WithTimeout(30*time.Second)`           |
+| `WithNoTimeout()`                | Disable client-level timeout for this request (explicit `WithTimeout` and context deadlines still apply) | `WithNoTimeout()` |
 | `WithContext(ctx)`               | Request context      | `WithContext(ctx)`                      |
-| `WithMaxRetries(n)`              | Max retry attempts   | `WithMaxRetries(3)`                     |
+| `WithMaxRetries(n)`              | Max retry attempts (idempotent methods only, unless non-idempotent retry is enabled) | `WithMaxRetries(3)` |
+| `WithRetryNonIdempotent(allow)`  | Per-request override of non-idempotent retry (POST/PATCH) | `WithRetryNonIdempotent(true)` |
 | `WithCookie(cookie)`             | Add cookie           | `WithCookie(http.Cookie{Name: "n", Value: "v"})` |
 | `WithCookies(cookies)`           | Add multiple cookies | `WithCookies([]http.Cookie{...})` |
 | `WithCookieMap(cookies)`         | Add multiple cookies | `WithCookieMap(map[string]string{...})` |
@@ -610,10 +630,10 @@ result, err = client.Post(url, httpc.WithBody(data, httpc.BodyMultipart))
 
 > **`WithStreamBody` limitation:** Streaming is only effective through `Download`.
 > When used with standard request methods (Get, Post, Put, Patch, Delete, Head,
-> Options, or Request), the response body is fully read during result conversion
-> and the underlying stream is then closed. The returned `Result` therefore has
-> an **empty body**, and the stream cannot be consumed by the caller. To actually
-> stream a large body without buffering, use `Download`.
+> Options, or Request), the request fails with `ErrStreamBodyRequiresDownload`
+> (detected via `errors.Is`): those methods buffer the body into a `Result` and
+> cannot hand the stream to the caller, so an empty body would be returned
+> silently. To actually stream a large body without buffering, use `Download`.
 
 ## Best Practices
 

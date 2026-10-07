@@ -37,6 +37,13 @@ func normalizeDomain(domain string) string {
 		end--
 	}
 
+	// Strip the fully-qualified trailing dot: "example.com." is a legal FQDN
+	// spelling of "example.com" and must match a whitelist entry without the
+	// dot (the root "." alone is left untouched).
+	if end-start > 1 && domain[end-1] == '.' {
+		end--
+	}
+
 	// Check if any uppercase letters exist
 	for i := start; i < end; i++ {
 		if domain[i] >= 'A' && domain[i] <= 'Z' {
@@ -53,9 +60,31 @@ func normalizeDomain(domain string) string {
 	// Build normalized string
 	result := domain[start:end]
 	if needsLower {
-		return strings.ToLower(result)
+		return asciiToLowerDomain(result)
 	}
 	return result
+}
+
+// asciiToLowerDomain lowercases ASCII letters using a stack buffer, skipping
+// strings.ToLower's generic (Unicode-aware) scan. The lowered copy still
+// allocates — the caller needs it as a map key — but hostnames are ASCII by
+// the time they reach the whitelist (IDN names arrive punycode-encoded), so
+// the ASCII-only loop is safe and cheaper. Longer-than-buffer names (invalid
+// hostnames in practice) fall back to strings.ToLower for correctness.
+func asciiToLowerDomain(s string) string {
+	var buf [128]byte
+	if len(s) > len(buf) {
+		return strings.ToLower(s)
+	}
+	b := buf[:len(s)]
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b[i] = c
+	}
+	return string(b)
 }
 
 // NewDomainWhitelist creates a new DomainWhitelist from a list of domains.
@@ -65,6 +94,14 @@ func normalizeDomain(domain string) string {
 //     example.com (e.g. api.example.com), but NOT the bare apex example.com.
 //     To allow both the apex and its subdomains, list both explicitly:
 //     "example.com", "*.example.com".
+//
+// INVARIANT (deliberate, fail-closed): calling with NO domains returns a
+// whitelist that DENIES every host — an empty whitelist means "nothing is
+// allowed", not "everything is allowed". This differs from a nil
+// *DomainWhitelist receiver, whose IsAllowed returns true for all hosts
+// ("no whitelist configured = no restriction"). The engine only installs a
+// whitelist when the config lists at least one domain (config_convert.go),
+// preserving both semantics.
 //
 // Example:
 //

@@ -34,19 +34,32 @@ type Doer interface {
 type Client interface {
 	Doer
 
-	// Convenience methods for common HTTP verbs
+	// Convenience methods for common HTTP verbs. Each issues a request with
+	// the corresponding method and returns the buffered Result; none of them
+	// take a context — use Request for cancellation/deadline control.
+
+	// Get issues a GET request to url.
 	Get(url string, options ...RequestOption) (*Result, error)
+	// Post issues a POST request to url (non-idempotent: not retried by default).
 	Post(url string, options ...RequestOption) (*Result, error)
+	// Put issues a PUT request to url.
 	Put(url string, options ...RequestOption) (*Result, error)
+	// Patch issues a PATCH request to url (non-idempotent: not retried by default).
 	Patch(url string, options ...RequestOption) (*Result, error)
+	// Delete issues a DELETE request to url.
 	Delete(url string, options ...RequestOption) (*Result, error)
+	// Head issues a HEAD request to url.
 	Head(url string, options ...RequestOption) (*Result, error)
+	// Options issues an OPTIONS request to url.
 	Options(url string, options ...RequestOption) (*Result, error)
 
 	// Download downloads a file from url to the path specified in cfg.
 	// cfg must be non-nil and cfg.FilePath must be set (ErrEmptyFilePath otherwise).
 	// Use DefaultDownloadConfig() as the starting point, then set FilePath and any
 	// of ProgressCallback / Overwrite / ResumeDownload / Checksum as needed.
+	// The download is subject to the client's Security.MaxResponseBodySize
+	// (default 10 MB); oversize bodies fail with an error, never a silent
+	// truncation — see DownloadConfig.
 	Download(ctx context.Context, url string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
 
 	// Close releases resources held by the client
@@ -60,25 +73,44 @@ type DomainClienter interface {
 	Client
 
 	// URL accessors
+
+	// URL returns the base URL this client was constructed with.
 	URL() string
+	// Domain returns the host:port of the base URL, scoping sessions and
+	// credential reuse to that exact origin.
 	Domain() string
 
 	// Session header management
+
+	// SetHeader sets a session header applied to every subsequent request.
 	SetHeader(key, value string) error
+	// SetHeaders replaces all session headers with the given map.
 	SetHeaders(headers map[string]string) error
+	// DeleteHeader removes one session header.
 	DeleteHeader(key string)
+	// ClearHeaders removes all session headers.
 	ClearHeaders()
+	// GetHeaders returns a copy of the current session headers.
 	GetHeaders() map[string]string
 
 	// Session cookie management
+
+	// SetCookie adds a cookie to the domain session.
 	SetCookie(cookie *http.Cookie) error
+	// SetCookies adds multiple cookies to the domain session.
 	SetCookies(cookies []*http.Cookie) error
+	// DeleteCookie removes one session cookie by name.
 	DeleteCookie(name string)
+	// ClearCookies removes all session cookies.
 	ClearCookies()
+	// GetCookies returns the session cookies.
 	GetCookies() []*http.Cookie
+	// GetCookie returns one session cookie by name, or nil.
 	GetCookie(name string) *http.Cookie
 
 	// Session access
+
+	// Session returns the underlying SessionManager for direct inspection.
 	Session() *SessionManager
 }
 
@@ -119,14 +151,26 @@ type clientImpl struct {
 //	// Use preset configuration
 //	client, err := httpc.New(httpc.SecureConfig())
 func New(cfg Config) (Client, error) {
+	cfg, err := validatedCopy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return newFromConfig(cfg)
+}
+
+// validatedCopy runs the constructor pipeline shared by New and NewDomain:
+// validate, deep-copy (callers may reuse their Config), and pre-parse the
+// SSRF exemption CIDRs. Keeping the sequence in one place prevents the two
+// constructors from drifting apart when a step is added.
+func validatedCopy(cfg Config) (Config, error) {
 	if err := ValidateConfig(&cfg); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
+		return Config{}, fmt.Errorf("invalid configuration: %w", err)
 	}
 	cfg = copyConfig(cfg)
 	if err := cfg.parseSSRFExemptCIDRs(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
+		return Config{}, fmt.Errorf("invalid configuration: %w", err)
 	}
-	return newFromConfig(cfg)
+	return cfg, nil
 }
 
 // NewDefault creates a new HTTP client with default configuration.
@@ -151,7 +195,12 @@ func newFromConfig(cfg Config) (Client, error) {
 	}
 
 	// Warn if InsecureSkipVerify is enabled outside test environment.
-	if cfg.Security.InsecureSkipVerify && !isTestEnvironment() {
+	// Check both the top-level flag and a custom TLSConfig that sets it —
+	// otherwise a Security.TLSConfig{InsecureSkipVerify: true} silently
+	// disables verification with no warning.
+	insecureVerify := cfg.Security.InsecureSkipVerify ||
+		(cfg.Security.TLSConfig != nil && cfg.Security.TLSConfig.InsecureSkipVerify)
+	if insecureVerify && !isTestEnvironment() {
 		insecureSkipVerifyWarnOnce.Do(func() {
 			w := getSecurityWarnOutput()
 			fmt.Fprintf(w, "[SECURITY WARNING] InsecureSkipVerify is enabled - TLS certificate verification is DISABLED\n")
@@ -254,34 +303,44 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 			reqCtx = ctx
 		}
 
-		// Read the engine-specific hooks (callbacks + per-request SSRF override) from
-		// the concrete *engine.Request. These are not part of RequestMutator (see the
-		// buildMiddlewareChain doc above), so we assert once here and forward the
-		// captured values through the option closure below. Middleware that mutates the
-		// request in place — as all built-in middlewares do — leaves req as an
-		// *engine.Request, so the assertion succeeds and the hooks are forwarded.
-		// Should a middleware replace req with a non-*engine.Request value, the
-		// assertion fails and these hooks are silently skipped; request replacement is
-		// therefore unsupported for callbacks/SSRF-override (mirrors getOrComputeSanitizedURL).
-		var onRequest func(*engine.Request) error
-		var onResponse func(*engine.Response) error
-		var allowPrivateIPs *bool
+		// The concrete *engine.Request carries engine-specific hooks (callbacks,
+		// per-request SSRF override) that are not part of RequestMutator (see the
+		// buildMiddlewareChain doc above). Apply() forwards them along with every
+		// other field when the assertion succeeds. A middleware that replaces req
+		// with a non-*engine.Request value loses them; request replacement is
+		// therefore unsupported for callbacks/SSRF-override (mirrors
+		// getOrComputeSanitizedURL).
 		engReq, isEngineReq := req.(*engine.Request)
-		if isEngineReq {
-			if cb := engReq.OnRequest(); cb != nil {
-				onRequest = cb
-			}
-			if cb := engReq.OnResponse(); cb != nil {
-				onResponse = cb
-			}
-			allowPrivateIPs = engReq.AllowPrivateIPs()
-		}
 
 		// Single option closure forwards all mutable fields from the middleware-modified request.
 		resp, err := c.engine.Request(reqCtx, req.Method(), req.URL(),
 			func(r *engine.Request) error {
-				r.SetHeaders(req.Headers())
-				r.SetQueryParams(req.QueryParams())
+				// Fast path: src is the concrete *engine.Request (all built-in
+				// middleware mutates in place). Apply is owned by the engine, so
+				// new Request fields are forwarded here by construction — the
+				// facade no longer enumerates them.
+				if isEngineReq {
+					r.Apply(engReq)
+					return nil
+				}
+				// Fallback for a middleware that replaced req with a non-*engine.Request
+				// RequestMutator: forward via the interface accessors. Callbacks and
+				// the SSRF override are unavailable in this case (see doc above).
+				//
+				// Headers and query params are passed as-is: engine
+				// SetHeaders/SetQueryParams COPY into engine-pooled maps, which
+				// is exactly what this path needs — a replacing middleware's
+				// accessors may return the engineReq's pooled maps, and copying
+				// at the engine boundary prevents the same pooled map being
+				// returned to the pool twice (double-release → concurrent map
+				// writes across future requests). No facade-side copy required;
+				// the engine setter is the single copy point.
+				if headers := req.Headers(); headers != nil {
+					r.SetHeaders(headers)
+				}
+				if qp := req.QueryParams(); qp != nil {
+					r.SetQueryParams(qp)
+				}
 				r.SetBody(req.Body())
 				r.SetTimeout(req.Timeout())
 				r.SetMaxRetries(req.MaxRetries())
@@ -292,30 +351,7 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 				if mr := req.MaxRedirects(); mr != nil {
 					r.SetMaxRedirects(mr)
 				}
-				if allowPrivateIPs != nil {
-					r.SetAllowPrivateIPs(allowPrivateIPs)
-				}
 				r.SetStreamBody(req.StreamBody())
-				// Forward pre-extracted callbacks
-				if onRequest != nil {
-					r.SetOnRequest(onRequest)
-				}
-				if onResponse != nil {
-					r.SetOnResponse(onResponse)
-				}
-				// Transfer ownership of pooled maps to the engine request to
-				// prevent double-pooling. r now holds the same headers/queryParams
-				// map pointers that engReq held; the engine's deferred putRequest
-				// will return them to headersMapPool/queryParamsPool. Nilling them
-				// on engReq here ensures the deferred releaseMiddlewareRequest
-				// (which calls putHeadersMap/putQueryParamsMap again) skips them —
-				// without this, the same map enters the pool twice and two
-				// concurrent goroutines can retrieve it simultaneously, causing a
-				// data race that leaks headers between unrelated requests.
-				if isEngineReq {
-					engReq.SetHeaders(nil)
-					engReq.SetQueryParams(nil)
-				}
 				return nil
 			})
 		if err != nil {
@@ -385,6 +421,20 @@ func (c *clientImpl) Request(ctx context.Context, method, url string, options ..
 	resp, err := c.executeRequest(ctx, method, url, options)
 	if err != nil {
 		return nil, err
+	}
+	// WithStreamBody has no effect on this path: the body is buffered into a
+	// Result below and the stream is closed by releaseResponseMutator, so the
+	// caller would silently get an empty body. Fail loudly instead and point
+	// at Download, which is the streaming entry point.
+	//
+	// The type assertion covers both the direct engine path and the middleware
+	// path (whose terminal handler returns the engine Response unwrapped). A
+	// user middleware that *wraps* the Response in its own type escapes this
+	// guard — such authors own the streaming contract (see TimeoutMiddleware
+	// for the reject-up-front pattern).
+	if engineResp, ok := resp.(*engine.Response); ok && engineResp.RawBodyReader() != nil {
+		releaseResponseMutator(resp)
+		return nil, ErrStreamBodyRequiresDownload
 	}
 	defer releaseResponseMutator(resp)
 	return convertResponseToResult(resp), nil
@@ -456,6 +506,13 @@ func (c *clientImpl) executeRequest(ctx context.Context, method, url string, opt
 	if err != nil && resp != nil {
 		releaseResponseMutator(resp)
 		return nil, err
+	}
+	// A middleware contract violation: neither a response nor an error.
+	// Without this guard the caller would receive (nil, nil), and the nil-safe
+	// Result accessors would silently report StatusCode 0 as a "success".
+	// Mirrors the defensive fallback in engine executeWithRetry.
+	if resp == nil && err == nil {
+		return nil, fmt.Errorf("middleware chain returned neither a response nor an error")
 	}
 	return resp, err
 }
@@ -593,6 +650,11 @@ func Request(ctx context.Context, method, url string, options ...RequestOption) 
 
 // SetDefaultClient sets a custom client as the default for package-level functions.
 // The previous default client is closed automatically.
+//
+// Concurrency: closing the previous default aborts any requests still in
+// flight on it — goroutines that already resolved the old client may observe
+// connection errors. Swap the default only at startup or during a quiescent
+// window, never under live traffic.
 // Only *clientImpl instances created by this package are supported.
 // Returns an error if client is nil, not created by this package, or already closed.
 func SetDefaultClient(client Client) error {
@@ -681,6 +743,7 @@ func convertResponseToResult(resp ResponseMutator) *Result {
 	// Fall back to clone for middleware-wrapped ResponseMutator.
 	if engineResp, ok := resp.(*engine.Response); ok {
 		result.Response.Headers = engineResp.TransferHeaders()
+		b.meta.ProxyURL = engineResp.ProxyURL()
 	} else {
 		result.Response.Headers = cloneHeaders(resp.Headers())
 	}
@@ -715,12 +778,12 @@ func cloneHeaders(h http.Header) http.Header {
 	return engine.CloneHeader(h)
 }
 
-func createCookieJar(enableCookies bool) (http.CookieJar, error) {
+func createCookieJar(enableCookies bool, psl cookiejar.PublicSuffixList) (http.CookieJar, error) {
 	if !enableCookies {
 		return nil, nil
 	}
 	jar, err := cookiejar.New(&cookiejar.Options{
-		PublicSuffixList: nil,
+		PublicSuffixList: psl,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to create cookie jar: %w", err)

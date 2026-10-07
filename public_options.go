@@ -24,7 +24,7 @@ import (
 func WithHeader(key, value string) RequestOption {
 	return func(r *engine.Request) error {
 		if err := validation.ValidateHeaderKeyValue(key, value); err != nil {
-			return fmt.Errorf("invalid header: %w", err)
+			return fmt.Errorf("%w: %w", ErrInvalidHeader, err)
 		}
 		r.SetHeader(key, value)
 		return nil
@@ -36,11 +36,13 @@ func WithHeader(key, value string) RequestOption {
 // (CRLF injection prevention).
 func WithHeaderMap(headers map[string]string) RequestOption {
 	return func(r *engine.Request) error {
-		for k, v := range headers {
-			if err := validation.ValidateHeaderKeyValue(k, v); err != nil {
-				return fmt.Errorf("invalid header %q: %w", k, err)
+		// Validate in sorted key order so the reported offending key is
+		// deterministic regardless of map iteration order.
+		for _, k := range sortedKeys(headers) {
+			if err := validation.ValidateHeaderKeyValue(k, headers[k]); err != nil {
+				return fmt.Errorf("%w %q: %w", ErrInvalidHeader, k, err)
 			}
-			r.SetHeader(k, v)
+			r.SetHeader(k, headers[k])
 		}
 		return nil
 	}
@@ -53,18 +55,18 @@ func WithUserAgent(userAgent string) RequestOption {
 }
 
 // WithBasicAuth sets HTTP Basic Authentication using the provided username and password.
-// Returns an error if username is empty, or if username or password exceeds the maximum
-// length or contains invalid characters.
+// Returns ErrInvalidCredentials if username is empty, or if username or password
+// exceeds the maximum length or contains invalid characters.
 func WithBasicAuth(username, password string) RequestOption {
 	return func(r *engine.Request) error {
 		if username == "" {
-			return fmt.Errorf("username cannot be empty")
+			return fmt.Errorf("%w: username cannot be empty", ErrInvalidCredentials)
 		}
 		if err := validation.ValidateCredential(username, validation.MaxCredLen, true, "username"); err != nil {
-			return fmt.Errorf("invalid username: %w", err)
+			return fmt.Errorf("%w: invalid username: %w", ErrInvalidCredentials, err)
 		}
 		if err := validation.ValidateCredential(password, validation.MaxCredLen, false, "password"); err != nil {
-			return fmt.Errorf("invalid password: %w", err)
+			return fmt.Errorf("%w: invalid password: %w", ErrInvalidCredentials, err)
 		}
 
 		// Efficient string concatenation and encoding
@@ -75,14 +77,14 @@ func WithBasicAuth(username, password string) RequestOption {
 }
 
 // WithBearerToken sets the Authorization header to "Bearer <token>".
-// Returns an error if token is empty or fails token format validation.
+// Returns ErrInvalidCredentials if token is empty or fails token format validation.
 func WithBearerToken(token string) RequestOption {
 	return func(r *engine.Request) error {
 		if token == "" {
-			return fmt.Errorf("token cannot be empty")
+			return fmt.Errorf("%w: token cannot be empty", ErrInvalidCredentials)
 		}
 		if err := validation.ValidateToken(token); err != nil {
-			return fmt.Errorf("invalid token: %w", err)
+			return fmt.Errorf("%w: invalid token: %w", ErrInvalidCredentials, err)
 		}
 
 		r.SetHeader("Authorization", "Bearer "+token)
@@ -122,7 +124,10 @@ func WithQueryMap(params map[string]any) RequestOption {
 	return func(r *engine.Request) error {
 		existing := r.EnsureQueryParams()
 
-		for k, v := range params {
+		// Validate in sorted key order so the reported offending key is
+		// deterministic regardless of map iteration order (see WithHeaderMap).
+		for _, k := range sortedKeys(params) {
+			v := params[k]
 			if err := validation.ValidateQueryKey(k); err != nil {
 				return fmt.Errorf("invalid key %s: %w", k, err)
 			}
@@ -513,14 +518,17 @@ func validateFormField(key, value string) error {
 // Handles both map[string]string and url.Values to ensure consistent
 // validation regardless of the input type used. Rejects nil inputs so that
 // validation (not encoding) is the single gatekeeper for invalid data.
+// Fields are validated in sorted key order so the reported offending field is
+// deterministic regardless of map iteration order (see WithHeaderMap).
 func validateFormInput(data any) error {
 	switch v := data.(type) {
 	case map[string]string:
 		if v == nil {
 			return fmt.Errorf("form data cannot be nil")
 		}
-		for k, val := range v {
-			if err := validateFormField(k, val); err != nil {
+		keys := sortedKeys(v)
+		for _, k := range keys {
+			if err := validateFormField(k, v[k]); err != nil {
 				return err
 			}
 		}
@@ -528,13 +536,14 @@ func validateFormInput(data any) error {
 		if v == nil {
 			return fmt.Errorf("form data cannot be nil")
 		}
-		for k, vals := range v {
+		keys := sortedKeys(v)
+		for _, k := range keys {
 			// Validate the key once (covers the case of a key with no values,
 			// which the per-value loop below would skip).
 			if err := validateFormKey(k); err != nil {
 				return err
 			}
-			for _, val := range vals {
+			for _, val := range v[k] {
 				if err := validateFormValue(k, val); err != nil {
 					return err
 				}
@@ -546,8 +555,33 @@ func validateFormInput(data any) error {
 	return nil
 }
 
+// sortedKeys returns the keys of m in ascending order. Shared by the
+// sorted-validation paths (WithHeaderMap, WithQueryMap, WithCookieMap,
+// validateFormInput, SessionManager.SetHeaders) so the first offending key
+// reported is stable across runs.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
 // WithFormData sets the request body as multipart/form-data.
 // This is a convenience method; the equivalent is WithBody(data, BodyMultipart).
+//
+// Concurrency: the *FormData is used as-is, not copied. A single FormData
+// value must not be shared across concurrently executing requests — the
+// WithFile option mutates its Files map in place, and concurrent requests
+// sharing one value would race on that map.
+//
+// Validation: field names, filenames, and per-file ContentType values
+// containing control characters (CR/LF/NUL/DEL, etc.) are rejected — they
+// would otherwise allow MIME header injection in the outgoing body. The same
+// check runs at the encoding layer, so a FormData constructed directly (not
+// via WithFile) is subject to identical limits. A nil *FileData map entry
+// fails the request rather than silently dropping the file.
 // Returns an error if data is nil.
 func WithFormData(data *FormData) RequestOption {
 	return func(r *engine.Request) error {
@@ -560,6 +594,11 @@ func WithFormData(data *FormData) RequestOption {
 }
 
 // WithFile adds a file upload to the request as multipart/form-data.
+// Multiple WithFile options merge their files into a single multipart body;
+// the same field name is overwritten. Any non-form body set earlier is replaced.
+// The merge mutates the request's existing *FormData in place — see the
+// WithFormData doc for why a FormData value must not be shared across
+// concurrent requests.
 // Returns an error if fieldName or filename is empty, contains invalid characters,
 // or resolves to an invalid path (e.g., ".." or ".").
 func WithFile(fieldName, filename string, content []byte) RequestOption {
@@ -582,15 +621,26 @@ func WithFile(fieldName, filename string, content []byte) RequestOption {
 			return fmt.Errorf("invalid filename")
 		}
 
-		r.SetBody(&FormData{
-			Fields: make(map[string]string, 1), // Pre-allocate for typical case
-			Files: map[string]*FileData{
-				fieldName: {
-					Filename: cleanFilename,
-					Content:  content,
+		// Merge into an existing FormData body so multiple WithFile options
+		// upload together; any other body type is replaced as before.
+		if existing, ok := r.Body().(*FormData); ok {
+			if existing.Files == nil {
+				existing.Files = make(map[string]*FileData, 1)
+			}
+			existing.Files[fieldName] = &FileData{
+				Filename: cleanFilename,
+				Content:  content,
+			}
+		} else {
+			r.SetBody(&FormData{
+				Files: map[string]*FileData{
+					fieldName: {
+						Filename: cleanFilename,
+						Content:  content,
+					},
 				},
-			},
-		})
+			})
+		}
 		return nil
 	}
 }
@@ -625,12 +675,51 @@ func WithContext(ctx context.Context) RequestOption {
 
 // WithMaxRetries sets the maximum number of retry attempts for this request.
 // Returns ErrInvalidRetry if maxRetries is negative or exceeds 10.
+//
+// Note: retrying follows the client's idempotency policy — non-idempotent
+// methods (POST, PATCH, custom) are not retried unless the client sets
+// Retry.RetryNonIdempotent or this request passes WithRetryNonIdempotent(true);
+// in that case MaxRetries only bounds idempotent requests.
 func WithMaxRetries(maxRetries int) RequestOption {
 	return func(r *engine.Request) error {
 		if maxRetries < 0 || maxRetries > maxRetryAttempts {
 			return fmt.Errorf("%w: must be 0-%d, got %d", ErrInvalidRetry, maxRetryAttempts, maxRetries)
 		}
 		r.SetMaxRetries(maxRetries)
+		return nil
+	}
+}
+
+// WithRetryNonIdempotent overrides, for this single request, whether
+// non-idempotent methods (POST, PATCH, custom methods) may be retried. It
+// takes precedence over the client-level Retry.RetryNonIdempotent setting in
+// both directions: WithRetryNonIdempotent(true) retries a POST on a
+// client that otherwise forbids it, and WithRetryNonIdempotent(false) pins a
+// single attempt on a client that allows it.
+//
+// SAFETY: enabling retries for a non-idempotent request means a timeout or
+// retryable 5xx may cause the request body to be sent more than once. Only
+// use it against endpoints that tolerate replay (or protect them with an
+// idempotency key). See RetryConfig.RetryNonIdempotent for the default policy.
+func WithRetryNonIdempotent(allow bool) RequestOption {
+	return func(r *engine.Request) error {
+		r.SetRetryNonIdempotent(&allow)
+		return nil
+	}
+}
+
+// WithNoTimeout disables the client-level request timeout (Config.Timeouts.Request)
+// for this single request, allowing it to run as long as the server takes.
+// It does not affect dial/TLS/response-header timeouts, and two limits still
+// apply: an explicit WithTimeout on the same request, and any deadline on the
+// caller-provided context (via WithContext or the ctx parameter) are always
+// honored.
+//
+// Use for long-running calls (large uploads/downloads, slow reports) on a
+// client whose default timeout would otherwise cut them off.
+func WithNoTimeout() RequestOption {
+	return func(r *engine.Request) error {
+		r.SetNoTimeout(true)
 		return nil
 	}
 }
@@ -679,10 +768,9 @@ func WithAllowPrivateIPs(allow bool) RequestOption {
 // IMPORTANT: streaming is only effective through Download (and any other path
 // that consumes the engine Response directly). When used with the standard
 // request methods — Get, Post, Put, Patch, Delete, Head, Options, or Request —
-// the response is converted to a Result whose body is fully read, and the
-// underlying stream is then closed by the deferred response release. The
-// returned Result therefore has an empty body, and the stream cannot be
-// consumed by the caller. To actually stream a large body without buffering,
+// the request fails with ErrStreamBodyRequiresDownload: those methods buffer
+// the body into a Result and cannot hand the stream to the caller, so an empty
+// body would be returned silently. To stream a large body without buffering,
 // use Download.
 func WithStreamBody(stream bool) RequestOption {
 	return func(r *engine.Request) error {
@@ -692,19 +780,22 @@ func WithStreamBody(stream bool) RequestOption {
 }
 
 // WithMaxRedirects sets the maximum number of redirects to follow for this request.
-// Returns an error if maxRedirects is negative or exceeds 50.
+// Returns ErrInvalidMaxRedirects if maxRedirects is negative or exceeds 50.
 //
 // Note: a value of 0 does NOT disable redirects. The engine treats 0 as the
 // "not explicitly set" sentinel and falls back to the default limit (10), so
 // WithMaxRedirects(0) is equivalent to omitting the option. To disable redirect
 // following entirely, use WithFollowRedirects(false) instead.
+//
+// Counting matches net/http: the limit includes the initial request, so
+// WithMaxRedirects(n) follows at most n-1 redirects (the default 10 follows 9).
 func WithMaxRedirects(maxRedirects int) RequestOption {
 	return func(r *engine.Request) error {
 		if maxRedirects < 0 {
-			return fmt.Errorf("maxRedirects cannot be negative")
+			return fmt.Errorf("%w: cannot be negative, got %d", ErrInvalidMaxRedirects, maxRedirects)
 		}
 		if maxRedirects > maxRedirectLimit {
-			return fmt.Errorf("maxRedirects exceeds maximum %d", maxRedirectLimit)
+			return fmt.Errorf("%w: exceeds maximum %d", ErrInvalidMaxRedirects, maxRedirectLimit)
 		}
 		r.SetMaxRedirects(&maxRedirects)
 		return nil
@@ -712,19 +803,23 @@ func WithMaxRedirects(maxRedirects int) RequestOption {
 }
 
 // WithBinary sets binary data as the request body with an optional content type.
-// Returns an error if data is nil.
+// Returns an error if data is empty (nil or zero length — matching
+// WithBody(BodyBinary)) or the content type contains invalid characters.
 func WithBinary(data []byte, contentType ...string) RequestOption {
 	return func(r *engine.Request) error {
-		if data == nil {
-			return fmt.Errorf("binary data cannot be nil")
+		if len(data) == 0 {
+			return fmt.Errorf("binary data cannot be empty")
 		}
-
-		r.SetBody(data)
 
 		ct := "application/octet-stream"
 		if len(contentType) > 0 && contentType[0] != "" {
 			ct = contentType[0]
 		}
+		if err := validation.ValidateHeaderKeyValue("Content-Type", ct); err != nil {
+			return fmt.Errorf("invalid content type: %w", err)
+		}
+
+		r.SetBody(data)
 		r.SetHeader("Content-Type", ct)
 		return nil
 	}
@@ -746,9 +841,12 @@ func WithCookie(cookie http.Cookie) RequestOption {
 }
 
 // ensureCookieCapacity grows the slice if needed to accommodate additional entries.
+// The minimum capacity of 4 avoids the 0→1→2→4 regrowth when cookies are added
+// one at a time via WithCookie (the per-request slice starts empty every time).
 func ensureCookieCapacity(existing []http.Cookie, additional int) []http.Cookie {
 	if cap(existing) < len(existing)+additional {
-		grown := make([]http.Cookie, len(existing), len(existing)+additional)
+		newCap := max(len(existing)+additional, 4)
+		grown := make([]http.Cookie, len(existing), newCap)
 		copy(grown, existing)
 		return grown
 	}
@@ -817,10 +915,13 @@ func WithCookieMap(cookies map[string]string) RequestOption {
 
 		existing := ensureCookieCapacity(r.Cookies(), len(cookies))
 
-		for name, value := range cookies {
+		// Iterate in sorted name order so both the reported offending cookie
+		// and the resulting Cookie header order are deterministic regardless
+		// of map iteration order (see WithHeaderMap).
+		for _, name := range sortedKeys(cookies) {
 			cookie := http.Cookie{
 				Name:  name,
-				Value: value,
+				Value: cookies[name],
 			}
 			if err := validation.ValidateCookie(&cookie); err != nil {
 				return fmt.Errorf("invalid cookie %s: %w", name, err)

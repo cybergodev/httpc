@@ -167,6 +167,14 @@ func (e *ClientError) WithType(t ErrorType) *ClientError {
 }
 
 // IsRetryable determines if the error is retryable based on its type and cause.
+//
+// Scope: this consults the built-in retry classification only (error type,
+// cause, and the built-in retryable HTTP status table). The retry ENGINE
+// additionally honors Connection.ExtraRetryableStatusCodes, so for a status
+// code configured there, the engine may retry a request whose ClientError
+// reports IsRetryable() == false. Treat this method as "retryable under the
+// default policy", not as a prediction of the engine's behavior for custom
+// status codes.
 func (e *ClientError) IsRetryable() bool {
 	// Check for context errors first - they are never retryable
 	if e.isContextError() {

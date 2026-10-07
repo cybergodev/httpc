@@ -2,6 +2,7 @@
 package proxy
 
 import (
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,7 +19,6 @@ type Detector struct {
 
 type proxyConfig struct {
 	proxyFunc func(*http.Request) (*url.URL, error)
-	enabled   bool
 }
 
 // NewDetector creates a new system proxy detector
@@ -51,7 +51,6 @@ func (d *Detector) GetProxyFunc() func(*http.Request) (*url.URL, error) {
 	proxyFunc := d.detect()
 	d.cache = &proxyConfig{
 		proxyFunc: proxyFunc,
-		enabled:   proxyFunc != nil,
 	}
 	d.cacheMu.Unlock()
 
@@ -76,6 +75,10 @@ func (d *Detector) detectFromEnvironment() func(*http.Request) (*url.URL, error)
 	httpProxy := getEnvAny("HTTP_PROXY", "http_proxy")
 	httpsProxy := getEnvAny("HTTPS_PROXY", "https_proxy")
 	noProxy := getEnvAny("NO_PROXY", "no_proxy")
+	// Capture the CGI indicator once: REQUEST_METHOD is fixed for the process
+	// lifetime, and reading os.Getenv per request both costs a syscall and
+	// races with any concurrent os.Setenv by the host application.
+	inCGI := os.Getenv("REQUEST_METHOD") != ""
 
 	if httpProxy == "" && httpsProxy == "" {
 		return nil
@@ -87,14 +90,19 @@ func (d *Detector) detectFromEnvironment() func(*http.Request) (*url.URL, error)
 
 	return func(req *http.Request) (*url.URL, error) {
 		// Don't use proxies in a CGI environment, matching net/http behavior.
-		if os.Getenv("REQUEST_METHOD") != "" {
+		if inCGI {
 			return nil, nil
 		}
 
 		host := req.URL.Hostname()
 
-		// localhost is always direct, matching net/http behavior.
+		// localhost and loopback IPs are always direct, matching net/http
+		// behavior (x/net httpproxy exempts net.IP.IsLoopback in addition to
+		// the literal hostname).
 		if host == "localhost" {
+			return nil, nil
+		}
+		if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 			return nil, nil
 		}
 
@@ -105,24 +113,31 @@ func (d *Detector) detectFromEnvironment() func(*http.Request) (*url.URL, error)
 
 		// Select proxy URL, matching net/http's resolution order:
 		// HTTPS requests prefer HTTPS_PROXY, falling back to HTTP_PROXY.
-		// Other requests use HTTP_PROXY only.
-		if req.URL.Scheme == "https" && httpsURL != nil {
+		// Other requests use HTTP_PROXY only (an invalid HTTPS_PROXY does not
+		// affect plain-HTTP requests — same as ProxyFromEnvironment).
+		//
+		// A proxy env var that is SET but INVALID must surface its parse
+		// error for the schemes it governs rather than silently
+		// direct-connecting — net/http's ProxyFromEnvironment does the same.
+		// (The previous error checks sat inside the `!= nil` branches where
+		// they were unreachable, so an invalid HTTPS_PROXY silently disabled
+		// proxying for HTTPS traffic.)
+		if req.URL.Scheme == "https" {
+			if httpsURL != nil {
+				return httpsURL, nil
+			}
 			if httpsErr != nil {
 				return nil, httpsErr
 			}
-			return httpsURL, nil
 		}
 		if httpURL != nil {
-			if httpErr != nil {
-				return nil, httpErr
-			}
 			return httpURL, nil
+		}
+		if httpErr != nil {
+			return nil, httpErr
 		}
 		// Fall back to HTTPS proxy for non-HTTPS requests.
 		if httpsURL != nil {
-			if httpsErr != nil {
-				return nil, httpsErr
-			}
 			return httpsURL, nil
 		}
 
@@ -140,15 +155,52 @@ func getEnvAny(names ...string) string {
 	return ""
 }
 
+// isLoopbackRequest reports whether the request targets localhost or a
+// loopback IP. Platform-detected proxies (Windows registry, macOS
+// networksetup) bypass such requests, matching net/http behavior and the
+// environment-variable path above — without this, an enterprise system proxy
+// would route http://127.0.0.1/health calls through the corporate proxy,
+// breaking local calls and disclosing internal URLs to the proxy.
+func isLoopbackRequest(req *http.Request) bool {
+	host := req.URL.Hostname()
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
 // parseProxyURL parses a proxy URL string, normalizing bare host:port values
 // by prepending "http://" when no recognizable scheme is present.
 func parseProxyURL(proxy string) (*url.URL, error) {
 	if proxy == "" {
 		return nil, nil
 	}
+	// Normalize the bare "socks" scheme to "socks5" (same as the Windows
+	// registry path): net/http recognizes socks5/socks5h but not "socks://".
+	if after, ok := strings.CutPrefix(proxy, "socks://"); ok {
+		proxy = "socks5://" + after
+	}
+	// Scheme allow-list matches validation.ValidateProxyURL exactly (the
+	// previous prefix check accepted "httpx://"/"socks4://", deferring failure
+	// to a per-request transport error instead of a clear detection-time one).
+	// Only values carrying an explicit "://" are treated as schemed — a bare
+	// "host:port" like "proxy:3128" parses with the hostname in the scheme
+	// position and must keep the http fallback below.
+	if i := strings.Index(proxy, "://"); i > 0 {
+		scheme := strings.ToLower(proxy[:i])
+		switch scheme {
+		case "http", "https", "socks5", "socks5h":
+		default:
+			return nil, fmt.Errorf("unsupported proxy scheme %q", scheme)
+		}
+	}
 	u, err := url.Parse(proxy)
 	if err == nil && u != nil {
-		if strings.HasPrefix(u.Scheme, "http") || strings.HasPrefix(u.Scheme, "socks") {
+		switch u.Scheme {
+		case "http", "https", "socks5", "socks5h":
 			return u, nil
 		}
 	}

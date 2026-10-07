@@ -19,6 +19,9 @@ It's important to understand the difference:
 result, err := client.Get("https://api.example.com",
     httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"}),  // Request cookie
 )
+if err != nil {
+    log.Fatal(err) // Result is nil on error — check err first
+}
 
 // Response cookies (from server's Set-Cookie header)
 for _, cookie := range result.Response.Cookies {
@@ -40,6 +43,9 @@ result, err := client.Get("https://api.example.com",
     httpc.WithHeader("X-API-Key", "secret"),
     httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"}),
 )
+if err != nil {
+    log.Fatal(err) // Result is nil on error — check err first
+}
 
 // Access all request headers
 for name, values := range result.Request.Headers {
@@ -62,10 +68,17 @@ result, err := client.Get("https://api.example.com",
     httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"}),
     httpc.WithCookie(http.Cookie{Name: "token", Value: "xyz789"}),
 )
+if err != nil {
+    log.Fatal(err)
+}
 
 // Get raw Cookie header
 cookieHeader := result.Request.Headers.Get("Cookie")
 fmt.Println(cookieHeader)  // Output: session=abc123; token=xyz789
+
+// SECURITY: never log the raw Cookie header in production code —
+// session tokens are credentials. Use it for debugging only, or mask it:
+// fmt.Println("Cookie header present:", cookieHeader != "")
 ```
 
 ### Method 2: Using Result Methods (Recommended)
@@ -90,6 +103,27 @@ if result.HasRequestCookie("session") {
     fmt.Println("Session cookie was sent")
 }
 ```
+
+## Inspecting the Proxy Used
+
+When a proxy is configured (`Connection.ProxyURL` or `Connection.ProxyPool`),
+`Result.Meta.ProxyURL` reports which proxy served the request. With a proxy
+pool this identifies the exact pool entry that produced the final response,
+so rotation can be verified per request:
+
+```go
+result, err := client.Get("https://httpbin.org/ip")
+if err != nil {
+    log.Fatal(err)
+}
+
+// Empty string means the request went out directly (no proxy)
+fmt.Printf("Served by proxy: %s\n", result.Meta.ProxyURL)
+```
+
+With retries each attempt may use a different proxy; `ProxyURL` reflects the
+attempt that produced the returned response (see `Meta.Attempts`). It is
+always empty for direct connections.
 
 ## Result Methods
 
@@ -145,10 +179,17 @@ Log complete request information for debugging:
 result, err := client.Get("https://api.example.com",
     httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"}),
 )
+if err != nil {
+    log.Fatal(err) // Result is nil on error — check err first
+}
 
 log.Printf("Request URL: %s", result.Request.URL)
 log.Printf("User-Agent: %s", result.Request.Headers.Get("User-Agent"))
-log.Printf("Cookies sent: %s", result.Request.Headers.Get("Cookie"))
+
+// SECURITY: avoid logging raw credential headers (Cookie, Authorization).
+// The inspection API returns them verbatim by design — that power is yours
+// to use carefully. Prefer a presence check or a masked form:
+log.Printf("Cookies sent: %d", len(result.Request.Cookies))
 ```
 
 ### 3. Verifying Cookie Jar Behavior
@@ -158,13 +199,22 @@ Check that cookie jar is working correctly:
 ```go
 config := httpc.DefaultConfig()
 config.Connection.EnableCookies = true
-client, _ := httpc.New(config)
+client, err := httpc.New(config)
+if err != nil {
+    log.Fatal(err)
+}
 
 // First request - server sets cookie
-result1, _ := client.Get("https://api.example.com/login")
+_, err = client.Get("https://api.example.com/login")
+if err != nil {
+    log.Fatal(err)
+}
 
 // Second request - verify cookie jar sent the cookie
-result2, _ := client.Get("https://api.example.com/profile")
+result2, err := client.Get("https://api.example.com/profile")
+if err != nil {
+    log.Fatal(err)
+}
 
 if result2.HasRequestCookie("session") {
     fmt.Println("Cookie jar is working!")
@@ -179,6 +229,9 @@ Compare what you sent vs what you received:
 result, err := client.Get("https://api.example.com",
     httpc.WithCookie(http.Cookie{Name: "client_cookie", Value: "value1"}),
 )
+if err != nil {
+    log.Fatal(err) // Result is nil on error — check err first
+}
 
 fmt.Println("Sent to server:")
 for _, cookie := range result.Request.Cookies {
@@ -279,6 +332,7 @@ func main() {
 |-------|------|-------------|
 | `Duration` | `time.Duration` | Total request duration |
 | `Attempts` | `int` | Number of attempts (including retries) |
+| `ProxyURL` | `string` | Proxy that served the final attempt (`""` = direct connection) |
 | `RedirectChain` | `[]string` | URLs visited during redirects |
 | `RedirectCount` | `int` | Number of redirects followed |
 

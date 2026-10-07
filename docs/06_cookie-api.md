@@ -17,7 +17,7 @@ Quick reference for working with cookies in httpc.
 
 Methods to access cookies returned by the server via `Set-Cookie` header:
 
-| Method | Description | Example |
+| API | Description | Example |
 |--------|-------------|---------|
 | `result.Response.Cookies` | All response cookies | `for _, c := range result.Response.Cookies { ... }` |
 | `result.ResponseCookies()` | All response cookies (method) | `cookies := result.ResponseCookies()` |
@@ -28,7 +28,7 @@ Methods to access cookies returned by the server via `Set-Cookie` header:
 
 Methods to inspect cookies that were sent in the request via `Cookie` header:
 
-| Method | Description | Example |
+| API | Description | Example |
 |--------|-------------|---------|
 | `result.Request.Cookies` | All request cookies | `for _, c := range result.Request.Cookies { ... }` |
 | `result.RequestCookies()` | All request cookies (method) | `cookies := result.RequestCookies()` |
@@ -138,6 +138,27 @@ result, err := client.Get(url,
 result, err := client.Get(url,
     httpc.WithCookieString("session=abc123; token=xyz789; user_id=12345"),
 )
+
+// Method 5: Batch slice (single validation pass — preferred over repeated WithCookie)
+result, err := client.Get(url,
+    httpc.WithCookies([]http.Cookie{
+        {Name: "cookie1", Value: "value1"},
+        {Name: "cookie2", Value: "value2"},
+    }),
+)
+
+// Method 6: With security attribute validation
+// (WithSecureCookie validates cookies added so far — place it AFTER the cookie options)
+result, err := client.Get(url,
+    httpc.WithCookie(http.Cookie{
+        Name:     "session",
+        Value:    "abc123",
+        Secure:   true,
+        HttpOnly: true,
+        SameSite: http.SameSiteStrictMode,
+    }),
+    httpc.WithSecureCookie(httpc.StrictCookieSecurityConfig()),
+)
 ```
 
 ## Cookie Jar (Automatic Cookie Management)
@@ -147,6 +168,9 @@ Enable cookie jar for automatic cookie persistence:
 ```go
 config := httpc.DefaultConfig()
 config.Connection.EnableCookies = true
+// Recommended: attach a public-suffix list so the jar rejects cookies set on
+// public suffixes (e.g. Domain=com supercookies) — pass
+// golang.org/x/net/publicsuffix.List as Connection.PublicSuffixList.
 client, err := httpc.New(config)
 if err != nil {
     log.Fatal(err)
@@ -252,11 +276,14 @@ for _, name := range requiredCookies {
 
 ## API Design
 
-All cookie inspection methods are available as Result methods for clean, intuitive API:
+Cookie data is exposed both as nested `Result` fields and as nil-safe `Result` methods:
 
 ```go
-// Result methods
-cookies := result.Request.Cookies
+// Nested fields (parsed cookie slices — nil-check the parent on error results)
+requestCookies := result.Request.Cookies
+responseCookies := result.Response.Cookies
+
+// Result methods (nil-safe accessors)
 cookie := result.GetRequestCookie("session")
 exists := result.HasRequestCookie("session")
 ```
@@ -272,8 +299,11 @@ exists := result.HasRequestCookie("session")
 For cross-request cookie persistence without a cookie jar, use `SessionManager`:
 
 ```go
-// Create a session manager
-session, err := httpc.NewSessionManagerDefault()
+// Create a session manager with strict cookie security
+// (or simply: session, err := httpc.NewSessionManagerDefault())
+config := httpc.DefaultSessionConfig()
+config.CookieSecurity = httpc.StrictCookieSecurityConfig()
+session, err := httpc.NewSessionManager(config)
 if err != nil {
     log.Fatal(err)
 }
@@ -292,13 +322,9 @@ if err := session.SetCookies([]*http.Cookie{
 allCookies := session.GetCookies()
 singleCookie := session.GetCookie("session")
 
-// Update session from a response
+// After a request, persist cookies received in the response
+// (result is the *httpc.Result returned by client.Get/Post/...)
 session.UpdateFromResult(result)
-
-// Cookie security validation
-config := httpc.DefaultSessionConfig()
-config.CookieSecurity = httpc.StrictCookieSecurityConfig()
-session, err := httpc.NewSessionManager(config)
 
 // Remove cookies
 session.DeleteCookie("session")

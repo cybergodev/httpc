@@ -2,10 +2,13 @@ package engine
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
+	"maps"
 	"mime/multipart"
 	"net/http"
 	"net/textproto"
@@ -13,10 +16,334 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/cybergodev/httpc/internal/types"
 	"github.com/cybergodev/httpc/internal/validation"
 )
+
+// maxRetriesUnset is the sentinel value for "not configured — use default".
+// Request.maxRetries is initialized to this value in pool New functions.
+const maxRetriesUnset = -1
+
+// headersMapPool reduces allocations for the per-request headers map (map[string]string).
+// Pooled maps are cleared before reuse and must not exceed 32 entries to prevent bloat.
+// Stores the map value directly: boxing a map into any is allocation-free, whereas
+// storing &m would force the parameter to escape (see httpHeaderPool for details).
+var headersMapPool = sync.Pool{
+	New: func() any {
+		return make(map[string]string, 4)
+	},
+}
+
+// queryParamsPool reduces allocations for the per-request query params map (map[string]any).
+// Pooled maps are cleared before reuse and must not exceed 32 entries to prevent bloat.
+var queryParamsPool = sync.Pool{
+	New: func() any {
+		return make(map[string]any, 4)
+	},
+}
+
+func getHeadersMap() map[string]string {
+	m, ok := headersMapPool.Get().(map[string]string)
+	if !ok || m == nil {
+		return make(map[string]string, 4)
+	}
+	return m
+}
+
+func putHeadersMap(m map[string]string) {
+	if m == nil || len(m) > 32 {
+		return
+	}
+	for k := range m {
+		delete(m, k)
+	}
+	headersMapPool.Put(m)
+}
+
+func getQueryParamsMap() map[string]any {
+	m, ok := queryParamsPool.Get().(map[string]any)
+	if !ok || m == nil {
+		return make(map[string]any, 4)
+	}
+	return m
+}
+
+func putQueryParamsMap(m map[string]any) {
+	if m == nil || len(m) > 32 {
+		return
+	}
+	for k := range m {
+		delete(m, k)
+	}
+	queryParamsPool.Put(m)
+}
+
+// requestPool is a typed pool for Request objects that eliminates
+// repetitive get/put/zeroing boilerplate.
+type requestPool struct {
+	pool sync.Pool
+}
+
+func newRequestPool() requestPool {
+	return requestPool{
+		pool: sync.Pool{
+			New: func() any {
+				return &Request{maxRetries: maxRetriesUnset}
+			},
+		},
+	}
+}
+
+func (p *requestPool) get() *Request {
+	req, ok := p.pool.Get().(*Request)
+	if !ok || req == nil {
+		return &Request{maxRetries: maxRetriesUnset}
+	}
+	return req
+}
+
+// resetRequest clears every field of a pooled Request and returns its pooled
+// maps. Both requestPool.put and ReleaseRequest must go through here so a
+// future Request field is reset in exactly one place.
+func resetRequest(req *Request) {
+	putHeadersMap(req.headers)
+	putQueryParamsMap(req.queryParams)
+	*req = Request{maxRetries: maxRetriesUnset}
+}
+
+func (p *requestPool) put(req *Request) {
+	resetRequest(req)
+	p.pool.Put(req)
+}
+
+// sharedRequestPool is a global pool for Request objects used by external packages
+// (httpc middleware path, session capture). Consolidating into a single pool improves
+// hit rates under concurrency compared to multiple separate pools.
+// maxRetries defaults to maxRetriesUnset so middleware-path requests use config defaults.
+var sharedRequestPool = sync.Pool{
+	New: func() any { return &Request{maxRetries: maxRetriesUnset} },
+}
+
+// AcquireRequest retrieves a Request from the shared pool.
+// The caller must call ReleaseRequest when done.
+func AcquireRequest() *Request {
+	req, ok := sharedRequestPool.Get().(*Request)
+	if !ok || req == nil {
+		return &Request{maxRetries: maxRetriesUnset}
+	}
+	return req
+}
+
+// ReleaseRequest returns a Request to the shared pool after clearing all fields.
+// Resets maxRetries to maxRetriesUnset so recycled requests inherit the client's retry config.
+func ReleaseRequest(req *Request) {
+	if req == nil {
+		return
+	}
+	resetRequest(req)
+	sharedRequestPool.Put(req)
+}
+
+// requestCallback is a callback function invoked before a request is sent.
+type requestCallback func(req *Request) error
+
+// responseCallback is a callback function invoked after a response is received.
+type responseCallback func(resp *Response) error
+
+// Request represents an HTTP request with method, URL, headers, body, and options.
+//
+// The exported accessor and mutator methods below implement the
+// types.RequestMutator interface (which embeds both read and write methods).
+// They are trivial field pass-throughs and intentionally lack per-method godoc;
+// refer to the interface definition for their contract.
+type Request struct {
+	method      string
+	url         string
+	headers     map[string]string
+	queryParams map[string]any
+	body        any
+	timeout     time.Duration
+	maxRetries  int
+	// context carries the request's cancellation/deadline. Storing it here is an
+	// intentional, narrow exception to the "do not store context in a struct"
+	// guideline: Request is a short-lived, pooled, request-scoped object whose
+	// lifetime is bounded by a single request — mirroring net/http.Request. It is
+	// reset to its zero value when returned to the pool (see requestPool.put /
+	// ReleaseRequest) and is never retained beyond the request. Long-lived structs
+	// that outlive a request must continue to take context.Context as the first
+	// parameter instead.
+	context         context.Context
+	cookies         []http.Cookie
+	followRedirects *bool
+	maxRedirects    *int
+	onRequest       requestCallback
+	onResponse      responseCallback
+	streamBody      bool   // When true, skip buffering response body; caller reads via RawBodyReader
+	sanitizedURL    string // Cached per-request sanitized URL, set by middleware on first access
+	allowPrivateIPs *bool  // Per-request override of client-level AllowPrivateIPs (nil = use client policy)
+	// retryNonIdempotent overrides client-level RetryNonIdempotent for this
+	// request (nil = use client config).
+	retryNonIdempotent *bool
+	// noTimeout suppresses the client-level request timeout for this request.
+	// An explicit per-request timeout (WithTimeout) still applies; a deadline
+	// on the caller's context is always respected.
+	noTimeout bool
+}
+
+// Compile-time interface check
+var _ types.RequestMutator = (*Request)(nil)
+
+// Accessors (implement RequestMutator)
+func (r *Request) Method() string { return r.method }
+func (r *Request) URL() string    { return r.url }
+
+// Headers returns the internal pooled headers map. The reference is valid
+// only for the lifetime of this request: after the request is released the
+// map is cleared and recycled for other requests. Callers that need to
+// retain the data (async logging, audit) must copy it.
+func (r *Request) Headers() map[string]string { return r.headers }
+
+// QueryParams returns the internal pooled query-parameter map, subject to
+// the same lifetime contract as Headers — copy before retaining.
+func (r *Request) QueryParams() map[string]any { return r.queryParams }
+func (r *Request) Body() any                   { return r.body }
+func (r *Request) Timeout() time.Duration      { return r.timeout }
+func (r *Request) MaxRetries() int             { return r.maxRetries }
+func (r *Request) Context() context.Context    { return r.context }
+func (r *Request) Cookies() []http.Cookie      { return r.cookies }
+func (r *Request) FollowRedirects() *bool      { return r.followRedirects }
+func (r *Request) MaxRedirects() *int          { return r.maxRedirects }
+func (r *Request) AllowPrivateIPs() *bool      { return r.allowPrivateIPs }
+func (r *Request) RetryNonIdempotent() *bool   { return r.retryNonIdempotent }
+func (r *Request) NoTimeout() bool             { return r.noTimeout }
+func (r *Request) SanitizedURL() string        { return r.sanitizedURL }
+func (r *Request) SetSanitizedURL(v string)    { r.sanitizedURL = v }
+
+// Mutators
+func (r *Request) SetMethod(v string) { r.method = v }
+func (r *Request) SetURL(v string)    { r.url = v }
+
+// SetHeaders replaces all headers with a COPY of v held in a pooled map.
+//
+// SECURITY (pool poisoning): Request objects are pooled, and resetRequest
+// returns whatever map is stored here to the shared headersMapPool (after
+// clearing it). Storing a caller-owned map by reference would hand that map
+// to an unrelated future request — concurrent map writes, or request A's
+// headers appearing in request B. User middleware reaches this method via the
+// RequestMutator interface, so the setter must copy. Internal zero-copy
+// moves of engine-owned pooled maps use moveHeaders (see Apply).
+func (r *Request) SetHeaders(v map[string]string) {
+	if v == nil {
+		r.headers = nil
+		return
+	}
+	h := getHeadersMap()
+	maps.Copy(h, v)
+	r.headers = h
+}
+
+// moveHeaders transfers ownership of an engine-pooled headers map without
+// copying. The caller MUST guarantee the map was produced by getHeadersMap
+// (engine-owned) and that no other reference retains it. Used by Apply.
+func (r *Request) moveHeaders(v map[string]string) { r.headers = v }
+
+func (r *Request) SetHeader(key, value string) {
+	if r.headers == nil {
+		r.headers = getHeadersMap()
+	}
+	r.headers[key] = value
+}
+
+// SetQueryParams replaces all query parameters with a COPY of v held in a
+// pooled map. See SetHeaders for why copying is mandatory (pool poisoning).
+func (r *Request) SetQueryParams(v map[string]any) {
+	if v == nil {
+		r.queryParams = nil
+		return
+	}
+	q := getQueryParamsMap()
+	maps.Copy(q, v)
+	r.queryParams = q
+}
+
+// moveQueryParams transfers ownership of an engine-pooled query-params map.
+// See moveHeaders for the ownership contract. Used by Apply.
+func (r *Request) moveQueryParams(v map[string]any) { r.queryParams = v }
+
+func (r *Request) EnsureQueryParams() map[string]any {
+	if r.queryParams == nil {
+		r.queryParams = getQueryParamsMap()
+	}
+	return r.queryParams
+}
+func (r *Request) SetBody(v any)                 { r.body = v }
+func (r *Request) SetTimeout(v time.Duration)    { r.timeout = v }
+func (r *Request) SetMaxRetries(v int)           { r.maxRetries = v }
+func (r *Request) SetContext(v context.Context)  { r.context = v }
+func (r *Request) SetCookies(v []http.Cookie)    { r.cookies = v }
+func (r *Request) SetFollowRedirects(v *bool)    { r.followRedirects = v }
+func (r *Request) SetMaxRedirects(v *int)        { r.maxRedirects = v }
+func (r *Request) SetAllowPrivateIPs(v *bool)    { r.allowPrivateIPs = v }
+func (r *Request) SetRetryNonIdempotent(v *bool) { r.retryNonIdempotent = v }
+func (r *Request) SetNoTimeout(v bool)           { r.noTimeout = v }
+func (r *Request) StreamBody() bool              { return r.streamBody }
+func (r *Request) SetStreamBody(v bool)          { r.streamBody = v }
+
+// Apply transfers all per-request mutable state from src onto r. It exists so
+// callers that forward a request through a fresh engine.Request call — e.g.
+// the facade middleware chain's terminal handler — stay in sync with the
+// Request type by construction instead of enumerating fields by hand.
+//
+// Ownership: the pooled headers and query-parameter maps are MOVED, not
+// copied — src's references are cleared so a later release of src cannot
+// return the same maps to the pool twice. The context is not transferred:
+// it is owned by the engine.Client.Request call that created r. Optional
+// fields (followRedirects, maxRedirects, allowPrivateIPs, callbacks) are
+// copied only when set on src, preserving r's defaults otherwise.
+func (r *Request) Apply(src *Request) {
+	r.SetMethod(src.method)
+	r.SetURL(src.url)
+	// Zero-copy MOVE of engine-owned pooled maps (see moveHeaders for the
+	// ownership contract). The public SetHeaders/SetQueryParams copy because
+	// middleware can call them with caller-owned maps.
+	r.moveHeaders(src.headers)
+	r.moveQueryParams(src.queryParams)
+	r.SetBody(src.body)
+	r.SetTimeout(src.timeout)
+	r.SetMaxRetries(src.maxRetries)
+	r.SetCookies(src.cookies)
+	if src.followRedirects != nil {
+		r.SetFollowRedirects(src.followRedirects)
+	}
+	if src.maxRedirects != nil {
+		r.SetMaxRedirects(src.maxRedirects)
+	}
+	if src.allowPrivateIPs != nil {
+		r.SetAllowPrivateIPs(src.allowPrivateIPs)
+	}
+	if src.retryNonIdempotent != nil {
+		r.SetRetryNonIdempotent(src.retryNonIdempotent)
+	}
+	r.SetNoTimeout(src.noTimeout)
+	r.SetStreamBody(src.streamBody)
+	if src.onRequest != nil {
+		r.SetOnRequest(src.onRequest)
+	}
+	if src.onResponse != nil {
+		r.SetOnResponse(src.onResponse)
+	}
+	// Ownership transfer of pooled maps (see doc comment).
+	src.headers = nil
+	src.queryParams = nil
+}
+
+// Callback accessors
+func (r *Request) OnRequest() requestCallback        { return r.onRequest }
+func (r *Request) OnResponse() responseCallback      { return r.onResponse }
+func (r *Request) SetOnRequest(cb requestCallback)   { r.onRequest = cb }
+func (r *Request) SetOnResponse(cb responseCallback) { r.onResponse = cb }
 
 // stringsReaderPool reduces allocations for strings.Reader used in request bodies
 var stringsReaderPool = sync.Pool{
@@ -78,6 +405,25 @@ func putMIMEHeader(h *textproto.MIMEHeader) {
 	mimeHeaderPool.Put(h)
 }
 
+// createMultipartPart creates one multipart form part through a pooled
+// textproto.MIMEHeader. It reproduces the exact wire format of
+// multipart.Writer.WriteField and CreateFormFile (including the latter's
+// implicit application/octet-stream Content-Type, supplied by the caller)
+// while avoiding those methods' per-part allocations: CreateFormField and
+// CreateFormFile each allocate a fresh MIMEHeader map plus a fmt.Sprintf
+// disposition string. CreatePart serializes the header into the multipart
+// buffer, so the pooled map is safe to recycle immediately after.
+func createMultipartPart(w *multipart.Writer, disposition, contentType string) (io.Writer, error) {
+	h := getMIMEHeader()
+	h.Set("Content-Disposition", disposition)
+	if contentType != "" {
+		h.Set("Content-Type", contentType)
+	}
+	part, err := w.CreatePart(*h)
+	putMIMEHeader(h)
+	return part, err
+}
+
 // multipartBufferPool reduces allocations for multipart form data buffers
 var multipartBufferPool = sync.Pool{
 	New: func() any {
@@ -92,7 +438,12 @@ var jsonBufferPool = sync.Pool{
 	},
 }
 
-// pooledStringsReader wraps a strings.Reader and returns it to the pool on EOF or Close.
+// pooledStringsReader wraps a strings.Reader and returns it to the pool on
+// Close. Release happens ONLY in Close — never on EOF in Read: net/http reads
+// the body to EOF and closes it later (on HTTP/2, from the writeLoop
+// goroutine). Releasing at EOF would return the wrapper to the pool while a
+// delayed Close can still arrive; another request could then acquire the
+// wrapper, and the stale Close would release the new request's live reader.
 type pooledStringsReader struct {
 	reader   *strings.Reader
 	released bool
@@ -102,11 +453,7 @@ func (r *pooledStringsReader) Read(p []byte) (n int, err error) {
 	if r.reader == nil {
 		return 0, io.EOF
 	}
-	n, err = r.reader.Read(p)
-	if err == io.EOF {
-		r.release()
-	}
-	return n, err
+	return r.reader.Read(p)
 }
 
 func (r *pooledStringsReader) Close() error {
@@ -127,7 +474,8 @@ func (r *pooledStringsReader) release() {
 	stringsReaderWrapperPool.Put(r)
 }
 
-// pooledBytesReader wraps a bytes.Reader and returns it to the pool on EOF or Close.
+// pooledBytesReader wraps a bytes.Reader and returns it to the pool on Close
+// only — see pooledStringsReader for why release-on-EOF is unsafe.
 type pooledBytesReader struct {
 	reader   *bytes.Reader
 	released bool
@@ -137,11 +485,7 @@ func (r *pooledBytesReader) Read(p []byte) (n int, err error) {
 	if r.reader == nil {
 		return 0, io.EOF
 	}
-	n, err = r.reader.Read(p)
-	if err == io.EOF {
-		r.release()
-	}
-	return n, err
+	return r.reader.Read(p)
 }
 
 func (r *pooledBytesReader) Close() error {
@@ -208,8 +552,11 @@ func getPooledBytesReader(b []byte) io.Reader {
 // from URL variants (e.g., different query parameter orderings for the same endpoint).
 const rawCacheMaxSize = 2048
 
-// urlCache provides a thread-safe LRU-like cache for parsed URLs
-// to avoid expensive url.Parse() calls for repeated URLs.
+// urlCache provides a thread-safe cache for parsed URLs to avoid expensive
+// url.Parse() calls for repeated URLs. Eviction is insertion-order (FIFO):
+// when the entries map reaches maxSize the oldest inserted key is dropped
+// (see evictOldest). This is simpler than true LRU and sufficient here —
+// hot URLs are typically re-inserted soon after eviction anyway.
 //
 // SECURITY: The cache uses a sanitized URL as the key (sensitive query parameter
 // values redacted) to prevent credentials from persisting in memory.
@@ -218,7 +565,7 @@ type urlCache struct {
 	mu      sync.RWMutex
 	raw     map[string]*url.URL // Fast path: raw URL string -> parsed URL
 	entries map[string]*url.URL // Sanitized key -> parsed URL (for sensitive URLs)
-	keys    []string            // Track insertion order for LRU eviction
+	keys    []string            // Insertion order for FIFO eviction (hits do not refresh position)
 	maxSize int
 }
 
@@ -264,11 +611,10 @@ func hasSensitiveContent(rawURL string) bool {
 		return true
 	}
 	// Only check query parameters if present
-	qIdx := strings.IndexByte(rawURL, '?')
-	if qIdx < 0 {
-		return false
+	if _, query, ok := strings.Cut(rawURL, "?"); ok {
+		return validation.HasSensitiveQueryParams(query)
 	}
-	return validation.HasSensitiveQueryParams(rawURL[qIdx+1:])
+	return false
 }
 
 // evictRawIfNeeded removes stale raw cache entries when the map exceeds
@@ -318,31 +664,40 @@ func (c *urlCache) GetReadOnly(rawURL string) (*url.URL, error) {
 // When clone is true, the returned URL is deep-copied to prevent mutation
 // of cached entries. When false, the cached pointer is returned directly
 // (read-only contract enforced at call site).
+//
+// The raw cache is consulted before the sensitive-content scan: raw entries
+// are only inserted after passing hasSensitiveContent, so a hit implies a
+// non-sensitive URL and the scan (an 8–80ns per-request cost) is skipped
+// entirely on the hot repeated-URL path.
 func (c *urlCache) getInternal(rawURL string, clone bool) (*url.URL, error) {
-	sensitive := hasSensitiveContent(rawURL)
-
 	// Fast path: check raw string cache first (avoids url.Parse for repeated URLs)
-	if !sensitive {
-		c.mu.RLock()
-		if c.raw != nil {
-			if cached, ok := c.raw[rawURL]; ok {
-				c.mu.RUnlock()
-				if clone {
-					return cloneURL(cached), nil
-				}
-				return cached, nil
+	c.mu.RLock()
+	if c.raw != nil {
+		if cached, ok := c.raw[rawURL]; ok {
+			c.mu.RUnlock()
+			if clone {
+				return cloneURL(cached), nil
 			}
+			return cached, nil
 		}
-		c.mu.RUnlock()
 	}
+	c.mu.RUnlock()
 
-	// Parse URL to produce sanitized cache key
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return nil, err
 	}
 	parsed.User = nil
-	cacheKey := sanitizeURLKey(parsed)
+
+	// Only URLs that failed the sensitive-content scan need the expensive
+	// redacting key (u.Query + Encode, ~5 allocations). Non-sensitive URLs
+	// are keyed by the raw string itself — an injective key that identifies
+	// the entry exactly as well as the sanitized form.
+	sensitive := hasSensitiveContent(rawURL)
+	cacheKey := rawURL
+	if sensitive {
+		cacheKey = sanitizeURLKey(parsed)
+	}
 
 	// Second fast path: check sanitized cache
 	c.mu.RLock()
@@ -416,18 +771,18 @@ func (c *urlCache) populateRawCacheLocked(rawURL string, cached *url.URL) {
 
 // evictOldest removes the oldest entry when the cache is full.
 // Must be called with c.mu held for writing.
+//
+// It deliberately does NOT scan the raw map for entries pointing at the
+// evicted *url.URL: an orphaned raw entry is still a correct parse of its
+// own key, so serving it is harmless, and evictRawIfNeeded reclaims raw
+// entries once the raw map exceeds its own cap. The previous per-eviction
+// O(|raw|) scan under the write lock was a contention hotspot once the
+// entries map reached maxSize.
 func (c *urlCache) evictOldest() {
 	if len(c.entries) < c.maxSize || len(c.keys) == 0 {
 		return
 	}
 	oldestKey := c.keys[0]
-	if old, ok := c.entries[oldestKey]; ok && c.raw != nil {
-		for k, v := range c.raw {
-			if v == old {
-				delete(c.raw, k)
-			}
-		}
-	}
 	delete(c.entries, oldestKey)
 	c.keys = c.keys[1:]
 	if cap(c.keys) > len(c.keys)*2 {
@@ -524,11 +879,7 @@ func (r *pooledMultipartBuffer) Read(p []byte) (n int, err error) {
 	if r.buf == nil {
 		return 0, io.EOF
 	}
-	n, err = r.buf.Read(p)
-	if err == io.EOF {
-		r.release()
-	}
-	return n, err
+	return r.buf.Read(p)
 }
 
 func (r *pooledMultipartBuffer) Close() error {
@@ -595,11 +946,7 @@ func (r *pooledJSONBuffer) Read(p []byte) (n int, err error) {
 	if r.buf == nil {
 		return 0, io.EOF
 	}
-	n, err = r.buf.Read(p)
-	if err == io.EOF {
-		r.release()
-	}
-	return n, err
+	return r.buf.Read(p)
 }
 
 func (r *pooledJSONBuffer) Close() error {
@@ -634,6 +981,7 @@ var (
 	hdrContentType    = http.CanonicalHeaderKey("Content-Type")
 	hdrAcceptEncoding = http.CanonicalHeaderKey("Accept-Encoding")
 	hdrUserAgent      = http.CanonicalHeaderKey("User-Agent")
+	hdrAuthorization  = http.CanonicalHeaderKey("Authorization")
 	hdrCookie         = http.CanonicalHeaderKey("Cookie")
 	hdrContentLength  = http.CanonicalHeaderKey("Content-Length")
 	hdrHost           = http.CanonicalHeaderKey("Host")
@@ -701,39 +1049,89 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 		parsedURL.RawQuery = appendQueryParams(parsedURL.RawQuery, req.QueryParams())
 	}
 
+	// Redirect following decides whether a replayable body is worth capturing:
+	// net/http only calls Request.GetBody to re-send a body when following a
+	// 307/308 redirect. Mirrors the effective-policy resolution at the
+	// SetRedirectPolicy call site in Client.executeRequest.
+	followRedirects := p.config.FollowRedirects
+	if req.FollowRedirects() != nil {
+		followRedirects = *req.FollowRedirects()
+	}
+
 	var body io.Reader
 	var contentType string
+	// replaySrc holds the body from a stable (non-pooled) source so GetBody can
+	// produce a fresh reader per 307/308 hop: string/[]byte sources are closed
+	// over as-is (immutable or caller-owned, same exposure as net/http's own
+	// NewRequest); JSON/multipart bytes live in pooled buffers that are
+	// recycled on body Close — which happens before any redirect hop needs
+	// GetBody — so they are cloned once, and only when redirects are enabled.
+	// Generic io.Reader bodies are left nil (not replayable), matching
+	// net/http's rules; the retry path has already buffered those to []byte.
+	var replaySrc any
 
 	if req.Body() != nil {
 		switch v := req.Body().(type) {
 		case string:
 			body = getPooledStringsReader(v)
 			contentType = "text/plain"
+			replaySrc = v
 		case []byte:
 			body = getPooledBytesReader(v)
 			contentType = "application/octet-stream"
+			replaySrc = v
 		case io.Reader:
 			body = v
 		default:
+			// Headers keep the caller's original key casing, so a lowercase
+			// "content-type" must still be detected — otherwise a struct body
+			// would be serialized as JSON under an XML Content-Type.
 			existingContentType := ""
-			if req.Headers() != nil {
-				existingContentType = req.Headers()["Content-Type"]
+			for k, v := range req.Headers() {
+				if http.CanonicalHeaderKey(k) == "Content-Type" {
+					existingContentType = v
+					break
+				}
 			}
 
-			if existingContentType == "application/xml" {
+			if isXMLContentType(existingContentType) {
 				xmlData, err := xml.Marshal(v)
 				if err != nil {
 					return nil, fmt.Errorf("marshal XML failed: %w", err)
 				}
 				body = getPooledBytesReader(xmlData)
 				contentType = "application/xml"
+				replaySrc = xmlData
 			} else if fd, ok := v.(*types.FormData); ok {
 				// Use pooled buffer for multipart form data
 				buf := getMultipartBuffer()
 				writer := multipart.NewWriter(buf)
 
+				// SECURITY (sink validation): *FormData is a public struct that
+				// callers can construct directly (types.go example) or via
+				// WithFormData/WithBody(BodyMultipart), bypassing the stricter
+				// option-layer checks in WithFile. Field names, filenames, and
+				// per-file Content-Types land verbatim in Content-Disposition /
+				// Content-Type header values, and mime/multipart.Writer does not
+				// reject CR/LF — so control characters here would inject
+				// arbitrary MIME headers/parts into the body. Validate every
+				// token at this, the single encoding sink, so no entry path can
+				// bypass it.
 				for key, value := range fd.Fields {
-					if err := writer.WriteField(key, value); err != nil {
+					if err := validation.ValidateMultipartToken(key, "multipart field name"); err != nil {
+						putMultipartBuffer(buf)
+						return nil, err
+					}
+					// Byte-identical to multipart.Writer.WriteField
+					// (`form-data; name="%s"` with escapeQuotes), minus its
+					// per-field MIMEHeader and fmt.Sprintf allocations.
+					disposition := `form-data; name="` + escapeQuotes(key) + `"`
+					part, err := createMultipartPart(writer, disposition, "")
+					if err != nil {
+						putMultipartBuffer(buf)
+						return nil, fmt.Errorf("write form field failed: %w", err)
+					}
+					if _, err := io.WriteString(part, value); err != nil {
 						putMultipartBuffer(buf)
 						return nil, fmt.Errorf("write form field failed: %w", err)
 					}
@@ -741,26 +1139,38 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 
 				for key, fileData := range fd.Files {
 					if fileData == nil {
-						continue
+						// A nil *FileData means the caller's map holds a nil
+						// entry where a file was expected. Silently dropping it
+						// would lose data without notice — fail the request
+						// instead so the bug surfaces.
+						putMultipartBuffer(buf)
+						return nil, fmt.Errorf("multipart file %q has nil FileData", key)
+					}
+					if err := validation.ValidateMultipartToken(key, "multipart file field name"); err != nil {
+						putMultipartBuffer(buf)
+						return nil, err
+					}
+					if err := validation.ValidateMultipartToken(fileData.Filename, "multipart filename"); err != nil {
+						putMultipartBuffer(buf)
+						return nil, err
 					}
 
-					var part io.Writer
-					var err error
-
-					if fileData.ContentType != "" {
-						h := getMIMEHeader()
-						escapedKey := escapeQuotes(key)
-						escapedFilename := escapeQuotes(fileData.Filename)
-						contentDisposition := `form-data; name="` + escapedKey + `"; filename="` + escapedFilename + `"`
-
-						h.Set("Content-Disposition", contentDisposition)
-						h.Set("Content-Type", fileData.ContentType)
-						part, err = writer.CreatePart(*h)
-						putMIMEHeader(h)
-					} else {
-						part, err = writer.CreateFormFile(key, fileData.Filename)
+					// Byte-identical to multipart.Writer.CreateFormFile for the
+					// no-ContentType case (which implies application/octet-stream),
+					// routed through the same pooled-header path as explicit
+					// Content-Types.
+					contentType := fileData.ContentType
+					if contentType == "" {
+						contentType = "application/octet-stream"
 					}
+					if !validation.IsValidHeaderString(contentType) {
+						putMultipartBuffer(buf)
+						return nil, fmt.Errorf("multipart file %q: invalid Content-Type", key)
+					}
+					disposition := `form-data; name="` + escapeQuotes(key) +
+						`"; filename="` + escapeQuotes(fileData.Filename) + `"`
 
+					part, err := createMultipartPart(writer, disposition, contentType)
 					if err != nil {
 						putMultipartBuffer(buf)
 						return nil, fmt.Errorf("create form file failed: %w", err)
@@ -779,6 +1189,9 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 
 				body = getPooledMultipartBufferWrapper(buf)
 				contentType = writer.FormDataContentType()
+				if followRedirects {
+					replaySrc = bytes.Clone(buf.Bytes())
+				}
 			} else {
 				// Use pooled buffer for JSON encoding to reduce allocations
 				buf := getJSONBuffer()
@@ -794,6 +1207,9 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 				}
 				body = getPooledJSONBufferWrapper(buf)
 				contentType = "application/json"
+				if followRedirects {
+					replaySrc = bytes.Clone(buf.Bytes())
+				}
 			}
 		}
 	}
@@ -821,7 +1237,12 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 	// the copy owns its own field values (shallow-copied pointers), and the
 	// template is zeroed on next use (*tmpl = http.Request{...}). The template
 	// is returned to the pool immediately, keeping it warm for the next call.
-	tmpl := httpRequestPool.Get().(*http.Request)
+	// Safe pool assertion (v, ok := ...) matching every other accessor in the
+	// package — a poisoned pool must degrade to an allocation, not a panic.
+	tmpl, ok := httpRequestPool.Get().(*http.Request)
+	if !ok || tmpl == nil {
+		tmpl = &http.Request{}
+	}
 	*tmpl = http.Request{
 		Method:     method,
 		URL:        parsedURL,
@@ -837,6 +1258,24 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 
 	// Set Content-Length from known body types
 	p.setContentLength(httpReq, body)
+
+	// GetBody lets net/http replay the body on 307/308 redirects (method and
+	// body are preserved for these codes). Without it, a bodied request that
+	// receives 307/308 is returned the 3xx response unfollowed. Each call
+	// returns a fresh reader over the stable replay source; length always
+	// matches ContentLength because both derive from the same bytes.
+	if followRedirects && replaySrc != nil {
+		switch src := replaySrc.(type) {
+		case string:
+			httpReq.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(strings.NewReader(src)), nil
+			}
+		case []byte:
+			httpReq.GetBody = func() (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(src)), nil
+			}
+		}
+	}
 
 	// Header values are stored in http.Header as []string. http.Header.Set
 	// allocates a fresh []string{value} on every call; assigning len-1 windows
@@ -874,10 +1313,33 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 		setHeader(http.CanonicalHeaderKey(key), value)
 	}
 
+	// URL userinfo → Basic auth, matching net/http behavior. The URL cache
+	// strips credentials when keying/parsing (request.go parseAndCacheURL),
+	// so without this the credentials would be silently dropped. An explicit
+	// Authorization header (WithHeader/WithBasicAuth) always wins. The "@"
+	// pre-filter keeps the common path at one string scan.
+	if strings.Contains(req.URL(), "@") {
+		if u, parseErr := url.Parse(req.URL()); parseErr == nil && u.User != nil {
+			if headerValueIsEmpty(httpReq.Header, hdrAuthorization) {
+				password, _ := u.User.Password()
+				creds := u.User.Username() + ":" + password
+				setHeader(hdrAuthorization, "Basic "+base64.StdEncoding.EncodeToString([]byte(creds)))
+			}
+		}
+	}
+
 	// Add Accept-Encoding automatically since DisableCompression is true
 	// and we handle decompression manually. Allows user override via WithHeader.
+	// Streaming responses bypass the buffered decompression pipeline, so they
+	// must request uncompressed bytes — otherwise servers honoring gzip would
+	// deliver compressed bytes straight to the caller (e.g. Download writing
+	// a gzip stream to disk).
 	if headerValueIsEmpty(httpReq.Header, hdrAcceptEncoding) {
-		setHeader(hdrAcceptEncoding, "gzip, deflate")
+		if req.StreamBody() {
+			setHeader(hdrAcceptEncoding, "identity")
+		} else {
+			setHeader(hdrAcceptEncoding, "gzip, deflate")
+		}
 	}
 
 	if p.config.UserAgent != "" && headerValueIsEmpty(httpReq.Header, hdrUserAgent) {
@@ -1042,6 +1504,12 @@ func escapeQuotes(s string) string {
 
 // FormatQueryParam converts a value to string for query parameters.
 // Optimized to avoid fmt.Sprintf allocations for common types.
+//
+// MAINTENANCE: this type switch has two siblings that MUST stay in sync —
+// writeQueryParamValue (pools.go, writes the wire format) and the facade's
+// queryValueLength (public_options.go, measures length without allocating).
+// query_param_parity_test.go guards the drift; when adding a type, add it to
+// all three.
 func FormatQueryParam(v any) string {
 	if v == nil {
 		return ""
@@ -1072,4 +1540,21 @@ func FormatQueryParam(v any) string {
 	default:
 		return fmt.Sprintf("%v", val)
 	}
+}
+
+// isXMLContentType reports whether a Content-Type header value designates XML.
+// Comparison ignores parameters ("; charset=...") and case, matching
+// mime.ParseMediaType semantics without its allocation. Without this, a body
+// declared as "application/xml; charset=utf-8" fell through to JSON encoding
+// while the header still advertised XML.
+func isXMLContentType(contentType string) bool {
+	if contentType == "" {
+		return false
+	}
+	if mediaType, _, ok := strings.Cut(contentType, ";"); ok {
+		contentType = mediaType
+	}
+	contentType = strings.TrimSpace(contentType)
+	return strings.EqualFold(contentType, "application/xml") ||
+		strings.EqualFold(contentType, "text/xml")
 }

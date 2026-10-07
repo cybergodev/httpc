@@ -15,8 +15,9 @@ func TestProxyConfigurationPriority(t *testing.T) {
 	// Note: the pure "EnableSystemProxy with no manual URL" case is intentionally
 	// omitted — its outcome depends on the host's OS-level proxy config (Windows
 	// registry / macOS system settings), which cannot be asserted deterministically.
-	// It is covered, machine-agnostically, by TestPoolManager_SystemProxy which only
-	// asserts that the transport is created. The cases below are all deterministic.
+	// (The former TestPoolManager_SystemProxy only asserted transport creation,
+	// true of every construction, so it was removed.) The cases below are all
+	// deterministic.
 	tests := []struct {
 		name              string
 		proxyURL          string
@@ -143,63 +144,10 @@ func TestValidProxyURLs(t *testing.T) {
 	}
 }
 
-// TestProxyConfigurationIsolation tests that different pool managers
-// can have different proxy configurations
-func TestProxyConfigurationIsolation(t *testing.T) {
-	// Create first pool with manual proxy
-	config1 := &Config{
-		ProxyURL:    "http://proxy.example.com:8080",
-		DialTimeout: 10 * time.Second,
-	}
-
-	pm1, err := NewPoolManager(config1)
-	if err != nil {
-		t.Fatalf("Failed to create first pool: %v", err)
-	}
-	defer pm1.Close()
-
-	// Create second pool with system proxy enabled
-	config2 := &Config{
-		EnableSystemProxy: true,
-		DialTimeout:       10 * time.Second,
-	}
-
-	pm2, err := NewPoolManager(config2)
-	if err != nil {
-		t.Fatalf("Failed to create second pool: %v", err)
-	}
-	defer pm2.Close()
-
-	// Create third pool with no proxy
-	config3 := &Config{
-		DialTimeout: 10 * time.Second,
-	}
-
-	pm3, err := NewPoolManager(config3)
-	if err != nil {
-		t.Fatalf("Failed to create third pool: %v", err)
-	}
-	defer pm3.Close()
-
-	// Verify each pool has its own configuration
-	transport1 := pm1.GetTransport()
-	transport2 := pm2.GetTransport()
-	transport3 := pm3.GetTransport()
-
-	if transport1 == nil || transport1.Proxy == nil {
-		t.Error("First pool should have proxy configured")
-	}
-
-	if transport2 == nil {
-		t.Error("Second pool transport should not be nil")
-	}
-
-	if transport3 == nil {
-		t.Error("Third pool transport should not be nil")
-	}
-
-	t.Log("✓ Different pool managers can have different proxy configurations")
-}
+// TestProxyConfigurationIsolation was removed: PoolManager instances hold no
+// package-level mutable state — each transports its own Config, and the
+// per-mode Proxy wiring is asserted by the mode tests above. The three
+// constructors here only re-verified that construction succeeds.
 
 // BenchmarkProxyConfiguration benchmarks the performance impact of proxy configuration
 func BenchmarkProxyConfiguration(b *testing.B) {

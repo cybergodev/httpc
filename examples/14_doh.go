@@ -14,7 +14,7 @@ import (
 // for encrypted, privacy-preserving DNS resolution.
 
 func main() {
-	fmt.Println("=== DNS-over-HTTPS (DoH) Examples ===\n ")
+	fmt.Println("=== DNS-over-HTTPS (DoH) Examples ===")
 
 	// Example 1: Enable DoH with default settings
 	demonstrateBasicDoH()
@@ -55,7 +55,7 @@ func demonstrateBasicDoH() {
 	fmt.Println("  1. Cloudflare (1.1.1.1) - priority 1")
 	fmt.Println("  2. Google (8.8.8.8) - priority 2")
 	fmt.Println("  3. Ali DNS (223.5.5.5) - priority 3")
-	fmt.Println("  Providers are tried in order with automatic failover.\n ")
+	fmt.Println("  Providers are tried in order with automatic failover.")
 }
 
 // demonstrateDoHWithCacheTTL shows customizing DoH cache duration

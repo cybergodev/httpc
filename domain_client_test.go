@@ -95,7 +95,7 @@ func TestDomainClient_AutomaticCookieManagement(t *testing.T) {
 			http.SetCookie(w, &http.Cookie{Name: "session", Value: "abc123"})
 			http.SetCookie(w, &http.Cookie{Name: "token", Value: "xyz789"})
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("first"))
+			_, _ = w.Write([]byte("first")) // best-effort test response
 		} else {
 			// Second request: verify cookies are sent
 			sessionCookie, err := r.Cookie("session")
@@ -107,7 +107,7 @@ func TestDomainClient_AutomaticCookieManagement(t *testing.T) {
 				t.Errorf("token cookie not found or incorrect")
 			}
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("second"))
+			_, _ = w.Write([]byte("second")) // best-effort test response
 		}
 	}))
 	defer server.Close()
@@ -198,7 +198,7 @@ func TestDomainClient_CookieOverride(t *testing.T) {
 			t.Errorf("Cookie not found")
 			return
 		}
-		w.Write([]byte(cookie.Value))
+		_, _ = w.Write([]byte(cookie.Value)) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -229,7 +229,7 @@ func TestDomainClient_CookieOverride(t *testing.T) {
 
 func TestDomainClient_HeaderOverride(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(r.Header.Get("X-Test")))
+		_, _ = w.Write([]byte(r.Header.Get("X-Test"))) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -463,13 +463,13 @@ func TestDomainClient_FullURLHandling(t *testing.T) {
 	// Create two test servers to simulate same domain and different domain
 	sameDomainServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("same-domain"))
+		_, _ = w.Write([]byte("same-domain")) // best-effort test response
 	}))
 	defer sameDomainServer.Close()
 
 	differentDomainServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("different-domain"))
+		_, _ = w.Write([]byte("different-domain")) // best-effort test response
 	}))
 	defer differentDomainServer.Close()
 
@@ -531,7 +531,7 @@ func TestDomainClient_SameDomainCookiePersistence(t *testing.T) {
 			// First request: set cookie
 			http.SetCookie(w, &http.Cookie{Name: "session", Value: "test123"})
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("first"))
+			_, _ = w.Write([]byte("first")) // best-effort test response
 		} else {
 			// Second request: verify cookie is sent
 			cookie, err := r.Cookie("session")
@@ -539,7 +539,7 @@ func TestDomainClient_SameDomainCookiePersistence(t *testing.T) {
 				t.Errorf("Cookie not found or incorrect in request %d", requestCount)
 			}
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("second"))
+			_, _ = w.Write([]byte("second")) // best-effort test response
 		}
 	}))
 	defer server.Close()
@@ -643,11 +643,11 @@ func TestDomainClient_ConcurrentAccess(t *testing.T) {
 		go func(id int) {
 			defer func() { done <- true }()
 
-			// Mix of operations
-			client.Get("/")
-			client.SetHeader("X-Concurrent", "test")
+			// Mix of operations (results discarded: this is a data-race probe)
+			_, _ = client.Get("/")
+			_ = client.SetHeader("X-Concurrent", "test")
 			client.GetHeaders()
-			client.SetCookie(&http.Cookie{Name: "concurrent", Value: "test"})
+			_ = client.SetCookie(&http.Cookie{Name: "concurrent", Value: "test"})
 			client.GetCookies()
 		}(i)
 	}
@@ -983,7 +983,7 @@ func TestDomainClient_RealWorldScenario(t *testing.T) {
 			// Set session cookie
 			http.SetCookie(w, &http.Cookie{Name: "session", Value: "secret123"})
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"token":"abc123"}`))
+			_, _ = w.Write([]byte(`{"token":"abc123"}`)) // best-effort test response
 		} else if strings.HasSuffix(r.URL.Path, "/api/data") {
 			apiCalled = true
 			// Verify session cookie is present
@@ -996,7 +996,7 @@ func TestDomainClient_RealWorldScenario(t *testing.T) {
 				t.Error("Authorization header not found in API request")
 			}
 			w.WriteHeader(http.StatusOK)
-			w.Write([]byte(`{"data":"success"}`))
+			_, _ = w.Write([]byte(`{"data":"success"}`)) // best-effort test response
 		}
 	}))
 	defer server.Close()
@@ -1063,7 +1063,7 @@ func TestDomainClient_Download_WithAutoHeaders(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write(content)
+		_, _ = w.Write(content) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -1083,7 +1083,7 @@ func TestDomainClient_Download_WithAutoHeaders(t *testing.T) {
 		t.Fatalf("SetHeader error = %v", err)
 	}
 
-	tmpFile := filepath.Join(os.TempDir(), "test_download_headers.txt")
+	tmpFile := filepath.Join(t.TempDir(), "test_download_headers.txt")
 	defer os.Remove(tmpFile)
 
 	_, err = client.Download(context.Background(), "/file.txt", &httpc.DownloadConfig{FilePath: tmpFile})
@@ -1110,7 +1110,7 @@ func TestDomainClient_Download_WithAutoCookies(t *testing.T) {
 		}
 
 		w.WriteHeader(http.StatusOK)
-		w.Write(content)
+		_, _ = w.Write(content) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -1128,7 +1128,7 @@ func TestDomainClient_Download_WithAutoCookies(t *testing.T) {
 		t.Fatalf("SetCookie error = %v", err)
 	}
 
-	tmpFile := filepath.Join(os.TempDir(), "test_download_cookies.txt")
+	tmpFile := filepath.Join(t.TempDir(), "test_download_cookies.txt")
 	defer os.Remove(tmpFile)
 
 	_, err = client.Download(context.Background(), "/file.txt", &httpc.DownloadConfig{FilePath: tmpFile})
@@ -1155,7 +1155,7 @@ func TestDomainClient_Download_FullURL(t *testing.T) {
 	server2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		called = true
 		w.WriteHeader(http.StatusOK)
-		w.Write(content)
+		_, _ = w.Write(content) // best-effort test response
 	}))
 	defer server2.Close()
 
@@ -1165,7 +1165,7 @@ func TestDomainClient_Download_FullURL(t *testing.T) {
 	}
 	defer client.Close()
 
-	tmpFile := filepath.Join(os.TempDir(), "test_download_fullurl.txt")
+	tmpFile := filepath.Join(t.TempDir(), "test_download_fullurl.txt")
 	defer os.Remove(tmpFile)
 
 	result, err := client.Download(context.Background(), server2.URL+"/file.txt", &httpc.DownloadConfig{FilePath: tmpFile})
@@ -1204,14 +1204,14 @@ func TestDomainClient_Download_WithPathOptions(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				called = true
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte("content"))
+				_, _ = w.Write([]byte("content")) // best-effort test response
 			}))
 			defer server.Close()
 
 			client, _ := httpc.NewDomain(server.URL, httpc.TestingConfig())
 			defer client.Close()
 
-			tmpFile := filepath.Join(os.TempDir(), "test_path_"+tt.name+".txt")
+			tmpFile := filepath.Join(t.TempDir(), "test_path_"+tt.name+".txt")
 			defer os.Remove(tmpFile)
 
 			_, err := client.Download(context.Background(), tt.path, &httpc.DownloadConfig{FilePath: tmpFile})
@@ -1467,5 +1467,85 @@ func TestDomainClient_UninitializedFields(t *testing.T) {
 	_, err := dc.Request(context.Background(), "GET", "/test")
 	if err == nil {
 		t.Error("expected error for uninitialized DomainClient Request")
+	}
+}
+
+// TestDomainClient_CrossOriginSessionIsolation verifies session state scoped
+// to the base host is neither sent to nor captured from a request targeting
+// a different host via an absolute URL.
+func TestDomainClient_CrossOriginSessionIsolation(t *testing.T) {
+	var baseCookies []*http.Cookie
+	base := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		baseCookies = r.Cookies() // sequential requests: no lock needed
+		w.Header().Set("Set-Cookie", "session=basecookie; Path=/")
+		_, _ = w.Write([]byte("base"))
+	}))
+	defer base.Close()
+
+	var foreignAuth string
+	foreign := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		foreignAuth = r.Header.Get("Authorization")
+		w.Header().Set("Set-Cookie", "foreign=leaked; Path=/")
+		_, _ = w.Write([]byte("foreign"))
+	}))
+	defer foreign.Close()
+
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true // httptest servers listen on 127.0.0.1
+	dc, err := httpc.NewDomain(base.URL, cfg)
+	if err != nil {
+		t.Fatalf("NewDomain() error: %v", err)
+	}
+	defer func() { _ = dc.Close() }()
+
+	// Establish session state on the base host.
+	if err := dc.SetHeader("Authorization", "Bearer secret-token"); err != nil {
+		t.Fatalf("SetHeader() error: %v", err)
+	}
+	if _, err := dc.Get("/"); err != nil {
+		t.Fatalf("base Get() error: %v", err)
+	}
+
+	// Cross-origin request: absolute URL to a different hostname (localhost
+	// resolves to the same loopback, but is a distinct origin for both the
+	// session gate and cookie matching).
+	foreignURL := strings.Replace(foreign.URL, "127.0.0.1", "localhost", 1)
+	if _, err := dc.Get(foreignURL + "/x"); err != nil {
+		t.Fatalf("foreign Get() error: %v", err)
+	}
+	if foreignAuth != "" {
+		t.Errorf("Authorization header leaked to foreign host: %q", foreignAuth)
+	}
+
+	// Foreign Set-Cookie must not have been captured into the session (the
+	// engine's shared cookie jar also does not replay a localhost host-only
+	// cookie to the 127.0.0.1 base origin).
+	if _, err := dc.Get("/"); err != nil {
+		t.Fatalf("base Get() #2 error: %v", err)
+	}
+	for _, c := range baseCookies {
+		if c.Name == "foreign" {
+			t.Errorf("foreign cookie captured into base session: %+v", c)
+		}
+	}
+	found := false
+	for _, c := range baseCookies {
+		if c.Name == "session" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("base session cookie missing on second request: %+v", baseCookies)
+	}
+
+	// Same hostname, different port is still a different origin for session
+	// headers. (Cookies are exempt: the shared engine jar is port-agnostic by
+	// cookie-spec design, so this request runs after the cookie assertions.)
+	foreignAuth = ""
+	if _, err := dc.Get(foreign.URL + "/x"); err != nil {
+		t.Fatalf("foreign Get() (same host, different port) error: %v", err)
+	}
+	if foreignAuth != "" {
+		t.Errorf("Authorization header leaked to same-host/different-port origin: %q", foreignAuth)
 	}
 }

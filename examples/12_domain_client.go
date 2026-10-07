@@ -16,7 +16,7 @@ import (
 // This example demonstrates DomainClient for automatic state management
 
 func main() {
-	fmt.Println("=== DomainClient Examples ===\n ")
+	fmt.Println("=== DomainClient Examples ===")
 
 	// 1. Basic Usage
 	demonstrateBasicUsage()
@@ -61,8 +61,8 @@ func demonstrateBasicUsage() {
 		return
 	}
 
-	fmt.Printf("✓ Created DomainClient for httpbin.org\n")
-	fmt.Printf("✓ Set %d persistent headers\n", len(client.GetHeaders()))
+	fmt.Printf("[OK] Created DomainClient for httpbin.org\n")
+	fmt.Printf("[OK] Set %d persistent headers\n", len(client.GetHeaders()))
 
 	// First request
 	resp1, err := client.Get("/get")
@@ -70,8 +70,8 @@ func demonstrateBasicUsage() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ First request: Status %d\n", resp1.StatusCode())
-	fmt.Printf("✓ Received %d cookies\n", len(resp1.ResponseCookies()))
+	fmt.Printf("[OK] First request: Status %d\n", resp1.StatusCode())
+	fmt.Printf("[OK] Received %d cookies\n", len(resp1.ResponseCookies()))
 
 	// Second request - headers and cookies automatically sent
 	resp2, err := client.Get("/get")
@@ -79,9 +79,9 @@ func demonstrateBasicUsage() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Second request: Status %d\n", resp2.StatusCode())
-	fmt.Printf("✓ Persistent headers: %d\n", len(client.GetHeaders()))
-	fmt.Printf("✓ Persistent cookies: %d\n\n", len(client.GetCookies()))
+	fmt.Printf("[OK] Second request: Status %d\n", resp2.StatusCode())
+	fmt.Printf("[OK] Persistent headers: %d\n", len(client.GetHeaders()))
+	fmt.Printf("[OK] Persistent cookies: %d\n\n", len(client.GetCookies()))
 }
 
 // demonstrateStateManagement shows cookie and header management
@@ -103,7 +103,7 @@ func demonstrateStateManagement() {
 		log.Printf("Operation failed: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Set %d headers\n", len(client.GetHeaders()))
+	fmt.Printf("[OK] Set %d headers\n", len(client.GetHeaders()))
 
 	// Add cookies manually
 	if err := client.SetCookies([]*http.Cookie{
@@ -113,7 +113,7 @@ func demonstrateStateManagement() {
 		log.Printf("Operation failed: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Set %d cookies\n", len(client.GetCookies()))
+	fmt.Printf("[OK] Set %d cookies\n", len(client.GetCookies()))
 
 	// Make request - all state automatically sent
 	resp, err := client.Get("/cookies")
@@ -121,7 +121,7 @@ func demonstrateStateManagement() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Request with state: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Request with state: Status %d\n", resp.StatusCode())
 
 	// Override header for single request
 	resp, err = client.Get("/get",
@@ -131,15 +131,15 @@ func demonstrateStateManagement() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Request with override: Status %d\n", resp.StatusCode())
-	fmt.Printf("✓ Persistent headers still intact: %d\n", len(client.GetHeaders()))
+	fmt.Printf("[OK] Request with override: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Persistent headers still intact: %d\n", len(client.GetHeaders()))
 
 	// Clear state
 	client.ClearCookies()
-	fmt.Printf("✓ Cleared cookies: %d remaining\n", len(client.GetCookies()))
+	fmt.Printf("[OK] Cleared cookies: %d remaining\n", len(client.GetCookies()))
 
 	client.ClearHeaders()
-	fmt.Printf("✓ Cleared headers: %d remaining\n\n", len(client.GetHeaders()))
+	fmt.Printf("[OK] Cleared headers: %d remaining\n\n", len(client.GetHeaders()))
 
 	// Access underlying SessionManager
 	session := client.Session()
@@ -169,14 +169,28 @@ func demonstrateRelativePaths() {
 	for _, path := range paths {
 		resp, err := client.Get(path)
 		if err != nil {
-			fmt.Printf("  ✗ %s: %v\n", path, err)
+			fmt.Printf("  [X] %s: %v\n", path, err)
 		} else {
-			fmt.Printf("  ✓ %s → Status %d\n", path, resp.StatusCode())
+			fmt.Printf("  [OK] %s -> Status %d\n", path, resp.StatusCode())
 		}
 	}
 
 	fmt.Println("\nTip: Use relative paths for domain-scoped requests")
 	fmt.Println("  Example: client.Get(\"/api/users\") instead of full URLs")
+
+	// Request() also resolves relative paths and takes an explicit context —
+	// the general-purpose form when the method is determined at runtime.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	resp, err := client.Request(ctx, "GET", "/get",
+		httpc.WithQuery("via", "request"),
+	)
+	if err != nil {
+		log.Printf("Request error: %v\n", err)
+		return
+	}
+	fmt.Printf("\n[OK] Request(ctx, \"GET\", \"/get\") -> Status %d\n", resp.StatusCode())
 }
 
 // demonstrateCustomConfigAndDownload shows NewDomain with a custom Config
@@ -197,7 +211,7 @@ func demonstrateCustomConfigAndDownload() {
 		return
 	}
 	defer dc.Close()
-	fmt.Printf("✓ Created DomainClient with custom config (UA: %s)\n", cfg.Defaults.UserAgent)
+	fmt.Printf("[OK] Created DomainClient with custom config (UA: %s)\n", cfg.Defaults.UserAgent)
 
 	// DomainClient.Download works like Client.Download but resolves the path
 	// against the base URL and captures response cookies into the session.
@@ -220,7 +234,7 @@ func demonstrateCustomConfigAndDownload() {
 		return
 	}
 
-	fmt.Printf("✓ Downloaded via DomainClient: %s (%s)\n",
+	fmt.Printf("[OK] Downloaded via DomainClient: %s (%s)\n",
 		result.FilePath, httpc.FormatBytes(result.BytesWritten))
-	fmt.Println("  Response cookies are captured into the session automatically.\n ")
+	fmt.Println("  Response cookies are captured into the session automatically.")
 }
