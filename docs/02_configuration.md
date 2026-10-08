@@ -55,6 +55,7 @@ Retry:
 - Retry.BackoffFactor: 2.0
 - Retry.EnableJitter: true
 - Retry.MaxRetryDelay: 30 seconds
+- Retry.RetryNonIdempotent: false (POST/PATCH execute exactly once)
 
 Defaults (Request Defaults):
 - Defaults.UserAgent: "httpc/1.0"
@@ -422,13 +423,14 @@ client, err := httpc.New(config)
 | `Connection.ProxyPoolStrategy`     | `ProxyStrategy` | RoundRobin | Strategy for selecting proxies from pool |
 | `Connection.ProxyFailureThreshold` | `int`           | 0 (defaults to 3) | Consecutive connection failures before circuit-breaking a proxy |
 | `Connection.ProxyCooldown`         | `time.Duration` | 0 (defaults to 30s) | How long a circuit-broken proxy stays out of rotation |
-| `Connection.ProxyRotateOnStatus`   | `[]int`         | nil     | HTTP status codes that trigger proxy rotation |
+| `Connection.ProxyRotateOnStatus`   | `[]int`         | nil     | HTTP status codes that trigger proxy rotation (effective only when `Retry.MaxRetries > 0`; status-based rotation does not circuit-break the proxy, unlike connection failures) |
 | `Connection.ProxyRotatePerRequest` | `bool`          | false   | Close idle connections before each request so the transport re-evaluates the proxy pool, guaranteeing per-request rotation (adds overhead: no connection reuse). Requires ProxyPool; no effect with ProxyURL |
 | `Connection.EnableHTTP2`           | `bool`          | true    | Enable HTTP/2                                |
 | `Connection.EnableCookies`         | `bool`          | false   | Enable automatic cookie jar                  |
+| `Connection.PublicSuffixList`      | `cookiejar.PublicSuffixList` | nil | Public-suffix database for the cookie jar (recommended: `golang.org/x/net/publicsuffix.List`); without one the jar accepts cookies on public suffixes (supercookies). Zero-dependency field — the type is the stdlib interface |
 | `Connection.EnableDoH`             | `bool`          | false   | Enable DNS-over-HTTPS resolution             |
 | `Connection.DoHCacheTTL`           | `time.Duration` | 5m      | DoH DNS cache TTL                            |
-| `Connection.MaxResponseHeaderBytes`| `int64`         | 0       | Max server response header size (0 = Go stdlib default 10MB) |
+| `Connection.MaxResponseHeaderBytes`| `int64`         | 0       | Max server response header size (0 = Go stdlib default 1MB) |
 
 ### Security
 
@@ -446,11 +448,13 @@ client, err := httpc.New(config)
 | `Security.TLSConfig`            | `*tls.Config` | nil     | Custom TLS configuration           |
 | `Security.ValidateURL`          | `bool`        | true    | Enable URL validation              |
 | `Security.ValidateHeaders`      | `bool`        | true    | Enable header validation (CRLF prevention) |
-| `Security.CookieSecurity`       | `*CookieSecurityConfig` | nil | Cookie security attribute validation (use `httpc.DefaultCookieSecurityConfig()` or `httpc.StrictCookieSecurityConfig()`) |
+| `Security.CookieSecurity`       | `*CookieSecurityConfig` | nil | Cookie security attributes — **currently not enforced during request processing**; enforce via `WithSecureCookie` (per request) or `SessionConfig.CookieSecurity` (per session) instead |
 | `Security.RedirectWhitelist`    | `[]string`    | nil     | Allowed domains for redirects      |
 | `Security.CertificatePinner`    | `CertificatePinner` | nil | Certificate pinning for MITM defense (see `NewSPKIHashPinner`, `NewPublicKeyPinner`) |
 
 **Note:** URL and header validation are enabled by default for security.
+
+**SSRF and proxies:** when a proxy (`Connection.ProxyURL`, `ProxyPool`, or system proxy) is active, the transport dials only the proxy and the target hostname is resolved *by the proxy*. The client-side resolve-validate-dial SSRF guard therefore does not see the target's resolved IPs — only the hostname-string pre-check applies (legacy IP-literal notations like `0x7f000001` are still blocked). A public-looking hostname that resolves to a private address *at the proxy* can pivot the proxy toward its own internal network (proxy-side metadata services, etc.). Only route through proxies you control, and treat the proxy itself as the SSRF trust boundary.
 
 ### Retry
 
@@ -461,9 +465,12 @@ client, err := httpc.New(config)
 | `Retry.BackoffFactor`    | `float64`       | 2.0     | Exponential backoff factor |
 | `Retry.EnableJitter`     | `bool`          | true    | Enable jitter in retry delay |
 | `Retry.MaxRetryDelay`    | `time.Duration` | 30s     | Cap on maximum delay between retries |
+| `Retry.RetryNonIdempotent` | `bool`        | false   | Retry non-idempotent methods (POST/PATCH/custom) — see note below |
 | `Retry.CustomPolicy`     | `RetryPolicy`   | nil     | Custom retry logic override |
 
 **Note:** If Retry-After header is present in the response, its value takes precedence (capped at 60s).
+
+**Retry idempotency (default since v1.7.0):** retries apply only to idempotent methods (GET, HEAD, OPTIONS, TRACE, PUT, DELETE). A POST or PATCH executes exactly once even when `MaxRetries > 0` — a timeout or retryable 5xx may arrive *after* the server committed the operation, and replaying the body could duplicate it (double payment, double insert). To opt in for a replay-tolerant endpoint, set `Retry.RetryNonIdempotent: true` on the Config, or scope it to a single request with `WithRetryNonIdempotent(true)`. Idempotency keys are the safer server-side companion either way.
 
 ### Middleware
 
@@ -481,7 +488,7 @@ headers, and redirect policy.
 | `Defaults.UserAgent`         | `string`            | "httpc/1.0" | User-Agent header                |
 | `Defaults.FollowRedirects`   | `bool`              | true        | Follow HTTP redirects            |
 | `Defaults.MaxRedirects`      | `int`               | 10          | Maximum redirects to follow      |
-| `Defaults.Headers`           | `map[string]string` | nil         | Default headers for all requests |
+| `Defaults.Headers`           | `map[string]string` | empty map (initialized) | Default headers for all requests |
 
 ## Best Practices
 

@@ -71,6 +71,7 @@ func (m *metrics) snapshot() metricsSnapshot {
 }
 
 // reset resets all metrics to zero.
+// Currently exercised only by tests.
 func (m *metrics) reset() {
 	m.totalRequests.Store(0)
 	m.successfulRequests.Store(0)

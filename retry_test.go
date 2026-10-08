@@ -54,7 +54,7 @@ func TestRetry_Behavior(t *testing.T) {
 			config.Retry.Delay = tt.delay
 			config.Security.AllowPrivateIPs = true
 			client, _ := New(config)
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			resp, err := client.Get(server.URL)
 			if err != nil {
@@ -99,7 +99,7 @@ func TestRetry_StatusCodes(t *testing.T) {
 				config.Retry.Delay = 10 * time.Millisecond
 				config.Security.AllowPrivateIPs = true
 				client, _ := New(config)
-				defer client.Close()
+				defer func() { _ = client.Close() }()
 
 				resp, err := client.Get(server.URL)
 				if err != nil {
@@ -141,7 +141,7 @@ func TestRetry_StatusCodes(t *testing.T) {
 				config.Retry.Delay = 10 * time.Millisecond
 				config.Security.AllowPrivateIPs = true
 				client, _ := New(config)
-				defer client.Close()
+				defer func() { _ = client.Close() }()
 
 				resp, err := client.Get(server.URL)
 				if err != nil {
@@ -183,7 +183,7 @@ func TestRetry_Backoff(t *testing.T) {
 	config.Retry.EnableJitter = false // Disable jitter for predictable testing
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Get(server.URL)
 	if err != nil {
@@ -238,7 +238,7 @@ func TestRetry_ContextCancellation(t *testing.T) {
 	config.Retry.Delay = 200 * time.Millisecond
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Create a context that will be cancelled
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
@@ -298,7 +298,7 @@ func TestRetry_RetryAfterHeader(t *testing.T) {
 	config.Retry.Delay = 100 * time.Millisecond
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	start := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -329,4 +329,34 @@ func TestRetry_RetryAfterHeader(t *testing.T) {
 	}
 
 	t.Logf("Request completed in %v with %d attempts", duration, resp.Meta.Attempts)
+}
+
+// TestRetry_PerRequestMaxRetriesOption covers the WithMaxRetries per-request
+// knob (moved from request_test.go: it is retry behavior — only the knob is
+// option-layer). A flaky 500-then-200 server must recover via retries.
+func TestRetry_PerRequestMaxRetriesOption(t *testing.T) {
+	attempts := int32(0)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := atomic.AddInt32(&attempts, 1)
+		if count < 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client, _ := newTestClient()
+	defer func() { _ = client.Close() }()
+
+	resp, err := client.Get(server.URL, WithMaxRetries(3))
+	if err != nil {
+		t.Fatalf("Request failed: %v", err)
+	}
+	if resp.StatusCode() != http.StatusOK {
+		t.Errorf("Expected 200, got %d", resp.StatusCode())
+	}
+	if resp.Meta.Attempts < 2 {
+		t.Errorf("Expected at least 2 attempts with retries, got %d", resp.Meta.Attempts)
+	}
 }

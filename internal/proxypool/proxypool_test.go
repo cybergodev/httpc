@@ -1,6 +1,7 @@
 package proxypool
 
 import (
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -179,10 +180,8 @@ func TestReportSuccess_ResetsCircuit(t *testing.T) {
 		t.Fatalf("New() failed: %v", err)
 	}
 
+	// Trip the breaker, then report success and verify it resets.
 	pool.ReportFailure("proxy1.example.com:8080")
-	got, _ := pool.Select(nil)
-	// Only one proxy and it's open — Select returns it as fallback
-	// Now report success and verify it's healthy again
 	pool.ReportSuccess("proxy1.example.com:8080")
 
 	// Verify openUntil was reset
@@ -193,7 +192,6 @@ func TestReportSuccess_ResetsCircuit(t *testing.T) {
 	if f := e.failures.Load(); f != 0 {
 		t.Errorf("after ReportSuccess, failures = %d, want 0", f)
 	}
-	_ = got
 }
 
 func TestReportFailure_ThresholdNotReached(t *testing.T) {
@@ -482,5 +480,128 @@ func TestSelectIndex_SkipsCircuitOpen(t *testing.T) {
 	got := pool.SelectIndex(0)
 	if got.Host != "proxy2.example.com:8080" {
 		t.Errorf("SelectIndex(0) with proxy1 circuit open: got %s, want proxy2", got.Host)
+	}
+}
+
+// TestSelectRandom_AlwaysFindsHealthyEntry verifies the random strategy
+// returns the only healthy proxy whenever one exists. The previous bounded
+// random probing missed it ~35% of the time (n=10, m=1) and fell back to a
+// circuit-open entry.
+func TestSelectRandom_AlwaysFindsHealthyEntry(t *testing.T) {
+	const n = 10
+	proxies := make([]string, 0, n)
+	hosts := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		proxies = append(proxies, fmt.Sprintf("http://proxy%d.example.com:8080", i))
+		hosts = append(hosts, fmt.Sprintf("proxy%d.example.com:8080", i))
+	}
+
+	pool, err := New(Config{
+		Proxies:          proxies,
+		Strategy:         StrategyRandom,
+		FailureThreshold: 1, // open on first failure for easy testing
+		Cooldown:         10 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	// Open circuits for every proxy except index 7.
+	for i, host := range hosts {
+		if i != 7 {
+			pool.ReportFailure(host)
+		}
+	}
+
+	for i := 0; i < 100; i++ {
+		got, err := pool.Select(nil)
+		if err != nil {
+			t.Fatalf("Select() error: %v", err)
+		}
+		if got.Host != hosts[7] {
+			t.Fatalf("iteration %d: Select() = %s, want the only healthy proxy %s", i, got.Host, hosts[7])
+		}
+	}
+}
+
+// TestSelectIndex_NegativeAttempt verifies the negative-modulo correction:
+// a negative attempt (caller bug upstream of the API contract) must still map
+// into the valid index range and return a configured proxy, never panic or
+// index out of range.
+func TestSelectIndex_NegativeAttempt(t *testing.T) {
+	pool, err := New(Config{
+		Proxies: []string{
+			"http://proxy1.example.com:8080",
+			"http://proxy2.example.com:8080",
+			"http://proxy3.example.com:8080",
+		},
+	})
+	if err != nil {
+		t.Fatalf("New() failed: %v", err)
+	}
+
+	byHost := map[string]bool{
+		"http://proxy1.example.com:8080": true,
+		"http://proxy2.example.com:8080": true,
+		"http://proxy3.example.com:8080": true,
+	}
+
+	for _, attempt := range []int{-1, -2, -3, -4, -100} {
+		got := pool.SelectIndex(attempt)
+		if got == nil {
+			t.Fatalf("SelectIndex(%d) = nil, want a configured proxy", attempt)
+		}
+		if !byHost[got.String()] {
+			t.Errorf("SelectIndex(%d) = %s, not a configured proxy", attempt, got)
+		}
+	}
+}
+
+// TestPortlessProxyCanonicalKeys verifies that pool entries are keyed by the
+// canonical dial address (default port appended) rather than the raw url.Host.
+// net/http dials canonicalAddr (e.g. "socks5://p" → "p:1080"); before this
+// normalization, ReportFailure with the dialed address never matched the
+// portless key, so circuit breaking silently never fired for portless proxies.
+func TestPortlessProxyCanonicalKeys(t *testing.T) {
+	pool, err := New(Config{
+		Proxies: []string{
+			"http://http-proxy.example.com",
+			"https://tls-proxy.example.com",
+			"socks5://socks-proxy.example.com",
+			"http://explicit.example.com:8080",
+		},
+		FailureThreshold: 1,
+	})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	want := map[string]bool{
+		"http-proxy.example.com:80":    true,
+		"tls-proxy.example.com:443":    true,
+		"socks-proxy.example.com:1080": true,
+		"explicit.example.com:8080":    true,
+	}
+	for _, h := range pool.Hosts() {
+		if !want[h] {
+			t.Errorf("unexpected host key %q (want one of the canonical forms)", h)
+		}
+		delete(want, h)
+	}
+	if len(want) > 0 {
+		t.Errorf("missing canonical host keys: %v", want)
+	}
+
+	// Reporting with the address net/http actually dials must circuit-break
+	// the portless socks proxy (threshold 1). Assert on the entry's internal
+	// circuit state directly — selecting an index would trivially return the
+	// earlier healthy http proxy regardless.
+	pool.ReportFailure("socks-proxy.example.com:1080")
+	e := pool.byHost["socks-proxy.example.com:1080"]
+	if e == nil {
+		t.Fatal("byHost missing canonical key socks-proxy.example.com:1080")
+	}
+	if ou := e.openUntil.Load(); ou == 0 {
+		t.Error("portless socks proxy was not circuit-broken after canonical ReportFailure (openUntil = 0)")
 	}
 }

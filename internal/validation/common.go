@@ -110,6 +110,30 @@ func ValidateFieldName(name string, fieldType string) error {
 	})
 }
 
+// ValidateMultipartToken validates a token (form field name or filename) that
+// will be embedded in a Content-Disposition quoted-string at the multipart
+// encoding sink (engine request building). It rejects control characters —
+// the bytes that can break out of the quoted string and inject additional
+// MIME headers (CR/LF) or corrupt the part stream — plus excessive length.
+//
+// Unlike ValidateFieldName (the stricter option-layer policy applied by
+// WithFile), characters such as '/', '&', or non-ASCII remain legal here:
+// they cannot escape a quoted-string parameter value because the encoder
+// backslash-escapes '"' and '\', and the multipart writer quotes every value.
+// Every path that encodes a *FormData must call this so the validation cannot
+// be bypassed by constructing FormData directly instead of via WithFile.
+func ValidateMultipartToken(s, what string) error {
+	if len(s) > MaxFilenameLen {
+		return fmt.Errorf("%s too long (max %d)", what, MaxFilenameLen)
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7F {
+			return fmt.Errorf("%s contains control characters", what)
+		}
+	}
+	return nil
+}
+
 // ValidateHeaderKeyValue validates HTTP header keys and values.
 func ValidateHeaderKeyValue(key, value string) error {
 	if err := validateInputString(key, MaxHeaderKeyLen, "header key", func(r rune) error {
@@ -119,10 +143,6 @@ func ValidateHeaderKeyValue(key, value string) error {
 		return nil
 	}); err != nil {
 		return err
-	}
-
-	if strings.HasPrefix(key, ":") {
-		return fmt.Errorf("pseudo-headers not allowed")
 	}
 
 	if len(value) > MaxHeaderValueLen {

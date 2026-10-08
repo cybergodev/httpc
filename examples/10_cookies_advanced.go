@@ -14,7 +14,7 @@ import (
 // This example demonstrates comprehensive cookie handling
 
 func main() {
-	fmt.Println("=== Advanced Cookie Handling ===\n ")
+	fmt.Println("=== Advanced Cookie Handling ===")
 
 	// 1. Request Cookies
 	demonstrateRequestCookies()
@@ -31,6 +31,9 @@ func main() {
 	// 5. Advanced Cookie Scenarios
 	demonstrateAdvancedScenarios()
 
+	// 6. Request Cookie Inspection (Result accessors)
+	demonstrateRequestCookieInspection()
+
 	fmt.Println("\n=== All Examples Completed ===")
 }
 
@@ -45,15 +48,15 @@ func demonstrateRequestCookies() {
 	}
 	defer client.Close()
 
-	// Method 1: Single cookie using WithCookie
+	// Method 1: Single cookie using WithCookies
 	resp, err := client.Get("https://httpbin.org/cookies",
-		httpc.WithCookie(http.Cookie{Name: "session_id", Value: "abc123"}),
+		httpc.WithCookies([]http.Cookie{{Name: "session_id", Value: "abc123"}}),
 	)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Single cookie: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Single cookie: Status %d\n", resp.StatusCode())
 
 	// Method 2: Batch multiple cookies using WithCookies (efficient)
 	resp, err = client.Get("https://httpbin.org/cookies",
@@ -67,7 +70,7 @@ func demonstrateRequestCookies() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Batch cookies (WithCookies): Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Batch cookies (WithCookies): Status %d\n", resp.StatusCode())
 
 	// Method 3: Cookie with attributes (full http.Cookie struct)
 	cookie := http.Cookie{
@@ -79,13 +82,13 @@ func demonstrateRequestCookies() {
 		HttpOnly: true,
 	}
 	resp, err = client.Get("https://httpbin.org/cookies",
-		httpc.WithCookie(cookie),
+		httpc.WithCookies([]http.Cookie{cookie}),
 	)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Cookie with attributes: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Cookie with attributes: Status %d\n", resp.StatusCode())
 
 	// Method 4: Multiple cookies using cookie string
 	cookieString := "cookie1=value1; cookie2=value2; cookie3=value3"
@@ -96,7 +99,7 @@ func demonstrateRequestCookies() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Multiple cookies (string): Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Multiple cookies (string): Status %d\n", resp.StatusCode())
 
 	// Method 5: Multiple cookies using map
 	cookieMap := map[string]string{
@@ -111,7 +114,7 @@ func demonstrateRequestCookies() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Cookie map: Status %d\n\n", resp.StatusCode())
+	fmt.Printf("[OK] Cookie map: Status %d\n\n", resp.StatusCode())
 }
 
 // demonstrateResponseCookies shows how to read cookies from responses
@@ -141,15 +144,15 @@ func demonstrateResponseCookies() {
 
 	// Method 2: Get specific cookie by name
 	if sessionCookie := resp.GetCookie("session"); sessionCookie != nil {
-		fmt.Printf("✓ Session cookie: %s\n", sessionCookie.Value)
+		fmt.Printf("[OK] Session cookie: %s\n", sessionCookie.Value)
 	}
 
 	// Method 3: Check if cookie exists
 	if resp.HasCookie("user") {
-		fmt.Println("✓ User cookie present")
+		fmt.Println("[OK] User cookie present")
 	}
 	if !resp.HasCookie("nonexistent") {
-		fmt.Println("✓ Nonexistent cookie not present\n ")
+		fmt.Println("[OK] Nonexistent cookie not present")
 	}
 }
 
@@ -174,7 +177,7 @@ func demonstrateCookieJar() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Status: %d (cookies stored in jar)\n", resp1.StatusCode())
+	fmt.Printf("[OK] Status: %d (cookies stored in jar)\n", resp1.StatusCode())
 
 	// Step 2: Cookies automatically sent in subsequent requests
 	fmt.Println("\nStep 2: Cookies automatically sent")
@@ -183,8 +186,8 @@ func demonstrateCookieJar() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Status: %d\n", resp2.StatusCode())
-	fmt.Printf("✓ Cookies persisted across requests\n\n")
+	fmt.Printf("[OK] Status: %d\n", resp2.StatusCode())
+	fmt.Printf("[OK] Cookies persisted across requests\n\n")
 }
 
 // demonstrateCookieString shows cookie string parsing
@@ -207,18 +210,18 @@ func demonstrateCookieString() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Parsed cookie string: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Parsed cookie string: Status %d\n", resp.StatusCode())
 
 	// Combine with other cookie methods
 	resp, err = client.Get("https://httpbin.org/cookies",
 		httpc.WithCookieString("session=abc123; token=xyz789"),
-		httpc.WithCookie(http.Cookie{Name: "manual", Value: "cookie"}),
+		httpc.WithCookies([]http.Cookie{{Name: "manual", Value: "cookie"}}),
 	)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Combined cookies: Status %d\n\n", resp.StatusCode())
+	fmt.Printf("[OK] Combined cookies: Status %d\n\n", resp.StatusCode())
 }
 
 // demonstrateAdvancedScenarios shows real-world cookie patterns
@@ -243,14 +246,14 @@ func demonstrateAdvancedScenarios() {
 		SameSite: http.SameSiteStrictMode,
 	}
 	resp, err := client.Post("https://httpbin.org/post",
-		httpc.WithCookie(sessionCookie),
+		httpc.WithCookies([]http.Cookie{sessionCookie}),
 		httpc.WithJSON(map[string]string{"action": "login"}),
 	)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Session management: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Session management: Status %d\n", resp.StatusCode())
 
 	// Scenario 2: Multiple purpose cookies (using WithCookies batch)
 	resp, err = client.Get("https://httpbin.org/cookies",
@@ -264,11 +267,11 @@ func demonstrateAdvancedScenarios() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Multiple purpose cookies (WithCookies): Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Multiple purpose cookies (WithCookies): Status %d\n", resp.StatusCode())
 
 	// Scenario 3: Cookies with authentication
 	resp, err = client.Get("https://httpbin.org/cookies",
-		httpc.WithCookie(http.Cookie{Name: "session", Value: "active"}),
+		httpc.WithCookies([]http.Cookie{{Name: "session", Value: "active"}}),
 		httpc.WithBearerToken("jwt_token_here"),
 		httpc.WithHeader("X-Request-ID", "12345"),
 	)
@@ -276,24 +279,60 @@ func demonstrateAdvancedScenarios() {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Cookies with auth: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Cookies with auth: Status %d\n", resp.StatusCode())
 
 	// Scenario 4: Secure cookie with validation
 	// Note: WithSecureCookie validates cookies already on the request,
 	// so add cookies first, then validate.
 	resp, err = client.Get("https://httpbin.org/cookies",
-		httpc.WithCookie(http.Cookie{
+		httpc.WithCookies([]http.Cookie{{
 			Name:     "secure_session",
 			Value:    "encrypted_value",
 			Secure:   true,
 			HttpOnly: true,
 			SameSite: http.SameSiteStrictMode,
-		}),
+		}}),
 		httpc.WithSecureCookie(httpc.StrictCookieSecurityConfig()),
 	)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
 		return
 	}
-	fmt.Printf("✓ Secure cookie: Status %d\n", resp.StatusCode())
+	fmt.Printf("[OK] Secure cookie: Status %d\n", resp.StatusCode())
+}
+
+// demonstrateRequestCookieInspection shows the Result-side request-cookie
+// accessors: RequestCookies, GetRequestCookie, and HasRequestCookie report
+// the cookies that were actually sent — useful for debugging cookie jars
+// and session state.
+func demonstrateRequestCookieInspection() {
+	fmt.Println("--- Request Cookie Inspection (Result) ---")
+
+	client, err := httpc.NewDefault()
+	if err != nil {
+		log.Printf("Failed to create client: %v\n", err)
+		return
+	}
+	defer client.Close()
+
+	resp, err := client.Get("https://httpbin.org/cookies",
+		httpc.WithCookies([]http.Cookie{
+			{Name: "session_id", Value: "abc123"},
+			{Name: "csrf_token", Value: "xyz789"},
+		}),
+	)
+	if err != nil {
+		log.Printf("Error: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Request cookies sent: %d\n", len(resp.RequestCookies()))
+	for _, c := range resp.RequestCookies() {
+		fmt.Printf("  %s = %s\n", c.Name, c.Value)
+	}
+	if c := resp.GetRequestCookie("session_id"); c != nil {
+		fmt.Printf("[OK] GetRequestCookie(session_id) = %s\n", c.Value)
+	}
+	fmt.Printf("HasRequestCookie(csrf_token): %v\n", resp.HasRequestCookie("csrf_token"))
+	fmt.Printf("HasRequestCookie(missing):    %v\n", resp.HasRequestCookie("nonexistent"))
 }

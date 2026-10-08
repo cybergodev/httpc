@@ -22,8 +22,6 @@ var resultBuilderPool = sync.Pool{
 }
 
 const (
-	maxBodyPreview   = 200 // Maximum body preview length in String()
-	truncationMarker = "...[truncated]"
 	// maxResultBuilderCap bounds the backing array retained by resultBuilderPool.
 	// Mirrors the cap guards on formBuilderPool / errorBuilderPool so a result
 	// with an unusually large header set cannot bloat the pooled builder.
@@ -64,9 +62,15 @@ var cachedSensitiveHeaderNames = func() []string {
 // mocks; reading them on a client-returned Result requires a nil-check on the
 // nested pointer (e.g. Response may be nil when the request errored).
 type Result struct {
-	Request  *RequestInfo
+	// Request describes the request as finally sent (after redirects,
+	// retries, and middleware).
+	Request *RequestInfo
+	// Response carries the final response data; nil when the request errored
+	// before a response arrived.
 	Response *ResponseInfo
-	Meta     *RequestMeta
+	// Meta carries request metadata (duration, attempts, proxy used); nil
+	// only for zero-value Results constructed by callers.
+	Meta *RequestMeta
 }
 
 // RequestInfo contains details about the HTTP request that was sent.
@@ -107,6 +111,13 @@ type RequestMeta struct {
 	Duration time.Duration
 	// Attempts is the number of request attempts including retries.
 	Attempts int
+	// ProxyURL is the URL of the proxy that served the final attempt of this
+	// request, as selected by the configured proxy (a single Connection.ProxyURL
+	// or a proxy pool entry). Empty when no proxy was used or the connection
+	// was direct. With proxy rotation each retry attempt may use a different
+	// proxy; this field reports the proxy that produced the returned response
+	// (see Attempts for the number of attempts made).
+	ProxyURL string
 	// RedirectChain contains the URLs followed during redirects.
 	RedirectChain []string
 	// RedirectCount is the number of redirects followed.
@@ -253,7 +264,9 @@ func (r *Result) HasRequestCookie(name string) bool {
 }
 
 // String returns a human-readable representation of the Result.
-// Sensitive headers are masked. Body is truncated to 200 characters.
+// Sensitive headers are masked. Body content is never included — only its
+// size — because response bodies frequently carry credentials (OAuth token
+// endpoints, session payloads) that must not reach logs.
 func (r *Result) String() string {
 	if r == nil || r.Response == nil {
 		return "Result{}"
@@ -271,8 +284,7 @@ func (r *Result) String() string {
 		estimatedSize += 32 // Cookies count
 	}
 	if len(r.Response.Body) > 0 {
-		bodyPreview := min(len(r.Response.Body), maxBodyPreview)
-		estimatedSize += 16 + bodyPreview + len(truncationMarker)
+		estimatedSize += 32 // "Body: [N bytes omitted]"
 	}
 
 	// Use pooled strings.Builder to reduce allocations
@@ -325,13 +337,11 @@ func (r *Result) String() string {
 	}
 
 	if len(r.Response.Body) > 0 {
-		b.WriteString(", Body: ")
-		if len(r.Response.Body) > maxBodyPreview {
-			b.WriteString(r.Response.Body[:maxBodyPreview])
-			b.WriteString(truncationMarker)
-		} else {
-			b.WriteString(r.Response.Body)
-		}
+		// SECURITY: never include body content in String() — bodies often
+		// carry bearer tokens or session data. Size only.
+		b.WriteString(", Body: [")
+		b.Write(strconv.AppendInt(numBuf[:0], int64(len(r.Response.Body)), 10))
+		b.WriteString(" bytes omitted]")
 	}
 
 	b.WriteByte('}')
@@ -348,6 +358,11 @@ func (r *Result) String() string {
 // SaveToFile saves the response body to a file at the specified path.
 // Returns ErrResponseBodyEmpty if the response body is nil or empty.
 // The file path is validated for security (path traversal, symlinks, etc.).
+//
+// The body is written to a "<path>.httpc-tmp" sibling and atomically renamed
+// into place, matching writeDownloadBody's TOCTOU posture: a symlink swapped
+// in between prepareFilePath's Lstat check and the write is never opened for
+// writing, and an interrupted save never leaves a partial destination file.
 func (r *Result) SaveToFile(filePath string) error {
 	if r == nil || r.Response == nil || r.Response.RawBody == nil {
 		return ErrResponseBodyEmpty
@@ -358,8 +373,14 @@ func (r *Result) SaveToFile(filePath string) error {
 		return fmt.Errorf("file path validation failed: %w", err)
 	}
 
-	if err := os.WriteFile(validatedPath, r.Response.RawBody, 0644); err != nil {
+	tmpPath := validatedPath + downloadTmpSuffix
+	if err := os.WriteFile(tmpPath, r.Response.RawBody, filePermissions); err != nil {
+		_ = os.Remove(tmpPath) // best-effort cleanup of a partial write
 		return fmt.Errorf("failed to write file: %w", err)
+	}
+	if err := os.Rename(tmpPath, validatedPath); err != nil {
+		_ = os.Remove(tmpPath) // best-effort cleanup
+		return fmt.Errorf("failed to finalize file: %w", err)
 	}
 
 	return nil

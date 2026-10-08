@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Timeout and Retry Examples ===\n ")
+	fmt.Println("=== Timeout and Retry Examples ===")
 
 	// Example 1: Basic timeout
 	demonstrateBasicTimeout()

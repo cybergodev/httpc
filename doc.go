@@ -5,7 +5,8 @@
 //
 //   - Secure by default with TLS 1.2+, CRLF injection prevention, header validation
 //   - High performance with connection pooling, HTTP/2, and goroutine-safe operations
-//   - Built-in resilience with smart retry and exponential backoff
+//   - Built-in resilience with smart retry and exponential backoff;
+//     non-idempotent requests (POST/PATCH) execute exactly once by default
 //   - Clean API with simplified request options
 //
 // # Quick Start
@@ -71,6 +72,10 @@
 //   - Instance configuration uses Config structs, not functional options.
 //   - Every Config struct has a Default*Config() function returning sensible
 //     defaults — start from it, then modify fields as needed.
+//   - Middleware config types are named XxxConfig paired with
+//     DefaultXxxConfig(); TimeoutMiddlewareConfig is the lone exception,
+//     carrying the Middleware suffix to avoid colliding with the client-level
+//     TimeoutConfig (Config.Timeouts).
 //   - The main Config and SessionConfig are passed by value (required). Middleware
 //     configs are passed by pointer and may be nil to accept defaults;
 //     DownloadConfig is passed by pointer but is required (FilePath must be set).
@@ -138,7 +143,7 @@
 //	httpc.WithBasicAuth(username, password)
 //
 //	// Cookies
-//	httpc.WithCookie(http.Cookie{Name: "session", Value: "abc"})
+//	httpc.WithCookies([]http.Cookie{{Name: "session", Value: "abc"}})
 //	httpc.WithCookieString("session=abc; token=xyz")
 //	httpc.WithCookieMap(map[string]string{"session": "abc"})
 //	httpc.WithSecureCookie(securityConfig)
@@ -146,10 +151,12 @@
 //	// Request control
 //	httpc.WithContext(ctx)
 //	httpc.WithTimeout(30 * time.Second)
+//	httpc.WithNoTimeout() // lift the client default for one slow call
 //	httpc.WithMaxRetries(3)
+//	httpc.WithRetryNonIdempotent(true) // opt in to POST retries (replay-safe endpoints only)
 //	httpc.WithFollowRedirects(false)
 //	httpc.WithMaxRedirects(5)
-//	httpc.WithStreamBody(true)
+//	httpc.WithStreamBody(true) // Download only; errors on Get/Post/...
 //
 //	// Callbacks
 //	httpc.WithOnRequest(callback)

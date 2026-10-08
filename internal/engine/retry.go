@@ -114,6 +114,13 @@ func parseRetryAfterHeader(headers http.Header) time.Duration {
 	return 0
 }
 
+// maxClampDelay saturates an overflown backoff product. 1e18 ns ≈ 31.7 years
+// — far beyond any sane retry delay, exactly representable as float64, and
+// safely inside time.Duration's int64 range. float64(math.MaxInt64) itself
+// rounds UP to 2^63, which converts back to minInt64 on amd64 and would
+// reproduce the overflow this constant exists to prevent.
+const maxClampDelay = 1e18
+
 // calculateExponentialDelay calculates the exponential backoff delay with optional jitter.
 // Uses iterative multiplication instead of math.Pow for better performance.
 func (r *retryEngine) calculateExponentialDelay(attempt int) time.Duration {
@@ -131,8 +138,14 @@ func (r *retryEngine) calculateExponentialDelay(attempt int) time.Duration {
 	exponentialDelay := float64(delay)
 	for i := 0; i < attempt; i++ {
 		exponentialDelay *= backoffFactor
-		if math.IsInf(exponentialDelay, 0) {
-			exponentialDelay = float64(r.config.MaxRetryDelay)
+		// A validated-but-extreme configuration (RetryDelay=30m × BackoffFactor=10
+		// at attempt ≥ 7) grows the product past int64's range. Converting an
+		// out-of-range float to time.Duration is implementation-defined (negative
+		// on amd64), and a negative result slips past the MaxRetryDelay cap below,
+		// turning the backoff into an immediate retry. Saturate at maxClampDelay;
+		// the cap below then reduces it to MaxRetryDelay as intended.
+		if math.IsInf(exponentialDelay, 0) || exponentialDelay > maxClampDelay {
+			exponentialDelay = maxClampDelay
 			break
 		}
 	}
@@ -143,7 +156,10 @@ func (r *retryEngine) calculateExponentialDelay(attempt int) time.Duration {
 		result = r.config.MaxRetryDelay
 	}
 
-	// Apply jitter to prevent thundering herd
+	// Apply jitter to prevent thundering herd. NOTE: jitter runs AFTER the
+	// cap, so an actual sleep can exceed MaxRetryDelay by up to +10% (the
+	// jitter range is ±10% of the capped delay). Callers using MaxRetryDelay
+	// for strict deadline math must account for the overshoot.
 	if r.config.Jitter {
 		result = r.applyJitter(result)
 	}
@@ -192,4 +208,22 @@ func (r *retryEngine) getJitter(maxJitter time.Duration) time.Duration {
 
 func (r *retryEngine) isRetryableStatus(statusCode int) bool {
 	return retryableStatusCodes[statusCode] || r.extraRetryable[statusCode]
+}
+
+// idempotentMethods lists the HTTP methods that are idempotent per RFC 9110
+// §9.2.1 (safe methods plus PUT and DELETE). Requests using any other
+// method — POST, PATCH, CONNECT, or a custom extension method — are treated
+// as non-idempotent: the server may have committed side effects before the
+// failure that triggered the retry, so replaying the request is not safe by
+// default. executeWithRetry zeroes the retry budget for such methods unless
+// the caller opts in via Config.RetryNonIdempotent or
+// WithRetryNonIdempotent.
+func isIdempotentMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace,
+		http.MethodPut, http.MethodDelete:
+		return true
+	default:
+		return false
+	}
 }

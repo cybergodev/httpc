@@ -28,7 +28,7 @@ func BenchmarkClient_SimpleGET(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL)
 		if err != nil {
 			b.Fatal(err)
@@ -57,7 +57,7 @@ func BenchmarkClient_POST_JSON(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Post(server.URL, WithJSON(payload))
 		if err != nil {
 			b.Fatal(err)
@@ -105,12 +105,12 @@ func BenchmarkMicro_Headers(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL,
 			WithHeader("X-Request-Id", "abc-123-def"),
 			WithHeader("X-Custom-1", "value1"),
@@ -130,12 +130,12 @@ func BenchmarkMicro_ManyQueryParams(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL,
 			WithQuery("page", 1),
 			WithQuery("limit", 50),
@@ -162,12 +162,12 @@ func BenchmarkMicro_ResultReuse(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		result, err := client.Get(server.URL)
 		if err != nil {
 			b.Fatal(err)
@@ -187,12 +187,12 @@ func BenchmarkClient_MemoryAllocation_SmallResponse(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		resp, err := client.Get(server.URL)
 		if err != nil {
 			b.Fatal(err)
@@ -210,12 +210,12 @@ func BenchmarkClient_MemoryAllocation_LargeResponse(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		resp, err := client.Get(server.URL)
 		if err != nil {
 			b.Fatal(err)
@@ -246,12 +246,12 @@ func BenchmarkClient_WithRetry(b *testing.B) {
 	config.Security.AllowPrivateIPs = true
 
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, _ = client.Get(server.URL)
 	}
 }
@@ -264,12 +264,12 @@ func BenchmarkClient_WithTimeout(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL, WithTimeout(100*time.Millisecond))
 		if err != nil {
 			b.Error(err)
@@ -289,12 +289,12 @@ func BenchmarkClient_ContextCancellation(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 		_, _ = client.Request(ctx, "GET", server.URL)
 		cancel()
@@ -322,7 +322,7 @@ func BenchmarkDefaultClient_Get(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := Get(server.URL)
 		if err != nil {
 			b.Fatal(err)
@@ -341,7 +341,7 @@ func BenchmarkClient_WithHeaders(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	headers := map[string]string{
 		"X-Custom-1": "value1",
@@ -354,7 +354,7 @@ func BenchmarkClient_WithHeaders(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL, WithHeaderMap(headers))
 		if err != nil {
 			b.Fatal(err)
@@ -391,7 +391,7 @@ func BenchmarkResult_ConvenienceMethods(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = result.Body()
 		_ = result.StatusCode()
 		_ = result.RequestCookies()
@@ -414,7 +414,7 @@ func BenchmarkResult_CookieAccess(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = result.GetCookie("session")
 		_ = result.HasCookie("session")
 	}
@@ -429,7 +429,7 @@ func BenchmarkResult_Unmarshal(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		var data map[string]interface{}
 		_ = result.Unmarshal(&data)
 	}
@@ -451,7 +451,7 @@ func BenchmarkResult_String(b *testing.B) {
 
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_ = result.String()
 	}
 }
@@ -479,12 +479,12 @@ func BenchmarkClient_MultipartForm(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		form := &FormData{
 			Fields: map[string]string{
 				"username": "testuser",
@@ -514,7 +514,7 @@ func BenchmarkClient_MultipartForm_LargeFiles(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Create 50KB file content
 	largeContent := make([]byte, 50*1024)
@@ -525,7 +525,7 @@ func BenchmarkClient_MultipartForm_LargeFiles(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		form := &FormData{
 			Files: map[string]*FileData{
 				"file": {
@@ -553,12 +553,12 @@ func BenchmarkClient_QueryParams(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL,
 			WithQuery("page", "1"),
 			WithQuery("limit", "100"),
@@ -579,12 +579,12 @@ func BenchmarkClient_QueryParams_Typed(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL,
 			WithQuery("page", 1),
 			WithQuery("limit", 100),
@@ -608,12 +608,12 @@ func BenchmarkQueryEncode(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL,
 			WithQuery("page", 1),
 			WithQuery("limit", 100),
@@ -634,12 +634,12 @@ func BenchmarkMultipartBuild(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		form := &FormData{
 			Fields: map[string]string{
 				"username": "testuser",
@@ -669,7 +669,7 @@ func BenchmarkResult_Unmarshal_Opt(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	type TestResponse struct {
 		Name   string               `json:"name"`
@@ -681,7 +681,7 @@ func BenchmarkResult_Unmarshal_Opt(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		result, err := client.Get(server.URL)
 		if err != nil {
 			b.Fatal(err)
@@ -701,7 +701,7 @@ func BenchmarkConcurrent_SameURL(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -724,7 +724,7 @@ func BenchmarkConcurrent_DifferentURLs(b *testing.B) {
 	defer server.Close()
 
 	client, _ := newBenchmarkClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	b.ResetTimer()
 	b.ReportAllocs()
@@ -768,7 +768,7 @@ func BenchmarkClient_WithConfigHeaders(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL)
 		if err != nil {
 			b.Fatal(err)
@@ -791,14 +791,84 @@ func BenchmarkClient_WithCookies(b *testing.B) {
 	b.ResetTimer()
 	b.ReportAllocs()
 
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		_, err := client.Get(server.URL,
-			WithCookie(http.Cookie{Name: "session_id", Value: "abc123def456"}),
-			WithCookie(http.Cookie{Name: "csrf_token", Value: "xyz789"}),
-			WithCookie(http.Cookie{Name: "user_pref", Value: "dark_mode"}),
+			WithCookies([]http.Cookie{
+				{Name: "session_id", Value: "abc123def456"},
+				{Name: "csrf_token", Value: "xyz789"},
+				{Name: "user_pref", Value: "dark_mode"},
+			}),
 		)
 		if err != nil {
 			b.Fatal(err)
 		}
 	}
+}
+
+// Moved from middleware_test.go (benchmark in a unit-test file):
+func BenchmarkMiddlewareOverhead(b *testing.B) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	b.Run("NoMiddleware", func(b *testing.B) {
+		cfg := testConfig()
+		client, _ := New(cfg)
+		defer func() { _ = client.Close() }()
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, _ = client.Get(ts.URL)
+		}
+	})
+
+	b.Run("WithMiddleware", func(b *testing.B) {
+		cfg := testConfig()
+		cfg.Middleware.Middlewares = []MiddlewareFunc{
+			func(next Handler) Handler {
+				return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
+					return next(ctx, req)
+				}
+			},
+		}
+		client, _ := New(cfg)
+		defer func() { _ = client.Close() }()
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, _ = client.Get(ts.URL)
+		}
+	})
+
+	b.Run("WithThreeMiddlewares", func(b *testing.B) {
+		cfg := testConfig()
+		cfg.Middleware.Middlewares = []MiddlewareFunc{
+			func(next Handler) Handler {
+				return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
+					return next(ctx, req)
+				}
+			},
+			func(next Handler) Handler {
+				return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
+					return next(ctx, req)
+				}
+			},
+			func(next Handler) Handler {
+				return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
+					return next(ctx, req)
+				}
+			},
+		}
+		client, _ := New(cfg)
+		defer func() { _ = client.Close() }()
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for b.Loop() {
+			_, _ = client.Get(ts.URL)
+		}
+	})
 }

@@ -65,7 +65,7 @@ func demonstrateHEAD(client httpc.Client) {
 
 // demonstrateOPTIONS shows OPTIONS request usage
 func demonstrateOPTIONS(client httpc.Client) {
-	fmt.Println("--- Example 2: OPTIONS (Allowed Methods) ---")
+	fmt.Println("\n--- Example 2: OPTIONS (Allowed Methods) ---")
 
 	resp, err := client.Options("https://httpbin.org/post")
 	if err != nil {
@@ -89,7 +89,7 @@ func demonstrateOPTIONS(client httpc.Client) {
 
 // demonstratePATCH shows PATCH request usage
 func demonstratePATCH(client httpc.Client) {
-	fmt.Println("--- Example 3: PATCH (Partial Update) ---")
+	fmt.Println("\n--- Example 3: PATCH (Partial Update) ---")
 
 	// PATCH only updates specified fields
 	partialUpdate := map[string]any{
@@ -123,7 +123,7 @@ func demonstratePATCH(client httpc.Client) {
 
 // demonstrateGenericRequest shows the generic Request() method
 func demonstrateGenericRequest(client httpc.Client) {
-	fmt.Println("--- Example 4: Generic Request() Method ---")
+	fmt.Println("\n--- Example 4: Generic Request() Method ---")
 
 	ctx := context.Background()
 
@@ -147,6 +147,14 @@ func demonstrateGenericRequest(client httpc.Client) {
 			continue
 		}
 		fmt.Printf("  %s %s -> %d\n", m.method, m.url, resp.StatusCode())
+	}
+
+	// Package-level equivalent: httpc.Request uses the shared default client
+	resp, err := httpc.Request(ctx, "GET", "https://httpbin.org/get")
+	if err != nil {
+		log.Printf("Package-level Request error: %v\n", err)
+	} else {
+		fmt.Printf("  httpc.Request (package-level) -> %d\n", resp.StatusCode())
 	}
 
 	fmt.Println("\nUse Request() when:")

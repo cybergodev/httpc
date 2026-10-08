@@ -44,7 +44,7 @@ A fast, secure HTTP client library for Go with sensible defaults, minimal depend
 |---------|-------------|
 | **Secure by Default** | TLS 1.2+, SSRF protection, CRLF injection prevention, path traversal blocking |
 | **High Performance** | Connection pooling, HTTP/2, goroutine-safe, `sync.Pool` optimization |
-| **Built-in Resilience** | Smart retry with exponential backoff and jitter |
+| **Built-in Resilience** | Smart retry with exponential backoff and jitter — non-idempotent requests (POST/PATCH) execute exactly once by default |
 | **Automatic Decompression** | Transparent gzip/deflate handling with zip-bomb protection |
 | **Developer Friendly** | Clean API, intuitive options pattern, comprehensive documentation |
 | **Minimal Dependencies** | 1 dependency (golang.org/x/sys), pure Go stdlib |
@@ -259,7 +259,7 @@ httpc.WithStreamBody(true)
 
 ```go
 // Single cookie
-httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"})
+httpc.WithCookies([]http.Cookie{{Name: "session", Value: "abc123"}})
 
 // Batch multiple cookies (efficient, pre-allocates capacity)
 httpc.WithCookies([]http.Cookie{
@@ -326,7 +326,7 @@ httpc.WithOnResponse(func(resp httpc.ResponseMutator) error {
 | **Auth** | `WithBearerToken(token)`, `WithBasicAuth(user, pass)` |
 | **Query** | `WithQuery(key, value)`, `WithQueryMap(map)` |
 | **Body** | `WithJSON(data)`, `WithXML(data)`, `WithForm(map)`, `WithFormData(*FormData)`, `WithFile(field, filename, content)`, `WithBody(data, ...BodyKind)`, `WithBinary([]byte, ...contentType)`, `WithStreamBody(bool)` |
-| **Cookies** | `WithCookie(cookie)`, `WithCookies([]Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
+| **Cookies** | `WithCookies([]http.Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
 | **Control** | `WithTimeout(dur)`, `WithMaxRetries(n)`, `WithContext(ctx)`, `WithAllowPrivateIPs(bool)` |
 | **Redirects** | `WithFollowRedirects(bool)`, `WithMaxRedirects(n)` |
 | **Callbacks** | `WithOnRequest(fn)`, `WithOnResponse(fn)` |
@@ -341,7 +341,7 @@ result, _ := httpc.Get("https://api.example.com/users/123")
 // Result struct composition:
 // result.Request  -> *RequestInfo  (URL, Method, Headers, Cookies)
 // result.Response -> *ResponseInfo (StatusCode, Status, Proto, Headers, Body, RawBody, ContentLength, Cookies)
-// result.Meta     -> *RequestMeta  (Duration, Attempts, RedirectCount, RedirectChain)
+// result.Meta     -> *RequestMeta  (Duration, Attempts, ProxyURL, RedirectCount, RedirectChain)
 
 // Quick access methods (nil-safe)
 fmt.Println(result.StatusCode())     // 200
@@ -381,6 +381,7 @@ if err := result.SaveToFile("response.json"); err != nil {
 // Metadata
 fmt.Println(result.Meta.Duration)      // Request duration
 fmt.Println(result.Meta.Attempts)      // Retry count
+fmt.Println(result.Meta.ProxyURL)      // Proxy that served the request ("" = direct)
 fmt.Println(result.Meta.RedirectCount) // Redirect count
 fmt.Println(result.Meta.RedirectChain) // Redirect URLs
 
@@ -402,9 +403,16 @@ result, _ := httpc.Get("https://httpbin.org/gzip",
 fmt.Println(result.Body()) // already decompressed
 ```
 
-> **Note:** Brotli (`br`) and LZW (`compress`) are **not** supported and return an
-> error if a server sends them. Since httpc does not advertise them, this only
-> happens if you set `Accept-Encoding` manually.
+> **Note:** Any `Content-Encoding` other than `gzip`, `deflate` and `identity`
+> (e.g. Brotli `br`, LZW `compress`, `zstd`, or a multi-token list like
+> `gzip, br`) is **rejected with an error** instead of silently returning raw
+> compressed bytes as the body. Since httpc only advertises `gzip, deflate`,
+> this normally only happens if you set `Accept-Encoding` manually.
+
+> **Streaming:** requests with `WithStreamBody(true)` (including `Download`)
+> send `Accept-Encoding: identity` — the streaming path hands you the raw
+> transport bytes, so it never requests compressed content. A manual
+> `Accept-Encoding` on a streaming request is honored as-is.
 
 ---
 
@@ -578,8 +586,9 @@ result, _ := httpc.Download(ctx,
 ```
 
 > **Note:** Regular `Get` / `Post` / etc. **always buffer the full response body**
-> into memory. `WithStreamBody` has no effect on these methods — use `Download`
-> for large responses. See [File Download](#file-download) for details.
+> into memory. Passing `WithStreamBody(true)` to these methods returns
+> `ErrStreamBodyRequiresDownload` — use `Download` for large responses.
+> See [File Download](#file-download) for details.
 
 ---
 
@@ -768,7 +777,7 @@ config := httpc.Config{
 }
 
 // Validate configuration before creating client (New() also validates internally)
-if err := httpc.ValidateConfig(&config); err != nil {
+if err := config.Validate(); err != nil {
     log.Fatal(err)
 }
 
@@ -787,7 +796,7 @@ fmt.Println(config.String())
 | `PerformanceConfig()` | High throughput |
 | `MinimalConfig()` | Lightweight (no retries) |
 | `TestingConfig()` | Testing only - disables security features |
-| `ValidateConfig(cfg)` | Validate configuration, returns error |
+| `Config.Validate()` | Validate configuration, returns error (function form: `ValidateConfig(cfg)`) |
 | `Config.String()` | Safe string representation (sensitive values masked) |
 
 | Option | Type | Default | Description |
@@ -813,7 +822,7 @@ fmt.Println(config.String())
 | `Connection.EnableCookies` | `bool` | `false` | Enable cookie jar |
 | `Connection.EnableDoH` | `bool` | `false` | Enable DNS-over-HTTPS |
 | `Connection.DoHCacheTTL` | `time.Duration` | `5m` | DoH cache duration |
-| `Connection.MaxResponseHeaderBytes` | `int64` | `0` | Max response header size (0 = Go stdlib default 10MB) |
+| `Connection.MaxResponseHeaderBytes` | `int64` | `0` | Max response header size (0 = Go stdlib default 1MB) |
 | **Security** (`Security: httpc.SecurityConfig{...}`) ||||
 | `Security.TLSConfig` | `*tls.Config` | `nil` | Custom TLS config |
 | `Security.MinTLSVersion` | `uint16` | `TLS 1.2` | Minimum TLS version |
@@ -829,7 +838,7 @@ fmt.Println(config.String())
 | `Security.RedirectWhitelist` | `[]string` | `nil` | Allowed redirect domains |
 | `Security.MaxDecompressedBodySize` | `int64` | `100MB` | Max decompressed body size (zip bomb protection) |
 | `Security.SSRFExemptCIDRs` | `[]string` | `nil` | CIDR ranges exempted from SSRF blocking |
-| `Security.CookieSecurity` | `*CookieSecurityConfig` | `nil` | Cookie security validation rules |
+| `Security.CookieSecurity` | `*CookieSecurityConfig` | `nil` | Currently not enforced during requests — use `WithSecureCookie` or `SessionConfig.CookieSecurity` |
 | **Retry** (`Retry: httpc.RetryConfig{...}`) ||||
 | `Retry.MaxRetries` | `int` | `3` | Max retry attempts |
 | `Retry.Delay` | `time.Duration` | `1s` | Initial retry delay |
@@ -843,7 +852,7 @@ fmt.Println(config.String())
 | `Defaults.UserAgent` | `string` | `"httpc/1.0"` | Default User-Agent |
 | `Defaults.Headers` | `map[string]string` | `{}` | Default headers |
 | `Defaults.FollowRedirects` | `bool` | `true` | Follow redirects |
-| `Defaults.MaxRedirects` | `int` | `10` | Max redirect count |
+| `Defaults.MaxRedirects` | `int` | `10` | Redirect limit; counts the initial request, so 10 follows at most 9 redirects |
 
 ---
 
@@ -1003,6 +1012,19 @@ re-evaluates the proxy pool. It adds a small overhead (no connection reuse) but
 is essential for scraping or fingerprint-rotation use cases. Requires
 `ProxyPool`; has no effect with `ProxyURL`.
 
+### Which Proxy Served a Request?
+
+Every `Result` reports the proxy that produced its final response, so rotation
+can be verified or logged per request (empty string means a direct connection):
+
+```go
+result, _ := client.Get("https://httpbin.org/ip")
+fmt.Println(result.Meta.ProxyURL) // e.g. "http://proxy2.example.com:8080"
+```
+
+With retries each attempt may use a different proxy; `ProxyURL` reflects the
+attempt that returned the response (`Meta.Attempts` holds the count).
+
 **Priority:** `ProxyURL` > `ProxyPool` > `EnableSystemProxy` > direct.
 
 ---
@@ -1134,9 +1156,9 @@ if !result.IsSuccess() {
 | `Cause` | `error` | Underlying error (unwrap with `%w`) |
 | `URL` | `string` | Request URL |
 | `Method` | `string` | HTTP method |
-| `Attempts` | `int` | Number of retry attempts |
+| `Attempts` | `int` | Total attempts made, including the first |
 | `StatusCode` | `int` | HTTP status code (if applicable) |
-| `Host` | `string` | Target host |
+| `Host` | `string` | Reserved; currently never set by the engine |
 
 ### Error Types
 
@@ -1148,7 +1170,7 @@ const (
     ErrorTypeContextCanceled // Context canceled
     ErrorTypeResponseRead   // Error reading response body
     ErrorTypeTransport      // HTTP transport error
-    ErrorTypeRetryExhausted // All retries exhausted
+    ErrorTypeRetryExhausted // Reserved for retry exhaustion; retries actually exhaust with the last error's type kept — check Attempts / IsRetryable()
     ErrorTypeTLS            // TLS handshake error
     ErrorTypeCertificate    // Certificate validation error
     ErrorTypeDNS            // DNS resolution error
@@ -1224,7 +1246,7 @@ _ = httpc.CloseDefaultClient()
 **Thread Safety Guarantees:**
 - All `Client` methods are safe for concurrent use
 - Package-level functions safely use a shared default client
-- `Result` objects are NOT safe for concurrent access — each goroutine should use its own `Result`
+- `Result` objects are immutable once returned — concurrent reads are safe; just avoid multiple goroutines assigning to the same `Result` variable
 - Internal metrics use atomic operations
 
 ---

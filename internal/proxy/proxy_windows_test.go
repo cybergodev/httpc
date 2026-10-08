@@ -1,3 +1,5 @@
+//go:build windows
+
 package proxy
 
 import (
@@ -45,11 +47,11 @@ func TestParseWindowsProxyString(t *testing.T) {
 			input:   "   ",
 			wantErr: true,
 		},
-		// Per-protocol parsing
+		// Per-protocol parsing: HTTPS entry is preferred regardless of order
 		{
-			name:     "Per-protocol returns first matching protocol",
+			name:     "Per-protocol https preferred despite http listed first",
 			input:    "http=proxy-http:8080;https=proxy-https:8443",
-			wantHost: "proxy-http",
+			wantHost: "proxy-https",
 			wantErr:  false,
 		},
 		{
@@ -58,7 +60,7 @@ func TestParseWindowsProxyString(t *testing.T) {
 			wantHost: "proxy-http",
 			wantErr:  false,
 		},
-		// Protocol priority: first matching protocol (http or https) is returned
+		// Protocol priority: https before http regardless of registry ordering
 		{
 			name:     "Per-protocol https first has priority",
 			input:    "https=https-proxy:8443;http=http-proxy:8080",
@@ -157,5 +159,22 @@ func TestParseWindowsProxyString(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestGetWindowsProxySettings exercises the registry-reading path (moved here
+// from proxy_test.go so that file builds on non-Windows platforms). On most
+// dev machines ProxyEnable is 0, so this returns ("", false, nil); on machines
+// with a proxy configured it returns the proxy details. Either way it must
+// not panic or error.
+func TestGetWindowsProxySettings(t *testing.T) {
+	server, enabled, err := getWindowsProxySettings()
+	if err != nil {
+		t.Logf("getWindowsProxySettings returned error (acceptable in CI): %v", err)
+		return
+	}
+	t.Logf("registry proxy: server=%q enabled=%v", server, enabled)
+	if !enabled && server != "" {
+		t.Logf("note: server=%q but enabled=false", server)
 	}
 }

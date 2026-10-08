@@ -192,4 +192,11 @@ func TestMetrics_ConcurrentReadAndWrite(t *testing.T) {
 	time.Sleep(duration)
 	atomic.StoreInt32(&stop, 1)
 	wg.Wait()
+
+	// The writer ran for the full duration, so counters must be positive.
+	final := m.snapshot()
+	if final.totalRequests <= 0 || final.successfulRequests <= 0 {
+		t.Errorf("after concurrent load: total=%d success=%d, want both > 0",
+			final.totalRequests, final.successfulRequests)
+	}
 }

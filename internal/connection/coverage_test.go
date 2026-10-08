@@ -3,67 +3,17 @@ package connection
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"net/http"
-	"net/http/httptest"
+	"net/url"
+	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/cybergodev/httpc/internal/proxypool"
 )
-
-// TestUpdateConnectionMetrics verifies per-host connection statistics tracking.
-// Successful dials increment TotalConns/ActiveConns, and every update records
-// the host. (Per-host latency and failed-connection counts were removed —
-// GetMetrics reports aggregate pool counters instead — so the weighted-average
-// and FailedConns assertions were retired with them.)
-func TestUpdateConnectionMetrics(t *testing.T) {
-	tests := []struct {
-		name            string
-		host            string
-		successes       int
-		recordFailure   bool // additionally record one failed update
-		wantTotalConns  int64
-		wantActiveConns int64
-	}{
-		{name: "single success", host: "api.example.com", successes: 1, wantTotalConns: 1, wantActiveConns: 1},
-		{name: "repeated success", host: "api.example.com", successes: 3, wantTotalConns: 3, wantActiveConns: 3},
-		{name: "failed only tracks host without counting", host: "fail.example.com", recordFailure: true, wantTotalConns: 0, wantActiveConns: 0},
-		{name: "mixed success and failure", host: "mixed.example.com", successes: 1, recordFailure: true, wantTotalConns: 1, wantActiveConns: 1},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			pm, err := NewPoolManager(nil)
-			if err != nil {
-				t.Fatalf("NewPoolManager() error: %v", err)
-			}
-			defer func() { _ = pm.Close() }()
-
-			var stats *hostStats
-			for i := 0; i < tt.successes; i++ {
-				stats = pm.updateConnectionMetrics(tt.host, true)
-			}
-			if tt.recordFailure {
-				stats = pm.updateConnectionMetrics(tt.host, false)
-			}
-
-			if stats == nil {
-				t.Fatal("updateConnectionMetrics() returned nil stats")
-			}
-
-			if got := atomic.LoadInt64(&stats.TotalConns); got != tt.wantTotalConns {
-				t.Errorf("TotalConns = %d, want %d", got, tt.wantTotalConns)
-			}
-			if got := atomic.LoadInt64(&stats.ActiveConns); got != tt.wantActiveConns {
-				t.Errorf("ActiveConns = %d, want %d", got, tt.wantActiveConns)
-			}
-			if _, ok := pm.hostConns.Load(tt.host); !ok {
-				t.Errorf("host %q not tracked after update", tt.host)
-			}
-		})
-	}
-}
 
 // TestTrackedConn_Lifecycle verifies that trackedConn properly tracks
 // active connection counts on creation, decrement on Close, and handles
@@ -75,42 +25,23 @@ func TestTrackedConn_Lifecycle(t *testing.T) {
 	}
 	defer func() { _ = pm.Close() }()
 
-	// Simulate the state that createDialer sets up
-	var initialActive int64 = 0
-	atomic.StoreInt64(&pm.activeConns, initialActive)
-
-	// Create stats entry for the host
-	stats := pm.updateConnectionMetrics("test.example.com:443", true)
-
-	if stats == nil {
-		t.Fatal("updateConnectionMetrics returned nil stats")
-	}
-
-	// Verify stats show one active connection
-	if got := atomic.LoadInt64(&stats.ActiveConns); got != 1 {
-		t.Errorf("ActiveConns after creation = %d, want 1", got)
-	}
-
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
-		t.Errorf("pool activeConns after metrics update = %d, want 0 (not yet incremented in pool)", got)
-	}
+	// Simulate the state that createDialer sets up: active gauge at zero.
+	pm.activeConns.Store(0)
 
 	// Simulate what createDialer does: increment pool active conns
-	atomic.AddInt64(&pm.activeConns, 1)
+	pm.activeConns.Add(1)
 
 	// Create a trackedConn wrapping a fake connection
 	server, client := net.Pipe()
 	defer func() { _ = server.Close() }()
 
 	tc := &trackedConn{
-		Conn:  client,
-		pm:    pm,
-		host:  "test.example.com:443",
-		stats: stats,
+		Conn: client,
+		pm:   pm,
 	}
 
 	// Verify active count before close
-	if got := atomic.LoadInt64(&pm.activeConns); got != 1 {
+	if got := pm.activeConns.Load(); got != 1 {
 		t.Errorf("pool activeConns before close = %d, want 1", got)
 	}
 
@@ -121,12 +52,8 @@ func TestTrackedConn_Lifecycle(t *testing.T) {
 	}
 
 	// Verify active count decremented
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
+	if got := pm.activeConns.Load(); got != 0 {
 		t.Errorf("pool activeConns after close = %d, want 0", got)
-	}
-
-	if got := atomic.LoadInt64(&stats.ActiveConns); got != 0 {
-		t.Errorf("stats ActiveConns after close = %d, want 0", got)
 	}
 
 	// Double close should not double-decrement
@@ -135,13 +62,10 @@ func TestTrackedConn_Lifecycle(t *testing.T) {
 		t.Errorf("Second Close() error: %v", err)
 	}
 
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
+	if got := pm.activeConns.Load(); got != 0 {
 		t.Errorf("pool activeConns after double close = %d, want 0 (no double-decrement)", got)
 	}
 
-	if got := atomic.LoadInt64(&stats.ActiveConns); got != 0 {
-		t.Errorf("stats ActiveConns after double close = %d, want 0 (no double-decrement)", got)
-	}
 }
 
 // TestTrackedConn_ConcurrentClose verifies that concurrent Close calls on a
@@ -153,17 +77,14 @@ func TestTrackedConn_ConcurrentClose(t *testing.T) {
 	}
 	defer func() { _ = pm.Close() }()
 
-	stats := pm.updateConnectionMetrics("concurrent.example.com:443", true)
-	atomic.AddInt64(&pm.activeConns, 1)
+	pm.activeConns.Add(1)
 
 	server, client := net.Pipe()
 	defer func() { _ = server.Close() }()
 
 	tc := &trackedConn{
-		Conn:  client,
-		pm:    pm,
-		host:  "concurrent.example.com:443",
-		stats: stats,
+		Conn: client,
+		pm:   pm,
 	}
 
 	var wg sync.WaitGroup
@@ -180,13 +101,10 @@ func TestTrackedConn_ConcurrentClose(t *testing.T) {
 	wg.Wait()
 
 	// Despite 10 Close calls, activeConns should only be decremented once
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
+	if got := pm.activeConns.Load(); got != 0 {
 		t.Errorf("pool activeConns after concurrent close = %d, want 0", got)
 	}
 
-	if got := atomic.LoadInt64(&stats.ActiveConns); got != 0 {
-		t.Errorf("stats ActiveConns after concurrent close = %d, want 0", got)
-	}
 }
 
 // TestCreateTLSConfig_Default verifies that the default TLS configuration has
@@ -250,57 +168,12 @@ func TestCreateTLSConfig_Default(t *testing.T) {
 	}
 }
 
-// TestCreateTLSConfig_Custom verifies that a custom TLS config is cloned and
-// preserved, including the cert pinner integration.
-func TestCreateTLSConfig_Custom(t *testing.T) {
-	customTLS := &tls.Config{
-		MinVersion:         tls.VersionTLS13,
-		InsecureSkipVerify: true,
-		CipherSuites:       []uint16{tls.TLS_AES_128_GCM_SHA256},
-	}
-
-	pinner := &mockCertPinner{}
-	pm, err := NewPoolManager(&Config{
-		TLSConfig:  customTLS,
-		certPinner: pinner,
-	})
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	tlsConfig := pm.createTLSConfig()
-	if tlsConfig == nil {
-		t.Fatal("createTLSConfig() returned nil")
-	}
-
-	// Custom TLS config values should be preserved
-	if tlsConfig.MinVersion != tls.VersionTLS13 {
-		t.Errorf("MinVersion = %d, want TLS 1.3", tlsConfig.MinVersion)
-	}
-	if !tlsConfig.InsecureSkipVerify {
-		t.Error("InsecureSkipVerify should be true from custom config")
-	}
-
-	// VerifyPeerCertificate should be set by cert pinner
-	if tlsConfig.VerifyPeerCertificate == nil {
-		t.Error("VerifyPeerCertificate should be set when certPinner is configured")
-	}
-}
-
-// TestCreateTLSConfig_NoCustom verifies default config has no VerifyPeerCertificate.
-func TestCreateTLSConfig_NoCustom(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	tlsConfig := pm.createTLSConfig()
-	if tlsConfig.VerifyPeerCertificate != nil {
-		t.Error("VerifyPeerCertificate should be nil without certPinner")
-	}
-}
+// TestCreateTLSConfig_Custom and TestCreateTLSConfig_NoCustom were removed:
+// their assertions (custom MinVersion/InsecureSkipVerify preserved;
+// VerifyPeerCertificate nil without a pinner) match the "Custom TLS config"
+// and "WithoutCertPinner" checks — see TestPoolManager_TLSConfig (pool_test.go)
+// and the removed-subtest note in that file. The invoked-callback matrix
+// survives in TestCreateVerifyPeerCertificate below.
 
 // TestCreateVerifyPeerCertificate verifies the certificate verification
 // callback across pinner success, pinner failure, and InsecureSkipVerify paths.
@@ -394,14 +267,14 @@ func TestCreateDialer_AllowPrivateIPs(t *testing.T) {
 	}
 
 	// Verify active connection tracking
-	if got := atomic.LoadInt64(&pm.activeConns); got != 1 {
+	if got := pm.activeConns.Load(); got != 1 {
 		t.Errorf("activeConns = %d, want 1", got)
 	}
 
 	// Close the tracked connection
 	_ = tc.Close()
 
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
+	if got := pm.activeConns.Load(); got != 0 {
 		t.Errorf("activeConns after close = %d, want 0", got)
 	}
 }
@@ -481,6 +354,27 @@ func TestResolveAndValidateAddress(t *testing.T) {
 			address: "169.254.1.1:443",
 			wantErr: true,
 		},
+		// IPv6 boundaries (IP literals — no DNS/network needed)
+		{
+			name:    "Public IPv6 with port",
+			address: "[2001:4860:4860::8888]:443",
+			wantErr: false,
+		},
+		{
+			name:    "IPv6 loopback",
+			address: "[::1]:8080",
+			wantErr: true,
+		},
+		{
+			name:    "IPv4-mapped IPv6 loopback",
+			address: "[::ffff:127.0.0.1]:8080",
+			wantErr: true,
+		},
+		{
+			name:    "Private IP without port",
+			address: "127.0.0.1",
+			wantErr: true,
+		},
 		// Unresolvable domain
 		{
 			name:    "Domain resolution failure",
@@ -515,11 +409,14 @@ func TestResolveAndValidateAddress(t *testing.T) {
 
 				var lastErr error
 				for _, domain := range domains {
-					result, resolveErr := pm.resolveAndValidateAddress(context.Background(), domain)
+					results, resolveErr := pm.resolveAndValidateAddress(context.Background(), domain)
 					if resolveErr == nil {
-						host, port, splitErr := net.SplitHostPort(result)
+						if len(results) == 0 {
+							t.Fatalf("expected at least one validated address for %s", domain)
+						}
+						host, port, splitErr := net.SplitHostPort(results[0])
 						if splitErr != nil {
-							t.Fatalf("result %q is not a valid host:port: %v", result, splitErr)
+							t.Fatalf("result %q is not a valid host:port: %v", results[0], splitErr)
 						}
 						if port != "443" {
 							t.Errorf("port = %q, want %q", port, "443")
@@ -552,77 +449,16 @@ func TestResolveAndValidateAddress(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 
-			if tt.want != "" && result != tt.want {
-				t.Errorf("result = %q, want %q", result, tt.want)
+			if tt.want != "" && (len(result) == 0 || result[0] != tt.want) {
+				t.Errorf("result = %v, want first candidate %q", result, tt.want)
 			}
 		})
 	}
 }
 
-// TestTrackedConn_NilStats verifies that trackedConn handles nil stats gracefully.
-func TestTrackedConn_NilStats(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	atomic.AddInt64(&pm.activeConns, 1)
-
-	server, client := net.Pipe()
-	defer func() { _ = server.Close() }()
-
-	tc := &trackedConn{
-		Conn:  client,
-		pm:    pm,
-		host:  "nilstats.example.com:443",
-		stats: nil,
-	}
-
-	// Close should not panic with nil stats
-	err = tc.Close()
-	if err != nil {
-		t.Errorf("Close() error: %v", err)
-	}
-
-	if got := atomic.LoadInt64(&pm.activeConns); got != 0 {
-		t.Errorf("activeConns after close = %d, want 0", got)
-	}
-}
-
-// TestCreateDialer_Integration verifies the full dialer path through an HTTP request,
-// exercising SSRF validation, connection tracking, and metrics updates.
-func TestCreateDialer_Integration(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	config := DefaultConfig()
-	config.AllowPrivateIPs = true
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	client := &http.Client{
-		Transport: pm.GetTransport(),
-		Timeout:   5 * time.Second,
-	}
-
-	resp, err := client.Get(server.URL)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	_ = resp.Body.Close()
-
-	// Verify connection metrics were tracked
-	metrics := pm.GetMetrics()
-	if metrics.TotalConnections < 1 {
-		t.Errorf("TotalConnections = %d, want at least 1", metrics.TotalConnections)
-	}
-}
+// The full dialer path through a live HTTP request (SSRF validation,
+// connection tracking, metric updates) is asserted by
+// TestPoolManager_ConnectionMetrics in pool_test.go — no duplicate here.
 
 // TestCreateDialer_SSRFRejectsPrivateIP verifies that the dialer function
 // rejects connections to private IPs by calling it directly.
@@ -700,203 +536,23 @@ func TestCreateDialer_ConnectionFailure(t *testing.T) {
 	}
 }
 
-// TestUpdateConnectionMetrics_InvalidType verifies the defensive nil check
-// when LoadOrStore returns a value that is not *hostStats.
-func TestUpdateConnectionMetrics_InvalidType(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	pm.hostConns.Store("bad-type.example.com", "not a hostStats")
-
-	result := pm.updateConnectionMetrics("bad-type.example.com", true)
-	if result != nil {
-		t.Errorf("expected nil result for invalid type, got %v", result)
-	}
-}
-
-// TestUpdateConnectionMetrics_NilValue verifies the defensive nil check
-// when LoadOrStore returns a nil *hostStats.
-func TestUpdateConnectionMetrics_NilValue(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	var nilStats *hostStats = nil
-	pm.hostConns.Store("nil-value.example.com", nilStats)
-
-	result := pm.updateConnectionMetrics("nil-value.example.com", true)
-	if result != nil {
-		t.Errorf("expected nil result for nil value, got %v", result)
-	}
-}
-
 // TestClose_WithDoHResolver verifies that Close properly cleans up the DoH resolver.
-func TestClose_WithDoHResolver(t *testing.T) {
-	config := &Config{
-		EnableDoH:       true,
-		AllowPrivateIPs: true,
-	}
+// TestClose_WithDoHResolver and TestCreateDialer_SSRFSuccessPath were removed:
+// - Close-with-DoH is covered by TestPoolManager_CloseWithDoHResolver
+//   (pool_coverage_test.go), which also varies DoHCacheTTL.
+// - The SSRF success path dialed the real host 8.8.8.8:443 and silently
+//   passed offline; the local public-IP dial path is covered by
+//   TestCreateDialer_AllowPrivateIPs and the ProxyAddr tests.
 
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
+// TestGetMetrics_HitRateCalculation and TestGetMetrics_ActiveConnections were
+// folded into TestPoolManager_GetMetrics (pool_test.go) as subtests, next to
+// the zero-state assertions of the same interface.
 
-	if pm.dohResolver == nil {
-		t.Fatal("DoH resolver should be initialized")
-	}
-
-	err = pm.Close()
-	if err != nil {
-		t.Errorf("Close() error: %v", err)
-	}
-}
-
-// TestCreateDialer_SSRFSuccessPath verifies that when SSRF protection is enabled
-// and the target resolves to a public IP, the validated address is used.
-func TestCreateDialer_SSRFSuccessPath(t *testing.T) {
-	// Create a local listener
-	listener, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatalf("failed to create listener: %v", err)
-	}
-	defer func() { _ = listener.Close() }()
-
-	go func() {
-		conn, acceptErr := listener.Accept()
-		if acceptErr == nil {
-			_ = conn.Close()
-		}
-	}()
-
-	// Use AllowPrivateIPs=false but set up the address as a validated public IP
-	// We test this by calling createDialer directly and using a public address
-	config := &Config{
-		AllowPrivateIPs: false,
-		DialTimeout:     2 * time.Second,
-		KeepAlive:       30 * time.Second,
-	}
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	dialFn := pm.createDialer()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Dial 8.8.8.8:443 — public IP, SSRF should allow
-	conn, dialErr := dialFn(ctx, "tcp", "8.8.8.8:443")
-	if dialErr != nil {
-		// Network may be unavailable — this test is best-effort
-		t.Logf("Could not connect to 8.8.8.8:443 (network may be restricted): %v", dialErr)
-		return
-	}
-	defer func() { _ = conn.Close() }()
-
-	// Verify it's a tracked connection
-	if _, ok := conn.(*trackedConn); !ok {
-		t.Error("expected trackedConn wrapper")
-	}
-}
-
-// TestGetMetrics_HitRateCalculation verifies that the connection hit rate is
-// correctly calculated from total and rejected connection counts.
-func TestGetMetrics_HitRateCalculation(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	// Initially, hit rate should be 0 (no connections)
-	m := pm.GetMetrics()
-	if m.ConnectionHitRate != 0 {
-		t.Errorf("initial hit rate = %f, want 0", m.ConnectionHitRate)
-	}
-
-	// Set some values to test hit rate calculation
-	atomic.StoreInt64(&pm.totalConns, 80)
-	atomic.StoreInt64(&pm.rejectedConns, 20)
-
-	m = pm.GetMetrics()
-	wantHitRate := float64(80) / float64(80+20) // 0.8
-	if m.ConnectionHitRate != wantHitRate {
-		t.Errorf("hit rate = %f, want %f", m.ConnectionHitRate, wantHitRate)
-	}
-}
-
-// TestGetMetrics_ActiveConnections verifies active connection tracking
-// through the metrics interface.
-func TestGetMetrics_ActiveConnections(t *testing.T) {
-	pm, err := NewPoolManager(nil)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	atomic.StoreInt64(&pm.activeConns, 42)
-
-	m := pm.GetMetrics()
-	if m.ActiveConnections != 42 {
-		t.Errorf("ActiveConnections = %d, want 42", m.ActiveConnections)
-	}
-
-	if m.LastUpdate == 0 {
-		t.Error("LastUpdate should be non-zero")
-	}
-}
-
-// TestCreateDialer_DoHPath exercises the DoH resolver path in createDialer
-// by enabling DoH and making an HTTP request to a local test server.
-func TestCreateDialer_DoHPath(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping DoH integration test in short mode")
-	}
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	config := DefaultConfig()
-	config.AllowPrivateIPs = true
-	config.EnableDoH = true
-
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("NewPoolManager() error: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	if pm.dohResolver == nil {
-		t.Skip("DoH resolver not available")
-	}
-
-	client := &http.Client{
-		Transport: pm.GetTransport(),
-		Timeout:   10 * time.Second,
-	}
-
-	resp, err := client.Get(server.URL)
-	if err != nil {
-		// DoH resolution may fail in restricted networks
-		t.Logf("DoH path request failed (expected in restricted networks): %v", err)
-		return
-	}
-	_ = resp.Body.Close()
-
-	metrics := pm.GetMetrics()
-	t.Logf("DoH path metrics: Total=%d, Active=%d, Rejected=%d, HitRate=%.2f",
-		metrics.TotalConnections, metrics.ActiveConnections,
-		metrics.RejectedConnections, metrics.ConnectionHitRate)
-}
+// TestCreateDialer_DoHPath was removed: it issued a request through the DoH
+// resolver but only logged the resulting metrics (no assertion) and silently
+// returned on network failure. The DoH dialer path with real assertions lives
+// in TestCreateDialer_DoHResolutionFailure (pool_coverage_test.go) and
+// TestCreateDialer_DoHPath_SSRFBlock below.
 
 // TestCreateDialer_DoHPath_SSRFBlock verifies that the DoH path blocks
 // connections to private IPs when SSRF protection is enabled.
@@ -931,3 +587,489 @@ func TestCreateDialer_DoHPath_SSRFBlock(t *testing.T) {
 		t.Logf("DoH SSRF block: %v", err)
 	}
 }
+
+// Each test targets specific uncovered code paths identified by
+// `go test -coverprofile`. Tests are organized by the function they cover.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// createDialer: pool exhaustion path (pool.go:341-345)
+// ---------------------------------------------------------------------------
+
+func TestCreateDialer_PoolExhaustion(t *testing.T) {
+	// TCP listener that accepts and holds a connection so the first dial
+	// stays open and occupies a pool slot.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	addr := listener.Addr().String()
+
+	config := &Config{
+		MaxTotalConns:   1,
+		AllowPrivateIPs: true,
+		DialTimeout:     5 * time.Second,
+	}
+
+	pm, err := NewPoolManager(config)
+	if err != nil {
+		t.Fatalf("NewPoolManager: %v", err)
+	}
+	defer func() { _ = pm.Close() }()
+
+	dialer := pm.createDialer()
+
+	// First connection succeeds and occupies the single slot.
+	conn1, err := dialer(context.Background(), "tcp", addr)
+	if err != nil {
+		t.Fatalf("First dial failed: %v", err)
+	}
+	defer func() { _ = conn1.Close() }()
+
+	// Accept on the server side so the connection completes.
+	serverConn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer func() { _ = serverConn.Close() }()
+
+	// Second dial should be rejected: MaxTotalConns exceeded.
+	_, err = dialer(context.Background(), "tcp", addr)
+	if err == nil {
+		t.Fatal("Expected ErrPoolExhausted, got nil")
+	}
+	if !errors.Is(err, ErrPoolExhausted) {
+		t.Errorf("Expected ErrPoolExhausted, got: %v", err)
+	}
+
+	// Verify rejected-connections counter was incremented.
+	metrics := pm.GetMetrics()
+	if metrics.RejectedConnections < 1 {
+		t.Errorf("Expected RejectedConnections >= 1, got %d", metrics.RejectedConnections)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// createDialer: proxy address bypass — success path (pool.go:349-373)
+// ---------------------------------------------------------------------------
+
+func TestCreateDialer_ProxyAddr_Success(t *testing.T) {
+	// Stand up a raw TCP listener to represent a proxy server.
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	proxyAddr := listener.Addr().String()
+
+	config := &Config{
+		ProxyURL:    "http://" + proxyAddr,
+		DialTimeout: 5 * time.Second,
+	}
+
+	pm, err := NewPoolManager(config)
+	if err != nil {
+		t.Fatalf("NewPoolManager: %v", err)
+	}
+	defer func() { _ = pm.Close() }()
+
+	if !pm.isProxyAddr(proxyAddr) {
+		t.Fatalf("proxyAddr %q not registered in proxyAddrs", proxyAddr)
+	}
+
+	dialer := pm.createDialer()
+
+	// Dial the proxy address — should bypass SSRF and succeed.
+	conn, err := dialer(context.Background(), "tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Dial to proxy address failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// Accept on the listener side to complete the handshake.
+	serverConn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer func() { _ = serverConn.Close() }()
+
+	// Verify active connection counter increased.
+	metrics := pm.GetMetrics()
+	if metrics.ActiveConnections < 1 {
+		t.Errorf("Expected ActiveConnections >= 1, got %d", metrics.ActiveConnections)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// createDialer: proxy address bypass — failure path (pool.go:353-361)
+// ---------------------------------------------------------------------------
+
+func TestCreateDialer_ProxyAddr_Failure(t *testing.T) {
+	// Use a port that is virtually guaranteed to be closed.
+	config := &Config{
+		ProxyURL:    "http://127.0.0.1:1",
+		DialTimeout: 500 * time.Millisecond,
+	}
+
+	pm, err := NewPoolManager(config)
+	if err != nil {
+		t.Fatalf("NewPoolManager: %v", err)
+	}
+	defer func() { _ = pm.Close() }()
+
+	dialer := pm.createDialer()
+
+	_, err = dialer(context.Background(), "tcp", "127.0.0.1:1")
+	if err == nil {
+		t.Fatal("Expected error connecting to dead proxy")
+	}
+	if !errors.Is(err, ErrProxyConnectionFailed) {
+		t.Errorf("Expected ErrProxyConnectionFailed, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// createDialer: proxy pool address — failure with reporting (pool.go:354-355)
+// ---------------------------------------------------------------------------
+
+func TestCreateDialer_ProxyPool_FailureReporting(t *testing.T) {
+	config := &Config{
+		ProxyPool: []string{
+			"http://127.0.0.1:1", // dead proxy
+		},
+		ProxyFailureThreshold: 2,
+		ProxyCooldown:         30 * time.Second,
+		DialTimeout:           500 * time.Millisecond,
+	}
+
+	pm, err := NewPoolManager(config)
+	if err != nil {
+		t.Fatalf("NewPoolManager: %v", err)
+	}
+	defer func() { _ = pm.Close() }()
+
+	dialer := pm.createDialer()
+
+	_, err = dialer(context.Background(), "tcp", "127.0.0.1:1")
+	if err == nil {
+		t.Fatal("Expected proxy connection failure")
+	}
+	if !errors.Is(err, ErrProxyConnectionFailed) {
+		t.Errorf("Expected ErrProxyConnectionFailed, got: %v", err)
+	}
+
+	// Verify the proxy pool recorded the failure.
+	// After ProxyFailureThreshold consecutive failures the proxy should
+	// be circuit-broken. With threshold=2, one failure is not enough,
+	// but the failure count should be > 0.
+	metrics := pm.GetMetrics()
+	if metrics.RejectedConnections < 1 {
+		t.Errorf("Expected RejectedConnections >= 1, got %d", metrics.RejectedConnections)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// createDialer: proxy pool address — success with reporting (pool.go:364-373)
+// ---------------------------------------------------------------------------
+
+func TestCreateDialer_ProxyPool_SuccessReporting(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	proxyAddr := listener.Addr().String()
+
+	config := &Config{
+		ProxyPool: []string{
+			"http://" + proxyAddr,
+		},
+		DialTimeout: 5 * time.Second,
+	}
+
+	pm, err := NewPoolManager(config)
+	if err != nil {
+		t.Fatalf("NewPoolManager: %v", err)
+	}
+	defer func() { _ = pm.Close() }()
+
+	if !pm.isProxyAddr(proxyAddr) {
+		t.Fatalf("proxyAddr %q not in proxyAddrs", proxyAddr)
+	}
+
+	dialer := pm.createDialer()
+
+	conn, err := dialer(context.Background(), "tcp", proxyAddr)
+	if err != nil {
+		t.Fatalf("Dial to proxy pool address failed: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	serverConn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer func() { _ = serverConn.Close() }()
+
+	metrics := pm.GetMetrics()
+	if metrics.ActiveConnections < 1 {
+		t.Errorf("Expected ActiveConnections >= 1, got %d", metrics.ActiveConnections)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// createDialer: DoH resolution failure (pool.go:393-399)
+// ---------------------------------------------------------------------------
+
+func TestCreateDialer_DoHResolutionFailure(t *testing.T) {
+	config := &Config{
+		EnableDoH:       true,
+		AllowPrivateIPs: false,
+		DialTimeout:     5 * time.Second,
+	}
+
+	pm, err := NewPoolManager(config)
+	if err != nil {
+		t.Fatalf("NewPoolManager: %v", err)
+	}
+	defer func() { _ = pm.Close() }()
+
+	// Close the DoH resolver so LookupIPAddr returns an error immediately.
+	if err := pm.dohResolver.Close(); err != nil {
+		t.Fatalf("DoH resolver close: %v", err)
+	}
+
+	dialer := pm.createDialer()
+
+	_, err = dialer(context.Background(), "tcp", "example.com:443")
+	if err == nil {
+		t.Fatal("Expected error from closed DoH resolver")
+	}
+	if !strings.Contains(err.Error(), "DoH DNS resolution failed") {
+		t.Errorf("Expected DoH resolution failure, got: %v", err)
+	}
+
+	metrics := pm.GetMetrics()
+	if metrics.RejectedConnections < 1 {
+		t.Errorf("Expected RejectedConnections >= 1, got %d", metrics.RejectedConnections)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// transport.Proxy: SelectIndex path via context (pool.go:275-280)
+// ---------------------------------------------------------------------------
+
+func TestProxyPool_TransportProxy_SelectIndex(t *testing.T) {
+	config := &Config{
+		ProxyPool: []string{
+			"http://proxy0.example.com:8080",
+			"http://proxy1.example.com:8080",
+			"http://proxy2.example.com:8080",
+		},
+		ProxyPoolStrategy: proxypool.StrategyRoundRobin,
+	}
+
+	pm, err := NewPoolManager(config)
+	if err != nil {
+		t.Fatalf("NewPoolManager: %v", err)
+	}
+	defer func() { _ = pm.Close() }()
+
+	transport := pm.GetTransport()
+	if transport.Proxy == nil {
+		t.Fatal("transport.Proxy should be set for proxy pool")
+	}
+
+	// Without ProxyAttempt on context → normal round-robin Select.
+	reqNormal := &http.Request{
+		URL: &url.URL{Scheme: "https", Host: "example.com"},
+	}
+	got, err := transport.Proxy(reqNormal.WithContext(context.Background()))
+	if err != nil {
+		t.Fatalf("Proxy() error: %v", err)
+	}
+	if got == nil {
+		t.Fatal("Proxy() returned nil for normal request")
+	}
+
+	// With ProxyAttempt=1 on context → SelectIndex(1) should return proxy at index 1.
+	reqWithAttempt := &http.Request{
+		URL: &url.URL{Scheme: "https", Host: "example.com"},
+	}
+	ctx := WithProxyAttempt(context.Background(), 1)
+	got, err = transport.Proxy(reqWithAttempt.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("Proxy() with attempt error: %v", err)
+	}
+	if got.Host != "proxy1.example.com:8080" {
+		t.Errorf("SelectIndex(1) returned %s, want proxy1.example.com:8080", got.Host)
+	}
+
+	// With ProxyAttempt=2 → SelectIndex(2).
+	reqWithAttempt2 := &http.Request{
+		URL: &url.URL{Scheme: "https", Host: "example.com"},
+	}
+	ctx2 := WithProxyAttempt(context.Background(), 2)
+	got, err = transport.Proxy(reqWithAttempt2.WithContext(ctx2))
+	if err != nil {
+		t.Fatalf("Proxy() with attempt=2 error: %v", err)
+	}
+	if got.Host != "proxy2.example.com:8080" {
+		t.Errorf("SelectIndex(2) returned %s, want proxy2.example.com:8080", got.Host)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// resolveAndValidateAddress: DialTimeout < dnsTimeout branch, nil context,
+// and domain-resolves-to-blocked (pool.go:510-515, 530-532)
+// ---------------------------------------------------------------------------
+
+func TestResolveAndValidateAddress_CoverageGaps(t *testing.T) {
+	t.Run("DialTimeout shorter than DNS timeout", func(t *testing.T) {
+		// DialTimeout=3s < dnsTimeout=10s → exercises the branch that
+		// derives the DNS timeout from DialTimeout.
+		config := DefaultConfig()
+		config.DialTimeout = 3 * time.Second
+		pm, err := NewPoolManager(config)
+		if err != nil {
+			t.Fatalf("NewPoolManager: %v", err)
+		}
+		defer func() { _ = pm.Close() }()
+
+		// "localhost" resolves to 127.0.0.1 (loopback) → FilterAllowedIPs
+		// returns empty → exercises the blocked-domain error path.
+		_, err = pm.resolveAndValidateAddress(context.Background(), "localhost:443")
+		if err == nil {
+			t.Error("Expected error for localhost (blocked IP)")
+		}
+	})
+
+	t.Run("nil context fallback", func(t *testing.T) {
+		pm, err := NewPoolManager(nil)
+		if err != nil {
+			t.Fatalf("NewPoolManager: %v", err)
+		}
+		defer func() { _ = pm.Close() }()
+
+		// Passing nil context must not panic; it falls back to context.Background().
+		_, err = pm.resolveAndValidateAddress(nil, "localhost:443") //nolint:staticcheck // intentionally nil to test the fallback path
+		if err == nil {
+			t.Error("Expected error for localhost with nil context")
+		}
+	})
+
+	t.Run("SplitHostPort failure fallback port", func(t *testing.T) {
+		pm, err := NewPoolManager(nil)
+		if err != nil {
+			t.Fatalf("NewPoolManager: %v", err)
+		}
+		defer func() { _ = pm.Close() }()
+
+		// Address without port → SplitHostPort fails → port defaults to "443".
+		_, err = pm.resolveAndValidateAddress(context.Background(), "localhost")
+		if err == nil {
+			t.Error("Expected error for localhost without port")
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// PoolManager.Close: DoH resolver close path (pool.go:787-791)
+// ---------------------------------------------------------------------------
+
+func TestPoolManager_CloseWithDoHResolver(t *testing.T) {
+	config := &Config{
+		EnableDoH:   true,
+		DoHCacheTTL: 1 * time.Minute,
+	}
+
+	pm, err := NewPoolManager(config)
+	if err != nil {
+		t.Fatalf("NewPoolManager: %v", err)
+	}
+
+	if pm.dohResolver == nil {
+		t.Fatal("DoH resolver should be initialized")
+	}
+
+	// Close should exercise the DoH resolver close path without error.
+	if err := pm.Close(); err != nil {
+		t.Errorf("Close with DoH resolver returned error: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// trackedConn: Close after pool is closed (pool.go:621-630)
+// ---------------------------------------------------------------------------
+
+func TestTrackedConn_CloseAfterPoolClosed(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	addr := listener.Addr().String()
+
+	config := &Config{
+		AllowPrivateIPs: true,
+		DialTimeout:     5 * time.Second,
+	}
+
+	pm, err := NewPoolManager(config)
+	if err != nil {
+		t.Fatalf("NewPoolManager: %v", err)
+	}
+
+	dialer := pm.createDialer()
+
+	conn, err := dialer(context.Background(), "tcp", addr)
+	if err != nil {
+		t.Fatalf("Dial failed: %v", err)
+	}
+
+	serverConn, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	defer func() { _ = serverConn.Close() }()
+
+	// Close the pool while a connection is still active.
+	// trackedConn.Close() must skip counter decrements when pool is closed.
+	_ = pm.Close()
+
+	// Closing the tracked connection after pool close must not panic
+	// and must not drive counters negative.
+	if err := conn.Close(); err != nil {
+		t.Errorf("Close after pool close returned error: %v", err)
+	}
+
+	metrics := pm.GetMetrics()
+	// Counters were reset by Close(); they must not be negative.
+	if metrics.ActiveConnections < 0 {
+		t.Errorf("ActiveConnections should not be negative, got %d", metrics.ActiveConnections)
+	}
+	if metrics.TotalConnections < 0 {
+		t.Errorf("TotalConnections should not be negative, got %d", metrics.TotalConnections)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// evictStaleHosts: re-insert when ActiveConns increments during eviction
+// (pool.go:709-718)
+//
+// This tests the TOCTOU window where an entry passes the ActiveConns==0
+// check but has ActiveConns>0 by the time LoadAndDelete returns. We
+// simulate this by directly invoking eviction with a carefully crafted
+// entry whose ActiveConns we bump at the right moment.
+// TestEvictStaleHosts_ReInsertActiveConn, TestCloseIdleConnections_NoPanic,
+// TestNextProxyIndex_NoPool, and TestNextProxyIndex_WithPool were removed:
+// - The eviction race test only logged its outcome (could never fail);
+//   eviction correctness is asserted by TestEvictStaleHosts_CASContention.
+// - CloseIdleConnections/NextProxyIndex no-pool and advance/wrap behavior
+//   is covered (stronger, incl. after-Close and modulo wrap) in
+//   proxy_context_test.go.

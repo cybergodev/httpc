@@ -2,10 +2,12 @@ package engine
 
 import (
 	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -207,6 +209,179 @@ func TestResponseProcessor_LargeResponse(t *testing.T) {
 	if !strings.Contains(err.Error(), "response body exceeds limit") && !strings.Contains(err.Error(), "response body too large") {
 		t.Errorf("Expected response body size error, got: %v", err)
 	}
+}
+
+// TestResponseProcessor_BodySizeExactBoundary pins the limit semantics at the
+// edge: a body of exactly MaxResponseBodySize bytes must be accepted, and one
+// byte over must be rejected.
+func TestResponseProcessor_BodySizeExactBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		size    int
+		wantErr bool
+	}{
+		{"exactly at limit succeeds", 1024, false},
+		{"one byte over limit fails", 1025, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &Config{
+				Timeout:             30 * time.Second,
+				MaxResponseBodySize: 1024,
+			}
+			processor := newResponseProcessor(config)
+
+			httpResponse := &http.Response{
+				StatusCode: 200,
+				Status:     "200 OK",
+				Header: http.Header{
+					"Content-Type": []string{"text/plain"},
+				},
+				Body:    io.NopCloser(strings.NewReader(strings.Repeat("A", tt.size))),
+				Request: &http.Request{},
+			}
+
+			resp, err := processor.Process(httpResponse)
+			if tt.wantErr && err == nil {
+				t.Error("expected size-limit error, got nil")
+			}
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if len(resp.Body()) != tt.size {
+					t.Errorf("body length = %d, want %d", len(resp.Body()), tt.size)
+				}
+				ReleaseResponse(resp)
+			}
+		})
+	}
+}
+
+// TestResponseProcessor_IdentityBodyCappedByResponseBodySize pins the C-1
+// regression: when both limits are configured (as DefaultConfig always does),
+// an identity (non-compressed) body is capped by MaxResponseBodySize — the
+// larger MaxDecompressedBodySize must not replace it on the buffered path.
+func TestResponseProcessor_IdentityBodyCappedByResponseBodySize(t *testing.T) {
+	config := &Config{
+		Timeout:                 30 * time.Second,
+		MaxResponseBodySize:     1024,              // the stricter cap
+		MaxDecompressedBodySize: 100 * 1024 * 1024, // DefaultConfig's value
+	}
+	processor := newResponseProcessor(config)
+
+	httpResponse := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       io.NopCloser(strings.NewReader(strings.Repeat("A", 2048))),
+		Request:    &http.Request{Method: "GET"},
+	}
+
+	_, err := processor.Process(httpResponse)
+	if err == nil {
+		t.Fatal("expected identity body over MaxResponseBodySize to fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit of 1024") {
+		t.Errorf("want 'exceeds limit of 1024', got: %v", err)
+	}
+}
+
+// TestResponseProcessor_FastPathSizeLimitMessage pins the fast-path fail-fast
+// guard: a known Content-Length above the cap must produce the clear
+// "exceeds limit" message, not the misleading "unexpected EOF" that
+// io.ReadFull yields when the limit reader stops it short.
+func TestResponseProcessor_FastPathSizeLimitMessage(t *testing.T) {
+	config := &Config{
+		Timeout:             30 * time.Second,
+		MaxResponseBodySize: 1024,
+	}
+	processor := newResponseProcessor(config)
+
+	httpResponse := &http.Response{
+		StatusCode:    200,
+		Header:        http.Header{"Content-Type": []string{"text/plain"}},
+		Body:          io.NopCloser(strings.NewReader(strings.Repeat("A", 4096))),
+		ContentLength: 4096, // known CL <= 512KB selects the pre-sized fast path
+		Request:       &http.Request{Method: "GET"},
+	}
+
+	_, err := processor.Process(httpResponse)
+	if err == nil {
+		t.Fatal("expected size-limit error, got nil")
+	}
+	if !strings.Contains(err.Error(), "response body exceeds limit") {
+		t.Errorf("want clear 'response body exceeds limit' message, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "unexpected EOF") {
+		t.Errorf("misleading 'unexpected EOF' leaked into the error: %v", err)
+	}
+}
+
+// TestResponseProcessor_HeadContentLengthOverLimit pins the HEAD exemption in
+// the fast-path guard: HEAD responses carry Content-Length with no body, so a
+// declared length above the cap must not be rejected.
+func TestResponseProcessor_HeadContentLengthOverLimit(t *testing.T) {
+	config := &Config{
+		Timeout:             30 * time.Second,
+		MaxResponseBodySize: 1024,
+	}
+	processor := newResponseProcessor(config)
+
+	httpResponse := &http.Response{
+		StatusCode:    200,
+		Header:        http.Header{},
+		Body:          io.NopCloser(strings.NewReader("")), // no body follows
+		ContentLength: 2048,                                // within the fast path, over the cap
+		Request:       &http.Request{Method: "HEAD"},
+	}
+
+	resp, err := processor.Process(httpResponse)
+	if err != nil {
+		t.Fatalf("HEAD with Content-Length over the cap must not be rejected: %v", err)
+	}
+	if len(resp.RawBody()) != 0 {
+		t.Errorf("HEAD body = %d bytes, want 0", len(resp.RawBody()))
+	}
+	ReleaseResponse(resp)
+}
+
+// TestResponseProcessor_CompressedUsesDecompressedCap pins Plan A semantics:
+// a compressed response is judged by MaxDecompressedBodySize even when the
+// inflated size exceeds MaxResponseBodySize — the identity cap introduced by
+// the C-1 fix must not over-restrict compressed bodies.
+func TestResponseProcessor_CompressedUsesDecompressedCap(t *testing.T) {
+	config := &Config{
+		Timeout:                 30 * time.Second,
+		MaxResponseBodySize:     1024,       // smaller than the inflated body
+		MaxDecompressedBodySize: 100 * 1024, // the cap that must govern
+	}
+	processor := newResponseProcessor(config)
+
+	var wire bytes.Buffer
+	gz := gzip.NewWriter(&wire)
+	if _, err := gz.Write(make([]byte, 8*1024)); err != nil { // inflates to 8KB
+		t.Fatalf("seed gzip writer: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
+
+	httpResponse := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Encoding": []string{"gzip"}},
+		Body:       io.NopCloser(bytes.NewReader(wire.Bytes())),
+		Request:    &http.Request{Method: "GET"},
+	}
+
+	resp, err := processor.Process(httpResponse)
+	if err != nil {
+		t.Fatalf("compressed body must be judged by MaxDecompressedBodySize, got: %v", err)
+	}
+	if got := len(resp.RawBody()); got != 8*1024 {
+		t.Errorf("decompressed length = %d, want %d", got, 8*1024)
+	}
+	ReleaseResponse(resp)
 }
 
 func TestResponseProcessor_HeaderProcessing(t *testing.T) {
@@ -508,5 +683,227 @@ func TestResponseProcessor_ContentLengthHandling(t *testing.T) {
 				t.Errorf("Expected content length %d, got %d", tt.expectedLength, resp.ContentLength())
 			}
 		})
+	}
+}
+
+// countingReadCloser tracks how many times Close is invoked.
+type countingReadCloser struct {
+	inner  io.Reader
+	closes int
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) { return c.inner.Read(p) }
+func (c *countingReadCloser) Close() error {
+	c.closes++
+	return nil
+}
+
+// TestStreamBodyReader_CloseIdempotent verifies Close is safe to call twice:
+// the caller may close the body and ReleaseResponse will close it again via
+// rawBodyReader. Without the guard the same *pooledLimitReader would be
+// returned to the pool twice, handing one object to two concurrent requests.
+func TestStreamBodyReader_CloseIdempotent(t *testing.T) {
+	source := &countingReadCloser{inner: strings.NewReader("stream body")}
+	s := &streamBodyReader{reader: getLimitReader(source, 1024), source: source}
+
+	if err := s.Close(); err != nil {
+		t.Fatalf("first Close() error: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close() error: %v", err)
+	}
+	if source.closes != 1 {
+		t.Errorf("source.Close called %d times, want exactly 1", source.closes)
+	}
+}
+
+// TestStreamBodyReader_OversizeError verifies the limit-enforcement contract
+// at the unit level: a body larger than the configured limit must surface as
+// a Read error (not a synthetic EOF, which io.Copy would treat as success and
+// silently truncate), while a body of exactly the limit must read cleanly.
+// The underlying reader's budget is limit+1 (see executeRequest), which is
+// what lets Read distinguish the two cases.
+func TestStreamBodyReader_OversizeError(t *testing.T) {
+	t.Run("body exactly at limit reads cleanly", func(t *testing.T) {
+		const limit = 8
+		s := &streamBodyReader{
+			reader: getLimitReader(io.NopCloser(strings.NewReader("12345678")), limit+1),
+			source: io.NopCloser(strings.NewReader("")),
+			limit:  limit,
+		}
+		data, err := io.ReadAll(s)
+		if err != nil {
+			t.Fatalf("ReadAll at exact limit: unexpected error %v", err)
+		}
+		if string(data) != "12345678" {
+			t.Errorf("ReadAll at exact limit: got %q, want %q", data, "12345678")
+		}
+	})
+
+	t.Run("body over limit errors instead of truncating", func(t *testing.T) {
+		const limit = 8
+		s := &streamBodyReader{
+			reader: getLimitReader(io.NopCloser(strings.NewReader("12345678901")), limit+1),
+			source: io.NopCloser(strings.NewReader("")),
+			limit:  limit,
+		}
+		_, err := io.ReadAll(s)
+		if err == nil {
+			t.Fatal("ReadAll over limit: expected error, got success (silent truncation)")
+		}
+		if !strings.Contains(err.Error(), "exceeds size limit") {
+			t.Errorf("ReadAll over limit: unexpected error %v", err)
+		}
+	})
+
+	t.Run("final chunk crossing limit with EOF errors", func(t *testing.T) {
+		// An io.Reader may legally return its last bytes together with io.EOF.
+		// A body of exactly limit+1 bytes delivered that way must still report
+		// the oversize error — returning the raw EOF would let io.Copy treat
+		// the truncated read as a clean success.
+		const limit = 8
+		s := &streamBodyReader{
+			reader: getLimitReader(&eofOnLastReader{data: "123456789"}, limit+1),
+			source: io.NopCloser(strings.NewReader("")),
+			limit:  limit,
+		}
+		_, err := io.ReadAll(s)
+		if err == nil {
+			t.Fatal("expected oversize error when final chunk crosses limit with EOF, got clean EOF")
+		}
+		if !strings.Contains(err.Error(), "exceeds size limit") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("read after close errors instead of panicking", func(t *testing.T) {
+		// Close returns the pooled limit reader to the pool (nil'ing its
+		// underlying reader); a subsequent Read must surface an error rather
+		// than dereferencing the recycled reader.
+		s := &streamBodyReader{
+			reader: getLimitReader(io.NopCloser(strings.NewReader("body")), 1024),
+			source: io.NopCloser(strings.NewReader("")),
+		}
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		buf := make([]byte, 4)
+		if _, err := s.Read(buf); err == nil {
+			t.Error("expected error reading after Close, got success")
+		} else if !strings.Contains(err.Error(), "closed") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
+// eofOnLastReader returns (n, io.EOF) from the Read that delivers its final
+// byte — a legal io.Reader behavior that strings/bytes.Reader never exercise.
+type eofOnLastReader struct {
+	data string
+	off  int
+}
+
+func (r *eofOnLastReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	if r.off == len(r.data) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+// TestStreamBodyReader_ConcurrentClose is the concurrent variant of
+// TestStreamBodyReader_CloseIdempotent: the user's Close and ReleaseResponse's
+// Close may race from different goroutines, so the guard must be an atomic
+// CAS — run with -race, which flags the unsynchronized closed-flag write this
+// test provokes when the guard is a plain bool.
+func TestStreamBodyReader_ConcurrentClose(t *testing.T) {
+	const rounds = 200
+	for i := 0; i < rounds; i++ {
+		source := &countingReadCloser{inner: strings.NewReader("x")}
+		s := &streamBodyReader{reader: getLimitReader(source, 1024), source: source}
+
+		var wg sync.WaitGroup
+		for g := 0; g < 4; g++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = s.Close()
+			}()
+		}
+		wg.Wait()
+
+		if source.closes != 1 {
+			t.Fatalf("round %d: source.Close called %d times, want exactly 1", i, source.closes)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// TestResponseConcurrentBodyAccess verifies that the Response body accessors
+// are safe to call concurrently with the body mutators. RawBody and
+// RawBodyReader take bodyMu for read specifically so that middleware or user
+// goroutines reading a response never race with a concurrent SetRawBody /
+// SetRawBodyReader / SetBody write; run with -race to catch a regression.
+func TestResponseConcurrentBodyAccess(t *testing.T) {
+	resp := getResponse()
+	defer ReleaseResponse(resp)
+	resp.SetRawBody([]byte("initial body content"))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		// Reader goroutine: mixes locked and previously-unlocked accessors.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 300; j++ {
+				_ = resp.RawBody()
+				_ = resp.Body()
+				_ = resp.RawBodyReader()
+			}
+		}()
+
+		// Writer goroutine: mutates every body-related field under bodyMu.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 300; j++ {
+				resp.SetRawBody([]byte("writer payload"))
+				resp.SetBody("direct body")
+				resp.SetRawBodyReader(io.NopCloser(bytes.NewReader(nil)))
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestResponseProcessor_LargeChunkedBody pins the slow path for bodies with
+// unknown length (ContentLength -1, chunked semantics) spanning several
+// buffer growth steps: content must round-trip exactly at sizes well beyond
+// the initial pooled buffer capacity.
+func TestResponseProcessor_LargeChunkedBody(t *testing.T) {
+	config := &Config{Timeout: 30 * time.Second, MaxResponseBodySize: 50 * 1024 * 1024}
+	processor := newResponseProcessor(config)
+
+	for _, size := range []int{33 * 1024, 64 * 1024, 100 * 1024} {
+		want := bytes.Repeat([]byte{0x7f}, size)
+		httpResp := &http.Response{
+			StatusCode:    200,
+			Status:        "200 OK",
+			Header:        http.Header{},
+			Body:          io.NopCloser(bytes.NewReader(want)),
+			Request:       &http.Request{},
+			ContentLength: -1, // unknown length -> slow path
+		}
+		resp, err := processor.Process(httpResp)
+		if err != nil {
+			t.Fatalf("Process(%d bytes): %v", size, err)
+		}
+		if !bytes.Equal(resp.RawBody(), want) {
+			t.Fatalf("body of %d bytes mismatched", size)
+		}
 	}
 }

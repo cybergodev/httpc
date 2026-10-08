@@ -30,7 +30,14 @@ func (d *Detector) detectPlatform() func(*http.Request) (*url.URL, error) {
 		return nil
 	}
 
-	return func(_ *http.Request) (*url.URL, error) {
+	return func(req *http.Request) (*url.URL, error) {
+		// Loopback targets bypass the system proxy, matching net/http and the
+		// environment path (isLoopbackRequest). ProxyOverride bypass patterns
+		// are not parsed yet — loopback (the implicit "<local>" rule's most
+		// critical part) is the minimum parity fix.
+		if isLoopbackRequest(req) {
+			return nil, nil
+		}
 		return proxyURL, nil
 	}
 }
@@ -136,20 +143,24 @@ func parseWindowsProxyString(proxyStr string) (*url.URL, error) {
 
 	// Check for per-protocol configuration
 	if strings.Contains(proxyStr, "=") {
-		// Parse per-protocol settings
-		parts := strings.Split(proxyStr, ";")
-		for _, part := range parts {
-			kv := strings.SplitN(part, "=", 2)
-			if len(kv) == 2 {
-				protocol := strings.ToLower(strings.TrimSpace(kv[0]))
-				server := strings.TrimSpace(kv[1])
-
-				// Prefer HTTPS proxy, fallback to HTTP
-				if protocol == "https" || protocol == "http" {
-					return url.Parse("http://" + server)
-				}
+		// Parse per-protocol settings, then select explicitly: the HTTPS
+		// proxy is preferred over HTTP regardless of registry ordering
+		// (previously the first http/https segment in document order won).
+		servers := make(map[string]string)
+		for _, part := range strings.Split(proxyStr, ";") {
+			if kv := strings.SplitN(part, "=", 2); len(kv) == 2 {
+				servers[strings.ToLower(strings.TrimSpace(kv[0]))] = strings.TrimSpace(kv[1])
 			}
 		}
+		for _, protocol := range []string{"https", "http"} {
+			if server := servers[protocol]; server != "" {
+				if !strings.Contains(server, "://") {
+					server = "http://" + server
+				}
+				return url.Parse(server)
+			}
+		}
+		return nil, fmt.Errorf("no http/https proxy found in per-protocol config: %q", proxyStr)
 	}
 
 	// Simple server:port format (possibly with an explicit scheme).

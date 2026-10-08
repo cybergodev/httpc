@@ -4,12 +4,14 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // detectPlatform reads proxy settings from macOS system configuration
@@ -25,7 +27,13 @@ func (d *Detector) detectPlatform() func(*http.Request) (*url.URL, error) {
 		return nil
 	}
 
-	return func(_ *http.Request) (*url.URL, error) {
+	return func(req *http.Request) (*url.URL, error) {
+		// Loopback targets bypass the system proxy, matching net/http and the
+		// environment path (isLoopbackRequest). networksetup bypass domains
+		// are not parsed yet.
+		if isLoopbackRequest(req) {
+			return nil, nil
+		}
 		return proxyURL, nil
 	}
 }
@@ -39,8 +47,12 @@ func (d *Detector) getMacOSProxy(toolType string) *url.URL {
 		return nil
 	}
 
-	// Run networksetup command to get proxy settings
-	cmd := exec.Command("networksetup", "-"+toolType, service)
+	// Run networksetup command to get proxy settings. Bounded by a timeout:
+	// this runs while holding the Detector write lock on the client-construction
+	// path, so a wedged networksetup would otherwise block NewClient forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "networksetup", "-"+toolType, service)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -62,8 +74,10 @@ func (d *Detector) getMacOSProxy(toolType string) *url.URL {
 
 // getPrimaryNetworkService returns the primary network service name
 func (d *Detector) getPrimaryNetworkService() string {
-	// Get list of network services
-	cmd := exec.Command("networksetup", "-listallnetworkservices")
+	// Get list of network services. Bounded by a timeout — see getMacOSProxy.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "networksetup", "-listallnetworkservices")
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 

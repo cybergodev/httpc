@@ -26,15 +26,19 @@ func TestConcurrentClientRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&requestCount, 1)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK")) // best-effort test response
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	const numGoroutines = 50
 	const requestsPerGoroutine = 10
@@ -65,6 +69,15 @@ func TestConcurrentClientRequests(t *testing.T) {
 
 	wg.Wait()
 
+	// The counter previously ignored failures; a regression in concurrent
+	// request handling must fail this test, not just be logged.
+	if got := atomic.LoadInt64(&errors); got != 0 {
+		t.Errorf("%d of %d concurrent requests failed", got, numGoroutines*requestsPerGoroutine)
+	}
+	if got := atomic.LoadInt64(&success); got != numGoroutines*requestsPerGoroutine {
+		t.Errorf("success count = %d, want %d", got, numGoroutines*requestsPerGoroutine)
+	}
+
 	t.Logf("Concurrent test completed: %d success, %d errors, %d server requests",
 		atomic.LoadInt64(&success), atomic.LoadInt64(&errors), atomic.LoadInt64(&requestCount))
 }
@@ -86,7 +99,7 @@ func TestConcurrentDomainClientSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create domain client: %v", err)
 	}
-	defer dc.Close()
+	defer func() { _ = dc.Close() }()
 
 	const numGoroutines = 50
 	const opsPerGoroutine = 20
@@ -260,10 +273,9 @@ func TestConcurrentSessionManagerWithCookieSecurity(t *testing.T) {
 
 // TestConcurrentDoHResolverCache tests concurrent DNS cache access.
 func TestConcurrentDoHResolverCache(t *testing.T) {
-	providers := []*dns.DoHProvider{
-		{Name: "test", Template: "https://example.com/dns-query?name={name}", Priority: 1},
-	}
-	resolver := dns.NewDoHResolver(providers, 5*time.Minute)
+	// nil selects defaultDoHProviders(); this test exercises concurrent cache
+	// and TTL operations only, so no provider is ever queried.
+	resolver := dns.NewDoHResolver(nil, 5*time.Minute)
 
 	const numGoroutines = 50
 	const opsPerGoroutine = 20
@@ -309,7 +321,7 @@ func TestConcurrentConnectionPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create pool manager: %v", err)
 	}
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	const numGoroutines = 50
 	const opsPerGoroutine = 20
@@ -394,12 +406,28 @@ func TestConcurrentDefaultClient(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&requestCount, 1)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK")) // best-effort test response
 	}))
 	defer server.Close()
 
-	// Reset default client
-	httpc.CloseDefaultClient()
+	// The package-level default client is built from DefaultConfig, whose SSRF
+	// protection blocks the loopback httptest server. Install a permissive
+	// client (also exercising SetDefaultClient) so the package-level verbs
+	// actually reach the server — previously every request silently failed
+	// validation and the error count was only logged.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	permissive, err := httpc.New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create permissive client: %v", err)
+	}
+	if err := httpc.SetDefaultClient(permissive); err != nil {
+		t.Fatalf("SetDefaultClient: %v", err)
+	}
+	defer func() {
+		_ = permissive.Close()
+		_ = httpc.CloseDefaultClient() // best-effort: reset singleton for later tests
+	}()
 
 	const numGoroutines = 10
 	const requestsPerGoroutine = 5
@@ -424,11 +452,12 @@ func TestConcurrentDefaultClient(t *testing.T) {
 
 	wg.Wait()
 
-	// Cleanup
-	httpc.CloseDefaultClient()
-
-	t.Logf("Default client test: %d errors, %d server requests",
-		atomic.LoadInt64(&errors), atomic.LoadInt64(&requestCount))
+	if got := atomic.LoadInt64(&errors); got != 0 {
+		t.Errorf("%d concurrent package-level requests failed (SSRF misconfiguration?)", got)
+	}
+	if got := atomic.LoadInt64(&requestCount); got != numGoroutines*requestsPerGoroutine {
+		t.Errorf("server saw %d requests, want %d", got, numGoroutines*requestsPerGoroutine)
+	}
 }
 
 // TestConcurrentContextCancellation tests proper handling of concurrent context cancellations.
@@ -442,11 +471,15 @@ func TestConcurrentContextCancellation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	const numGoroutines = 10
 
@@ -496,11 +529,15 @@ func TestRaceConditionMetricsUpdate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	const numGoroutines = 20
 	const requestsPerGoroutine = 10
@@ -585,20 +622,25 @@ func TestConcurrentResultPool(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt64(&requestCount, 1)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("response"))
+		_, _ = w.Write([]byte("response")) // best-effort test response
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	const numGoroutines = 20
 	const opsPerGoroutine = 10
 
 	var wg sync.WaitGroup
+	var errors int64
 	wg.Add(numGoroutines)
 
 	for i := 0; i < numGoroutines; i++ {
@@ -608,6 +650,7 @@ func TestConcurrentResultPool(t *testing.T) {
 				// Get result
 				result, err := client.Get(server.URL)
 				if err != nil {
+					atomic.AddInt64(&errors, 1)
 					continue
 				}
 
@@ -627,7 +670,12 @@ func TestConcurrentResultPool(t *testing.T) {
 
 	wg.Wait()
 
-	t.Logf("Result pool test: %d server requests", atomic.LoadInt64(&requestCount))
+	if got := atomic.LoadInt64(&errors); got != 0 {
+		t.Errorf("%d result-pool requests failed", got)
+	}
+	if got := atomic.LoadInt64(&requestCount); got != numGoroutines*opsPerGoroutine {
+		t.Errorf("server saw %d requests, want %d", got, numGoroutines*opsPerGoroutine)
+	}
 }
 
 // TestConcurrentCookieJar tests concurrent cookie jar operations.
@@ -644,33 +692,44 @@ func TestConcurrentCookieJar(t *testing.T) {
 	}))
 	defer server.Close()
 
+	// DefaultConfig blocks loopback (SSRF); cookies only round-trip if the
+	// requests actually reach the server.
 	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
 	cfg.Connection.EnableCookies = true
 
 	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	const numGoroutines = 10
 	const requestsPerGoroutine = 5
 
 	var wg sync.WaitGroup
+	var errors int64
 	wg.Add(numGoroutines)
 
 	for i := 0; i < numGoroutines; i++ {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < requestsPerGoroutine; j++ {
-				_, _ = client.Get(server.URL)
+				if _, err := client.Get(server.URL); err != nil {
+					atomic.AddInt64(&errors, 1)
+				}
 			}
 		}()
 	}
 
 	wg.Wait()
 
-	t.Logf("Cookie jar test: %d server requests", atomic.LoadInt64(&requestCount))
+	if got := atomic.LoadInt64(&errors); got != 0 {
+		t.Errorf("%d cookie-jar requests failed", got)
+	}
+	if got := atomic.LoadInt64(&requestCount); got != numGoroutines*requestsPerGoroutine {
+		t.Errorf("server saw %d requests, want %d", got, numGoroutines*requestsPerGoroutine)
+	}
 }
 
 // TestConcurrentRedirectHandling tests concurrent redirect handling.
@@ -685,15 +744,19 @@ func TestConcurrentRedirectHandling(t *testing.T) {
 			return
 		}
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
+		_, _ = w.Write([]byte("OK")) // best-effort test response
 	}))
 	defer server.Close()
 
-	client, err := httpc.New(httpc.DefaultConfig())
+	// DefaultConfig blocks loopback (SSRF); tests must allow the private
+	// httptest server or every request silently fails validation.
+	cfg := httpc.DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true
+	client, err := httpc.New(cfg)
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	const numGoroutines = 10
 	const requestsPerGoroutine = 5
@@ -757,7 +820,7 @@ func TestConcurrentMiddlewareExecution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	const numRequests = 50
 	var wg sync.WaitGroup
@@ -784,7 +847,7 @@ func TestConcurrentMiddlewareExecution(t *testing.T) {
 func TestConcurrentMixedOperations(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		_, _ = w.Write([]byte(`{"status":"ok"}`)) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -794,18 +857,23 @@ func TestConcurrentMixedOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	const duration = 200 * time.Millisecond
 	var stop int32
 	var wg sync.WaitGroup
+	var requests int64
+	var failures int64
 
 	// GET requests
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		for atomic.LoadInt32(&stop) == 0 {
-			client.Get(server.URL)
+			if _, err := client.Get(server.URL); err != nil { // load generator
+				atomic.AddInt64(&failures, 1)
+			}
+			atomic.AddInt64(&requests, 1)
 		}
 	}()
 
@@ -814,7 +882,10 @@ func TestConcurrentMixedOperations(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for atomic.LoadInt32(&stop) == 0 {
-			client.Post(server.URL, httpc.WithJSON(map[string]string{"key": "value"}))
+			if _, err := client.Post(server.URL, httpc.WithJSON(map[string]string{"key": "value"})); err != nil { // load generator
+				atomic.AddInt64(&failures, 1)
+			}
+			atomic.AddInt64(&requests, 1)
 		}
 	}()
 
@@ -824,12 +895,23 @@ func TestConcurrentMixedOperations(t *testing.T) {
 		defer wg.Done()
 		for atomic.LoadInt32(&stop) == 0 {
 			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-			client.Request(ctx, "GET", server.URL)
+			if _, err := client.Request(ctx, "GET", server.URL); err != nil { // load generator
+				atomic.AddInt64(&failures, 1)
+			}
 			cancel()
+			atomic.AddInt64(&requests, 1)
 		}
 	}()
 
 	time.Sleep(duration)
 	atomic.StoreInt32(&stop, 1)
 	wg.Wait()
+
+	// Mixed concurrent traffic must have produced load without any failures.
+	if got := atomic.LoadInt64(&requests); got == 0 {
+		t.Error("mixed operations produced no requests")
+	}
+	if got := atomic.LoadInt64(&failures); got != 0 {
+		t.Errorf("%d mixed-operation requests failed", got)
+	}
 }

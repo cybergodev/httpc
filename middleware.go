@@ -6,8 +6,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"net/http"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"time"
 
@@ -39,18 +41,34 @@ func getOrComputeSanitizedURL(req RequestMutator) string {
 // It captures request/response details for compliance logging in financial,
 // medical, and government applications.
 type AuditEvent struct {
-	Timestamp     time.Time           `json:"timestamp"`
-	Method        string              `json:"method"`
-	URL           string              `json:"url"` // Sanitized (credentials removed)
-	StatusCode    int                 `json:"statusCode"`
-	Duration      time.Duration       `json:"duration"`
-	Attempts      int                 `json:"attempts"`
-	Error         error               `json:"error,omitempty"`
-	SourceIP      string              `json:"sourceIP,omitempty"`
-	UserID        string              `json:"userID,omitempty"`
-	RedirectChain []string            `json:"redirectChain,omitempty"`
-	ReqHeaders    map[string][]string `json:"reqHeaders,omitempty"`
-	RespHeaders   map[string][]string `json:"respHeaders,omitempty"`
+	// Timestamp is when the request started; add Duration for the end time.
+	Timestamp time.Time `json:"timestamp"`
+	// Method is the HTTP method of the request.
+	Method string `json:"method"`
+	// URL is the request URL, sanitized (credentials removed).
+	URL string `json:"url"`
+	// StatusCode is the final HTTP status code (0 when the request errored).
+	StatusCode int `json:"statusCode"`
+	// Duration covers all attempts, including retry delays; serialized as
+	// durationMs by MarshalJSON.
+	Duration time.Duration `json:"-"`
+	// Attempts is the number of requests sent (1 when no retry occurred).
+	Attempts int `json:"attempts"`
+	// Error is the request error, if any; marshaled as a string with
+	// sensitive details removed.
+	Error error `json:"error,omitempty"`
+	// SourceIP is an application-supplied caller identifier, if known.
+	SourceIP string `json:"sourceIP,omitempty"`
+	// UserID is an application-supplied user identifier, if known.
+	UserID string `json:"userID,omitempty"`
+	// RedirectChain lists the URLs followed before the final response.
+	RedirectChain []string `json:"redirectChain,omitempty"`
+	// ReqHeaders contains the final request headers (may be nil for early
+	// failures).
+	ReqHeaders map[string][]string `json:"reqHeaders,omitempty"`
+	// RespHeaders contains the final response headers (nil when the request
+	// errored before a response arrived).
+	RespHeaders map[string][]string `json:"respHeaders,omitempty"`
 }
 
 // MarshalJSON implements custom JSON marshaling for AuditEvent.
@@ -101,8 +119,11 @@ func DefaultAuditConfig() *AuditConfig {
 	return &AuditConfig{
 		Format:         "text",
 		IncludeHeaders: false,
-		MaskHeaders:    cachedSensitiveHeaderNames,
-		SanitizeError:  true,
+		// Clone the shared default list: handing out the package-level slice
+		// would let one caller's in-place mutation change every subsequently
+		// created default config.
+		MaskHeaders:   slices.Clone(cachedSensitiveHeaderNames),
+		SanitizeError: true,
 	}
 }
 
@@ -169,8 +190,8 @@ const (
 // The final handler is executed after all middlewares have processed the request.
 func Chain(middlewares ...MiddlewareFunc) MiddlewareFunc {
 	return func(final Handler) Handler {
-		for i := len(middlewares) - 1; i >= 0; i-- {
-			final = middlewares[i](final)
+		for _, mw := range slices.Backward(middlewares) {
+			final = mw(final)
 		}
 		return final
 	}
@@ -270,8 +291,17 @@ func RequestIDMiddleware(config *RequestIDConfig) MiddlewareFunc {
 
 	return func(next Handler) Handler {
 		return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
-			headers := req.Headers()
-			if _, exists := headers[headerName]; !exists {
+			// Header keys are stored with the caller's original casing, so a
+			// case-insensitive scan is required to respect a header set as
+			// e.g. "x-request-id" instead of adding a duplicate.
+			exists := false
+			for k := range req.Headers() {
+				if strings.EqualFold(k, headerName) {
+					exists = true
+					break
+				}
+			}
+			if !exists {
 				req.SetHeader(headerName, generator())
 			}
 
@@ -320,6 +350,15 @@ func TimeoutMiddleware(config *TimeoutMiddlewareConfig) MiddlewareFunc {
 		return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
 			if timeout <= 0 {
 				return next(ctx, req)
+			}
+
+			// Streaming responses outlive this middleware's handler call:
+			// defer cancel() fires as soon as headers arrive and aborts the
+			// body stream mid-read. Reject loudly at configuration time
+			// instead of letting the request fail with a misleading
+			// "context canceled" on the first body byte.
+			if req.StreamBody() {
+				return nil, fmt.Errorf("TimeoutMiddleware is incompatible with streaming responses (WithStreamBody/Download): its context is canceled before the body stream is consumed; use WithTimeout instead")
 			}
 
 			// Derive from the request's own context (which may carry a user-supplied
@@ -372,9 +411,7 @@ func HeaderMiddleware(config *HeaderConfig) MiddlewareFunc {
 
 	// Defensive copy to prevent concurrent mutation by caller
 	copied := make(map[string]string, len(headers))
-	for key, value := range headers {
-		copied[key] = value
-	}
+	maps.Copy(copied, headers)
 
 	// Pre-validate all headers at middleware creation time
 	for key, value := range copied {
@@ -427,16 +464,45 @@ func MetricsMiddleware(config *MetricsConfig) MiddlewareFunc {
 	}
 }
 
+// sanitizedCallbackError carries a redacted error message while preserving
+// the original error for errors.Is/errors.As via Unwrap.
+type sanitizedCallbackError struct {
+	msg     string
+	origErr error
+}
+
+// contextStringValue looks up a string context value on the middleware chain's
+// ctx first, then on the request's own context (set via WithContext). See the
+// AuditMiddleware call site for why both must be consulted.
+func contextStringValue(ctx context.Context, req RequestMutator, key auditContextKey) (string, bool) {
+	if v, ok := ctx.Value(key).(string); ok {
+		return v, true
+	}
+	if reqCtx := req.Context(); reqCtx != nil {
+		if v, ok := reqCtx.Value(key).(string); ok {
+			return v, true
+		}
+	}
+	return "", false
+}
+
+func (e *sanitizedCallbackError) Error() string { return e.msg }
+func (e *sanitizedCallbackError) Unwrap() error { return e.origErr }
+
 // sanitizeCallbackError prevents credential leakage in callback errors.
 // ClientError already sanitizes URLs; for other error types, it replaces
-// the raw URL in the error message with the sanitized version.
+// the raw URL in the error message with the sanitized version. The returned
+// error still unwraps to the original, so consumers keep error classification.
 func sanitizeCallbackError(err error, rawURL, sanitizedURL string) error {
 	if err == nil || rawURL == "" || rawURL == sanitizedURL {
 		return err
 	}
 	errStr := err.Error()
 	if strings.Contains(errStr, rawURL) {
-		return fmt.Errorf("%s", strings.ReplaceAll(errStr, rawURL, sanitizedURL))
+		return &sanitizedCallbackError{
+			msg:     strings.ReplaceAll(errStr, rawURL, sanitizedURL),
+			origErr: err,
+		}
 	}
 	return err
 }
@@ -448,8 +514,9 @@ func sanitizeCallbackError(err error, rawURL, sanitizedURL string) error {
 //
 // This middleware is designed for high-security scenarios (financial, medical,
 // government) where comprehensive request logging is required for compliance.
-// SourceIP and UserID are extracted from the request context using SourceIPKey
-// and UserIDKey.
+// SourceIP and UserID are extracted using SourceIPKey and UserIDKey from the
+// context passed to Client.Request, falling back to the request's own context
+// when set via WithContext.
 //
 // Example:
 //
@@ -472,6 +539,12 @@ func AuditMiddleware(config *AuditConfig) MiddlewareFunc {
 	// Pre-compute mask set once at middleware creation time instead of per-request.
 	precomputedMaskSet := buildMaskSet(config.MaskHeaders)
 
+	// Snapshot the config flags alongside the callback and mask set: keeping
+	// the live *AuditConfig pointer would race with a caller mutating these
+	// fields while requests are in flight.
+	includeHeaders := config.IncludeHeaders
+	sanitizeError := config.SanitizeError
+
 	return func(next Handler) Handler {
 		return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
 			start := time.Now()
@@ -487,11 +560,16 @@ func AuditMiddleware(config *AuditConfig) MiddlewareFunc {
 				Error:     err,
 			}
 
-			// Extract context values
-			if sourceIP, ok := ctx.Value(SourceIPKey).(string); ok {
+			// Extract context values. Audit values may be attached either to the
+			// context passed to Client.Request (the middleware chain's ctx) or to
+			// the request's own context via WithContext — the engine reads the
+			// latter, so without this fallback audit events would silently drop
+			// values supplied through WithContext. The chain ctx wins when both
+			// carry a value (backward-compatible).
+			if sourceIP, ok := contextStringValue(ctx, req, SourceIPKey); ok {
 				event.SourceIP = sourceIP
 			}
-			if userID, ok := ctx.Value(UserIDKey).(string); ok {
+			if userID, ok := contextStringValue(ctx, req, UserIDKey); ok {
 				event.UserID = userID
 			}
 
@@ -503,7 +581,7 @@ func AuditMiddleware(config *AuditConfig) MiddlewareFunc {
 			}
 
 			// Include headers if configured
-			if config.IncludeHeaders {
+			if includeHeaders {
 				event.ReqHeaders = maskStringHeaders(req.Headers(), precomputedMaskSet)
 				if resp != nil {
 					event.RespHeaders = maskHTTPHeaders(resp.Headers(), precomputedMaskSet)
@@ -511,7 +589,7 @@ func AuditMiddleware(config *AuditConfig) MiddlewareFunc {
 			}
 
 			// Sanitize error if configured
-			if config.SanitizeError && event.Error != nil {
+			if sanitizeError && event.Error != nil {
 				event.Error = fmt.Errorf("[sanitized]")
 			}
 
@@ -560,7 +638,10 @@ func maskHTTPHeaders(headers http.Header, maskSet map[string]bool) map[string][]
 		if maskSet[http.CanonicalHeaderKey(k)] {
 			result[k] = []string{"[REDACTED]"}
 		} else {
-			result[k] = vv
+			// Copy the slice: the source headers may belong to a pooled
+			// response that gets reset and reused once the audit event's
+			// synchronous callback returns.
+			result[k] = append([]string(nil), vv...)
 		}
 	}
 	return result

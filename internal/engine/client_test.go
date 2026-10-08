@@ -57,19 +57,12 @@ func TestNewClient(t *testing.T) {
 
 func TestNewClient_InvalidConfig(t *testing.T) {
 	tests := []struct {
-		name   string
-		config *Config
+		name    string
+		config  *Config
+		wantErr bool
 	}{
-		{
-			name:   "Nil config",
-			config: nil,
-		},
-		{
-			name: "Zero timeout",
-			config: &Config{
-				Timeout: 0,
-			},
-		},
+		{name: "Nil config", config: nil, wantErr: true},
+		{name: "Zero timeout falls back to default", config: &Config{Timeout: 0}, wantErr: false},
 	}
 
 	for _, tt := range tests {
@@ -78,19 +71,20 @@ func TestNewClient_InvalidConfig(t *testing.T) {
 			if client != nil {
 				defer func() { _ = client.Close() }()
 			}
-			if tt.config == nil {
-				if err == nil {
-					t.Error("expected error for nil config")
-				}
-				if client != nil {
-					t.Error("expected nil client for nil config")
-				}
+			if tt.wantErr && err == nil {
+				t.Error("expected error, got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected success, got: %v", err)
+			}
+			if tt.wantErr && client != nil {
+				t.Error("expected nil client on error")
 			}
 		})
 	}
 }
 
-// TestClient_HTTPMethods removed - duplicate of TestClient_AllHTTPMethods in comprehensive_test.go
+// TestClient_HTTPMethods removed - duplicate of TestClient_ConvenienceMethods below
 
 func TestClient_Request(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -192,26 +186,9 @@ func TestClient_Close(t *testing.T) {
 	}
 }
 
-func TestClient_Statistics(t *testing.T) {
-	config := &Config{
-		Timeout:         30 * time.Second,
-		AllowPrivateIPs: true,
-		MaxRetries:      1,
-		UserAgent:       "test-client/1.0",
-	}
-
-	client, err := NewClient(config)
-	if err != nil {
-		t.Fatalf("NewClient failed: %v", err)
-	}
-	defer func() { _ = client.Close() }()
-
-	// Test that client tracks basic statistics via health status
-	status := client.getHealthStatus()
-	if status.totalRequests < 0 {
-		t.Error("totalRequests should be non-negative")
-	}
-}
+// TestClient_Statistics was removed: it asserted totalRequests >= 0 on a
+// monotonic counter (could never fail). Request-count tracking is asserted
+// with a real request by TestClient_IsHealthy.
 
 func TestClient_ConcurrentRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -290,7 +267,8 @@ func TestClient_TLSConfig(t *testing.T) {
 	}
 }
 
-// TestClient_ContextCancellation removed - duplicate of TestClient_Timeout in client_test.go
+// TestClient_ContextCancellation removed (early version) - the surviving
+// test of the same name lives further down in this file.
 
 // TestClient_InvalidURL removed - duplicate of TestClient_ErrorHandling in client_test.go
 
@@ -361,7 +339,7 @@ func TestClient_ConvenienceMethods(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewClient failed: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			resp, err := client.Request(backgroundCtx, tt.method, server.URL)
 			if err != nil {
@@ -393,7 +371,7 @@ func TestClient_IsHealthy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Make a successful request
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -427,7 +405,7 @@ func TestClient_OnRequestOnResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -580,7 +558,7 @@ func TestClient_ResponseProcessing(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			resp, err := client.Request(backgroundCtx, "GET", server.URL)
 			if err != nil {
@@ -671,7 +649,7 @@ func TestClient_ErrorHandling(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			_, err = client.Request(backgroundCtx, "GET", server.URL)
 
@@ -710,7 +688,7 @@ func TestClient_ContextCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -733,7 +711,7 @@ func TestClient_ContextCancellation(t *testing.T) {
 func TestClient_OnResponseErrorReleasesResponse(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("test body"))
+		_, _ = w.Write([]byte("test body")) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -743,7 +721,7 @@ func TestClient_OnResponseErrorReleasesResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// onResponse callback that returns an error
 	onRespOption := func(req *Request) error {
@@ -776,7 +754,7 @@ func TestClient_SetRawBodyReader(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(fmt.Sprintf("body=%s,content-type=%s", string(body), r.Header.Get("Content-Type"))))
+		_, _ = fmt.Fprintf(w, "body=%s,content-type=%s", string(body), r.Header.Get("Content-Type")) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -790,7 +768,7 @@ func TestClient_SetRawBodyReader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient error: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	if err != nil {
@@ -818,4 +796,222 @@ func TestClient_SetRawBodyReader(t *testing.T) {
 
 	// Restore original to avoid leak if it was non-nil
 	_ = originalReader
+}
+
+// TestRequestApply verifies Apply forwards every per-request mutable field
+// and transfers ownership of the pooled maps (src's references cleared).
+func TestRequestApply(t *testing.T) {
+	src := &Request{}
+	src.SetMethod("POST")
+	src.SetURL("https://api.example.com/apply")
+	src.SetHeader("X-Test", "value")
+	src.EnsureQueryParams()["q"] = "1"
+	src.SetBody(map[string]string{"k": "v"})
+	src.SetTimeout(7 * time.Second)
+	src.SetMaxRetries(3)
+	src.SetCookies([]http.Cookie{{Name: "c", Value: "v"}})
+	fr, mr, ap := true, 4, true
+	src.SetFollowRedirects(&fr)
+	src.SetMaxRedirects(&mr)
+	src.SetAllowPrivateIPs(&ap)
+	src.SetStreamBody(true)
+
+	dst := &Request{}
+	dst.Apply(src)
+
+	if dst.Method() != "POST" || dst.URL() != "https://api.example.com/apply" {
+		t.Errorf("method/url not forwarded: %s %s", dst.Method(), dst.URL())
+	}
+	if dst.Headers()["X-Test"] != "value" {
+		t.Errorf("headers not forwarded: %v", dst.Headers())
+	}
+	if dst.QueryParams()["q"] != "1" {
+		t.Errorf("query params not forwarded: %v", dst.QueryParams())
+	}
+	if dst.Body() == nil || dst.Timeout() != 7*time.Second || dst.MaxRetries() != 3 {
+		t.Errorf("body/timeout/retries not forwarded: %v %v %v", dst.Body(), dst.Timeout(), dst.MaxRetries())
+	}
+	if len(dst.Cookies()) != 1 || dst.Cookies()[0].Name != "c" {
+		t.Errorf("cookies not forwarded: %v", dst.Cookies())
+	}
+	if dst.FollowRedirects() == nil || !*dst.FollowRedirects() {
+		t.Error("followRedirects not forwarded")
+	}
+	if dst.MaxRedirects() == nil || *dst.MaxRedirects() != 4 {
+		t.Error("maxRedirects not forwarded")
+	}
+	if dst.AllowPrivateIPs() == nil || !*dst.AllowPrivateIPs() {
+		t.Error("allowPrivateIPs not forwarded")
+	}
+	if !dst.StreamBody() {
+		t.Error("streamBody not forwarded")
+	}
+
+	// Ownership transfer: pooled maps must be detached from src so a later
+	// release of src cannot double-pool them.
+	if src.Headers() != nil || src.QueryParams() != nil {
+		t.Errorf("src pooled maps not cleared: headers=%v queryParams=%v", src.Headers(), src.QueryParams())
+	}
+	// dst still sees the transferred maps.
+	if dst.Headers()["X-Test"] != "value" {
+		t.Error("headers lost after ownership transfer")
+	}
+}
+
+// TestExecuteWithRetry_ProxyRotationPaths covers the proxy-rotation branches
+// of executeWithRetry that plain mock-transport retry tests cannot reach:
+// recorder attachment + NextProxyIndex reservation in both the no-retry fast
+// path and the retry loop, and per-attempt WithProxyAttempt context wiring.
+// The mock transport bypasses the real Proxy callback, so ProxyURL stays
+// empty — the branches, not the value, are the point here.
+func TestExecuteWithRetry_ProxyRotationPaths(t *testing.T) {
+	newPoolCfg := func(maxRetries int) *Config {
+		return &Config{
+			Timeout:               5 * time.Second,
+			AllowPrivateIPs:       true,
+			MaxRetries:            maxRetries,
+			RetryDelay:            time.Millisecond,
+			ProxyPool:             []string{"http://p1.example.com:8080", "http://p2.example.com:8080"},
+			ProxyRotatePerRequest: true,
+		}
+	}
+
+	t.Run("fast path attaches recorder and reserves index", func(t *testing.T) {
+		mt := newMockTransport(200, "ok")
+		client, err := NewClient(newPoolCfg(0), withMockTransport(mt))
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		defer func() { _ = client.Close() }()
+
+		resp, err := client.Request(context.Background(), "GET", "https://example.com")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		if resp.Attempts() != 1 {
+			t.Errorf("Attempts = %d, want 1 (no-retry fast path)", resp.Attempts())
+		}
+		ReleaseResponse(resp)
+	})
+
+	t.Run("retry loop rotates proxy index across attempts", func(t *testing.T) {
+		mt := newMockTransport(200, "ok")
+		mt.failFirst = 2 // two retryable failures, success on attempt 3
+		client, err := NewClient(newPoolCfg(2), withMockTransport(mt))
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		defer func() { _ = client.Close() }()
+
+		resp, err := client.Request(context.Background(), "GET", "https://example.com")
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+		if resp.Attempts() != 3 {
+			t.Errorf("Attempts = %d, want 3", resp.Attempts())
+		}
+		if mt.GetCallCount() != 3 {
+			t.Errorf("transport calls = %d, want 3", mt.GetCallCount())
+		}
+		ReleaseResponse(resp)
+	})
+}
+
+// TestExecuteWithRetry_CustomPolicyVetoAndSleepError covers the two
+// custom-policy exits of the retry loop: a policy that vetoes a retryable
+// error (ShouldRetry=false → immediate return), and a sleep aborted by the
+// request deadline during the inter-attempt delay.
+func TestExecuteWithRetry_CustomPolicyVetoAndSleepError(t *testing.T) {
+	t.Run("policy vetoes retryable error", func(t *testing.T) {
+		mt := newMockTransport(200, "ok")
+		mt.failFirst = 1 // retryable connection-reset, but policy says stop
+		client, err := NewClient(&Config{
+			Timeout:           5 * time.Second,
+			AllowPrivateIPs:   true,
+			MaxRetries:        2,
+			CustomRetryPolicy: &testRetryPolicy{maxRetries: 0, delay: time.Millisecond},
+		}, withMockTransport(mt))
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		defer func() { _ = client.Close() }()
+
+		_, err = client.Request(context.Background(), "GET", "https://example.com")
+		if err == nil {
+			t.Fatal("expected error: policy must stop after first failure")
+		}
+		if mt.GetCallCount() != 1 {
+			t.Errorf("transport calls = %d, want 1 (veto honored)", mt.GetCallCount())
+		}
+	})
+
+	t.Run("sleep aborted by request deadline", func(t *testing.T) {
+		mt := newMockTransport(200, "ok")
+		mt.failFirst = 1
+		client, err := NewClient(&Config{
+			Timeout:         30 * time.Second, // > ctx deadline: ctx deadline wins
+			AllowPrivateIPs: true,
+			MaxRetries:      1,
+			CustomRetryPolicy: &testRetryPolicy{
+				maxRetries: 1,
+				delay:      500 * time.Millisecond, // longer than the ctx deadline
+			},
+		}, withMockTransport(mt))
+		if err != nil {
+			t.Fatalf("NewClient: %v", err)
+		}
+		defer func() { _ = client.Close() }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+
+		_, err = client.Request(ctx, "GET", "https://example.com")
+		if err == nil {
+			t.Fatal("expected error: sleep must be aborted by the deadline")
+		}
+	})
+}
+
+// TestSecurityRequestPool_FallbackAndReset covers the defensive branches of
+// getSecurityRequest/putSecurityRequest: a wrong-typed pooled value must fall
+// back to a fresh security.Request, and put must clear every field so a
+// recycled request never leaks prior-request state. Mirrors the poisoned-pool
+// tests the other engine pools already have.
+func TestSecurityRequestPool_FallbackAndReset(t *testing.T) {
+	client, err := NewClient(&Config{Timeout: 30 * time.Second, AllowPrivateIPs: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	t.Run("wrong-typed pooled value falls back to fresh", func(t *testing.T) {
+		client.securityRequestPool.Put(42) //nolint:staticcheck // intentional wrong-type poisoning
+
+		req := client.getSecurityRequest()
+		if req == nil {
+			t.Fatal("getSecurityRequest returned nil from poisoned pool")
+		}
+		// Must be a usable zero value.
+		if req.Method != "" || req.URL != "" || req.Headers != nil {
+			t.Errorf("fallback request not zero-valued: %+v", req)
+		}
+	})
+
+	t.Run("put clears all fields", func(t *testing.T) {
+		req := client.getSecurityRequest()
+		req.Method = "POST"
+		req.URL = "https://example.com"
+		req.Headers = map[string]string{"X-A": "1"}
+		req.QueryParams = map[string]any{"q": 1}
+
+		client.putSecurityRequest(req)
+
+		if req.Method != "" || req.URL != "" || req.Headers != nil || req.QueryParams != nil {
+			t.Errorf("putSecurityRequest did not reset: %+v", req)
+		}
+	})
+
+	t.Run("put nil is a no-op", func(t *testing.T) {
+		client.putSecurityRequest(nil) // must not panic
+	})
 }

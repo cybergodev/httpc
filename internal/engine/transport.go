@@ -73,34 +73,21 @@ var redirectSettingsPool = sync.Pool{
 	},
 }
 
-// cookieMapPool reduces allocations for cookie merging maps.
-// Used in RoundTrip when merging request cookies with jar cookies.
-var cookieMapPool = sync.Pool{
-	New: func() any {
-		m := make(map[string]*http.Cookie, 8)
-		return &m
-	},
-}
-
-// cookieSlicePool reduces allocations for cookie slices.
-var cookieSlicePool = sync.Pool{
-	New: func() any {
-		s := make([]*http.Cookie, 0, 8)
-		return &s
-	},
-}
-
 // getRedirectSettings retrieves a redirectSettings from the pool.
 func getRedirectSettings() *redirectSettings {
 	s, ok := redirectSettingsPool.Get().(*redirectSettings)
 	if !ok || s == nil {
 		return &redirectSettings{}
 	}
-	*s = redirectSettings{}
+	// No re-clear here: putRedirectSettings is the single reset point, so a
+	// recycled object is already zeroed. Clearing in exactly one place keeps
+	// the reset contract obvious.
 	return s
 }
 
 // putRedirectSettings returns a redirectSettings to the pool after resetting it.
+// This is the single reset point for recycled settings objects (see
+// getRedirectSettings).
 // SECURITY: Clears all redirect URLs to prevent sensitive URL leakage.
 func putRedirectSettings(s *redirectSettings) {
 	if s == nil {
@@ -182,8 +169,15 @@ func (t *transport) checkRedirect(req *http.Request, via []*http.Request) error 
 	// Get redirect settings from context
 	settings, ok := req.Context().Value(redirectContextKey{}).(*redirectSettings)
 	if !ok {
-		// No settings in context, use defaults
-		return nil
+		// SECURITY: fail closed. Installing CheckRedirect REPLACES net/http's
+		// default policy, so returning nil here would mean "follow, with no
+		// redirect-count cap, no SSRF validation, no whitelist check, and no
+		// cross-origin header stripping" — an unbounded SSRF bypass. Settings
+		// are always injected by SetRedirectPolicy before RoundTrip, so this
+		// branch is unreachable on current call paths; it exists to catch any
+		// future path that rebuilds the context without them (a previous
+		// version silently allowed the redirect here).
+		return fmt.Errorf("redirect blocked: no redirect policy in request context (internal error)")
 	}
 
 	// Don't follow redirects if disabled
@@ -219,9 +213,13 @@ func (t *transport) checkRedirect(req *http.Request, via []*http.Request) error 
 	}
 
 	// SECURITY: Strip sensitive headers on cross-origin redirects to prevent
-	// credential leakage. When the redirect target host differs from the original
-	// request host, remove Authorization, Cookie, and Proxy-Authorization headers.
-	if len(via) > 0 && req.URL.Hostname() != via[0].URL.Hostname() {
+	// credential leakage. Origin follows RFC 6454: scheme, host, AND port
+	// (scheme-default ports normalized, so example.com and example.com:80 are
+	// one origin under http, while example.com:443 is not). Any scheme change
+	// — including the https → http downgrade, where credentials would cross a
+	// plaintext hop — is cross-origin; treating the http → https upgrade the
+	// same way matches net/http's own redirect header-copying behavior.
+	if len(via) > 0 && !sameOrigin(via[0].URL, req.URL) {
 		req.Header.Del("Authorization")
 		req.Header.Del("Proxy-Authorization")
 		req.Header.Del("Cookie")
@@ -276,8 +274,9 @@ func (t *transport) validateRedirectTarget(targetURL *url.URL) error {
 		return fmt.Errorf("nil redirect URL")
 	}
 
-	scheme := strings.ToLower(targetURL.Scheme)
-	if scheme != "http" && scheme != "https" {
+	// EqualFold instead of lowering: URL schemes are ASCII, and this avoids
+	// a per-redirect string allocation.
+	if !strings.EqualFold(targetURL.Scheme, "http") && !strings.EqualFold(targetURL.Scheme, "https") {
 		return fmt.Errorf("unsupported redirect scheme: %s", targetURL.Scheme)
 	}
 
@@ -290,7 +289,38 @@ func (t *transport) validateRedirectTarget(targetURL *url.URL) error {
 	// createDialer → resolveAndValidateAddress) performs full SSRF validation
 	// with DNS rebinding prevention (resolves once, validates, dials IP directly).
 	// Skipping DNS here avoids a redundant resolution and a TOCTOU window.
-	return validation.ValidateSSRFHost(host, t.exemptNets, false)
+	return validation.ValidateSSRFHost(host, t.exemptNets)
+}
+
+// sameOrigin reports whether two URLs share an origin per RFC 6454: scheme,
+// host, and effective port, with scheme-default ports normalized (so
+// "example.com" and "example.com:80" under http are one origin, while
+// "example.com:8080" is not). checkRedirect uses it to decide when
+// Authorization/Cookie/Proxy-Authorization must be stripped; comparing
+// hostname alone would treat "example.com:443 → example.com:8080" as
+// same-origin and leak credentials across what is really a server change.
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+// effectivePort returns u's explicit port, or the scheme's default when the
+// URL omits one (mirrors net/http's schemePort). A URL with neither port nor
+// recognized scheme has no effective port and matches only the same
+// degenerate form.
+func effectivePort(u *url.URL) string {
+	if p := u.Port(); p != "" {
+		return p
+	}
+	switch u.Scheme {
+	case "https":
+		return "443"
+	case "http":
+		return "80"
+	default:
+		return ""
+	}
 }
 
 // redirectContextKey is a typed context key for redirect settings.
@@ -315,112 +345,84 @@ func (t *transport) SetRedirectPolicy(ctx context.Context, followRedirects bool,
 	return newCtx, settings
 }
 
-// GetRedirectChain returns the redirect chain from the context
-func (t *transport) GetRedirectChain(ctx context.Context) []string {
-	settings, ok := ctx.Value(redirectContextKey{}).(*redirectSettings)
-	if !ok || settings.chainLen == 0 {
-		return nil
-	}
-	return settings.getChain()
-}
-
 // RoundTrip executes an HTTP round trip
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// The http.Client with Jar handles cookies automatically
-	// If there are manually set cookies, merge them with the jar
-	if t.httpClient.Jar != nil {
-		if requestCookies := req.Cookies(); len(requestCookies) > 0 {
-			existingCookies := t.httpClient.Jar.Cookies(req.URL)
-
-			// Use pooled cookie map to reduce allocations
-			cookieMapPtr, ok := cookieMapPool.Get().(*map[string]*http.Cookie)
-			if !ok || cookieMapPtr == nil {
-				m := make(map[string]*http.Cookie, len(existingCookies)+len(requestCookies))
-				cookieMapPtr = &m
-			}
-			cookieMap := *cookieMapPtr
-
-			// Clear the map for reuse
-			for k := range cookieMap {
-				delete(cookieMap, k)
-			}
-
-			for _, c := range existingCookies {
-				cookieMap[c.Name] = c
-			}
-
-			for _, c := range requestCookies {
-				cookieCopy := *c
-				if cookieCopy.Domain == "" {
-					cookieCopy.Domain = req.URL.Hostname()
-				}
-				if cookieCopy.Path == "" {
-					cookieCopy.Path = "/"
-				}
-				cookieMap[cookieCopy.Name] = &cookieCopy
-			}
-
-			// Use pooled slice for merged cookies
-			mergedPtr, ok := cookieSlicePool.Get().(*[]*http.Cookie)
-			if !ok || mergedPtr == nil {
-				s := make([]*http.Cookie, 0, len(cookieMap))
-				mergedPtr = &s
-			}
-			mergedCookies := (*mergedPtr)[:0]
-
-			for _, c := range cookieMap {
-				mergedCookies = append(mergedCookies, c)
-			}
-			// Capture the slice that was actually populated. append only updates
-			// the local mergedCookies header (and may reallocate into a new backing
-			// array), leaving the pooled *mergedPtr header at length 0 — so the
-			// deferred scrub below must iterate populated, not *mergedPtr, or it
-			// clears nothing (this was a no-op bug: it scrubbed a zero-length slice).
-			populated := mergedCookies
-
-			t.httpClient.Jar.SetCookies(req.URL, mergedCookies)
-			req.Header.Del("Cookie")
-
-			// SECURITY: Clear sensitive cookie data before returning to pool.
-			// Use defer to ensure cleanup even if subsequent operations panic.
-			defer func() {
-				// Clear the map to prevent data leakage between requests
-				for k := range cookieMap {
-					delete(cookieMap, k)
-				}
-				// SECURITY: Clear each populated Cookie's sensitive fields so they do
-				// not persist in pooled memory. `populated` is the slice that actually
-				// received the merged cookies: on the common path (merged count <= the
-				// pool slice capacity) it aliases the pooled backing array, so this
-				// fully scrubs it. On the rare reallocation path (count > capacity),
-				// `populated` is a fresh array and the pooled array's pre-reallocation
-				// slots retain their previous pointers until overwritten on the next
-				// reuse; those pointers reference this same request's cookies (request
-				// cookies plus jar cookies for this URL), so the residual is low-impact.
-				for i := range populated {
-					if populated[i] != nil {
-						populated[i].Value = ""
-						populated[i].Domain = ""
-						populated[i].Path = ""
-						populated[i].RawExpires = ""
-						populated[i].Raw = ""
-					}
-				}
-				// Reset the pooled slice header to length 0, keeping its backing
-				// array for reuse. *mergedPtr still references the original pooled
-				// backing array; any reallocated array (the count > capacity path)
-				// was scrubbed above via `populated` and is left for GC rather than
-				// returned to the pool.
-				*mergedPtr = (*mergedPtr)[:0]
-
-				// Return the map and slice headers to their pools.
-				cookieMapPool.Put(cookieMapPtr)
-				cookieSlicePool.Put(mergedPtr)
-			}()
+	// Manually set cookies are layered onto the jar via a per-request
+	// overlay instead of being written into the shared client jar: a
+	// one-off WithCookies value must not persist across requests. The
+	// overlay stays active for the whole round trip including redirects.
+	client := t.httpClient
+	if client.Jar != nil {
+		// Parse the Cookie header once and share the result with the overlay
+		// constructor — req.Cookies() re-parses on every call, so the old
+		// len-check + construct sequence paid the full parse twice.
+		if cookies := req.Cookies(); len(cookies) > 0 {
+			overlay := newCookieOverlayJar(client.Jar, req, cookies)
+			req.Header.Del("Cookie") // supplied per-hop by the overlay jar
+			scoped := *client        // shallow copy; Transport and friends are shared
+			scoped.Jar = overlay
+			client = &scoped
 		}
 	}
+	return client.Do(req)
+}
 
-	return t.httpClient.Do(req)
+// cookieOverlayJar layers request-scoped manual cookies on top of a shared
+// base jar for the duration of one round trip. Manual cookies are matched by
+// name against the original request's hostname and win over jar cookies with
+// the same name. SetCookies forwards to the base jar only, so manual cookies
+// are never persisted client-wide.
+type cookieOverlayJar struct {
+	base   http.CookieJar
+	manual []*http.Cookie
+	origin string // hostname the manual cookies were set for
+}
+
+// newCookieOverlayJar builds an overlay from the request's Cookie header.
+// newCookieOverlayJar builds the overlay from an already-parsed cookie list
+// (callers parse the Cookie header once and pass the result in).
+func newCookieOverlayJar(base http.CookieJar, req *http.Request, requestCookies []*http.Cookie) *cookieOverlayJar {
+	manual := make([]*http.Cookie, 0, len(requestCookies))
+	for _, c := range requestCookies {
+		cc := *c
+		manual = append(manual, &cc)
+	}
+	return &cookieOverlayJar{
+		base:   base,
+		manual: manual,
+		origin: req.URL.Hostname(),
+	}
+}
+
+// Cookies returns the base jar's cookies with manual cookies layered on top
+// (manual wins by name) when the target hostname matches the overlay's
+// origin. Redirects to other hosts do not receive the manual cookies.
+func (j *cookieOverlayJar) Cookies(u *url.URL) []*http.Cookie {
+	merged := j.base.Cookies(u)
+	if !strings.EqualFold(u.Hostname(), j.origin) {
+		return merged
+	}
+	out := make([]*http.Cookie, 0, len(merged)+len(j.manual))
+	out = append(out, merged...)
+	for _, m := range j.manual {
+		replaced := false
+		for i := range out {
+			if out[i].Name == m.Name {
+				out[i] = m
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// SetCookies forwards to the base jar only; the overlay itself is read-only.
+func (j *cookieOverlayJar) SetCookies(u *url.URL, cookies []*http.Cookie) {
+	j.base.SetCookies(u, cookies)
 }
 
 // Close closes the transport and cleans up resources

@@ -3,76 +3,18 @@ package engine
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 )
 
-func TestRequest_Validation(t *testing.T) {
-	tests := []struct {
-		name    string
-		request *Request
-		wantErr bool
-	}{
-		{
-			name: "Valid request",
-			request: testRequestBuilder().
-				Method("GET").
-				URL("https://example.com").
-				Headers(make(map[string]string)).
-				QueryParams(make(map[string]any)).
-				Context(context.Background()).
-				Build(),
-			wantErr: false,
-		},
-		{
-			name: "Empty method",
-			request: testRequestBuilder().
-				Method("").
-				URL("https://example.com").
-				Context(context.Background()).
-				Build(),
-			wantErr: false, // Should default to GET
-		},
-		{
-			name: "Empty URL",
-			request: testRequestBuilder().
-				Method("GET").
-				URL("").
-				Context(context.Background()).
-				Build(),
-			wantErr: true,
-		},
-		{
-			name: "Nil context",
-			request: testRequestBuilder().
-				Method("GET").
-				URL("https://example.com").
-				Build(),
-			wantErr: false, // Should use background context
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.request.Method() == "" {
-				tt.request.SetMethod("GET")
-			}
-			if tt.request.Context() == nil {
-				tt.request.SetContext(context.Background())
-			}
-
-			hasURL := tt.request.URL() != ""
-			if tt.wantErr && hasURL {
-				t.Errorf("expected error case %q should have empty URL", tt.name)
-			}
-			if !tt.wantErr && !hasURL {
-				t.Errorf("non-error case %q should have a URL", tt.name)
-			}
-		})
-	}
-}
+// TestRequest_Validation was removed: it never invoked any validation —
+// it compared builder-set values back against the table that supplied
+// them (wantErr was decorative). Real validation paths are exercised in
+// request_processor_test.go and the client option tests.
 
 func TestRequest_WithTimeout(t *testing.T) {
 	req := testRequestBuilder().
@@ -327,14 +269,52 @@ func TestURLCache_EvictOldest(t *testing.T) {
 	if _, ok := c.entries["k2"]; !ok {
 		t.Error("newest entry (k2) should be retained")
 	}
-	if _, ok := c.raw["http://example.com/oldest"]; ok {
-		t.Error("raw entry for the evicted URL should be removed")
+	// evictOldest no longer scans the raw map: an orphaned raw entry is a
+	// still-correct parse of its key and is reclaimed by evictRawIfNeeded
+	// once the raw map exceeds its cap. Verify both raw entries survive here.
+	if _, ok := c.raw["http://example.com/oldest"]; !ok {
+		t.Error("orphaned raw entry for the evicted URL may remain until evictRawIfNeeded runs")
 	}
 	if _, ok := c.raw["http://example.com/newest"]; !ok {
 		t.Error("raw entry for the retained URL should remain")
 	}
 	if len(c.keys) != 1 || c.keys[0] != "k2" {
 		t.Errorf("keys slice should advance to [k2], got %v", c.keys)
+	}
+
+	// populateRawCacheLocked must lazily initialize a nil raw map, and an
+	// existing key must be a no-op (no overwrite). Covers the branches that
+	// formerly relied on the removed TestURLCache_Eviction.
+	u := &url.URL{Path: "/x"}
+	c2 := &urlCache{
+		entries: map[string]*url.URL{"k": u},
+		keys:    []string{"k"},
+		maxSize: 4,
+		// raw intentionally nil
+	}
+	c2.populateRawCacheLocked("http://example.com/x", u)
+	if c2.raw == nil || c2.raw["http://example.com/x"] != u {
+		t.Error("populateRawCacheLocked should lazily create the raw map and insert")
+	}
+	c2.populateRawCacheLocked("http://example.com/x", &url.URL{Path: "/other"})
+	if c2.raw["http://example.com/x"] != u {
+		t.Error("populateRawCacheLocked must not overwrite an existing raw entry")
+	}
+
+	// The keys-slice compaction branch: after eviction leaves a slice whose
+	// capacity is more than double its length, the backing array is shrunk.
+	big := &url.URL{Path: "/big"}
+	c3 := &urlCache{
+		entries: map[string]*url.URL{"k": big},
+		keys:    append(make([]string, 0, 16), "k"), // cap 16 >> len 1
+		maxSize: 1,
+	}
+	c3.evictOldest()
+	if _, ok := c3.entries["k"]; ok {
+		t.Error("entry should be evicted at maxSize")
+	}
+	if cap(c3.keys) > 2*len(c3.keys) {
+		t.Errorf("keys backing array should be shrunk, cap=%d len=%d", cap(c3.keys), len(c3.keys))
 	}
 }
 
@@ -367,4 +347,201 @@ func TestRequest_AccessorRoundTrip(t *testing.T) {
 	if r.AllowPrivateIPs() == nil || *r.AllowPrivateIPs() != true {
 		t.Error("SetAllowPrivateIPs round-trip failed")
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Cookie header sanitization (request.go)
+// ---------------------------------------------------------------------------
+
+// TestSanitizeCookieNameValue pins the Cookie header-injection defenses:
+// CR/LF stripped from names, and invalid value bytes (quote, semicolon,
+// backslash, control, non-ASCII) octal-escaped exactly like net/http.
+func TestSanitizeCookieNameValue(t *testing.T) {
+	t.Run("sanitizeCookieName", func(t *testing.T) {
+		tests := []struct {
+			name, in, want string
+		}{
+			{"clean name passthrough", "session", "session"},
+			{"strip LF", "bad\nname", "badname"},
+			{"strip CR", "bad\rname", "badname"},
+			{"strip both", "a\r\nb", "ab"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				if got := sanitizeCookieName(tt.in); got != tt.want {
+					t.Errorf("sanitizeCookieName(%q) = %q, want %q", tt.in, got, tt.want)
+				}
+			})
+		}
+	})
+
+	t.Run("sanitizeCookieValue", func(t *testing.T) {
+		tests := []struct {
+			name, in, want string
+		}{
+			{"clean value passthrough (fast path)", "abc123", "abc123"},
+			{"printable specials excepted stay clean", "a:b/c?d#e", "a:b/c?d#e"},
+			{"quote escaped", "a\"b", "a\\042b"},
+			{"semicolon escaped", "a;b", "a\\073b"},
+			{"backslash escaped", "a\\b", "a\\134b"},
+			{"control byte escaped", "a\x01b", "a\\001b"},
+			{"non-ASCII escaped as UTF-8 byte pair (slow path)", "a\u00e4b", "a\\303\\244b"},
+			{"invalid at start", "\x00x", "\\000x"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				if got := sanitizeCookieValue(tt.in); got != tt.want {
+					t.Errorf("sanitizeCookieValue(%q) = %q, want %q", tt.in, got, tt.want)
+				}
+			})
+		}
+	})
+}
+
+// TestPooledStringsReader_NoReleaseOnEOF pins the release discipline of the
+// request-body reader wrappers: the pool return must happen ONLY in Close,
+// never at EOF in Read. net/http reads the body to EOF and closes it later
+// (on HTTP/2, from the writeLoop goroutine); releasing at EOF would put the
+// wrapper back in the pool while a delayed Close can still arrive, and after
+// another request recycles the wrapper that stale Close would release the
+// new request's live reader.
+func TestPooledStringsReader_NoReleaseOnEOF(t *testing.T) {
+	r := getPooledStringsReader("hello world")
+	pr := r.(*pooledStringsReader)
+
+	if _, err := io.ReadAll(pr); err != nil {
+		t.Fatalf("ReadAll error: %v", err)
+	}
+	if pr.released {
+		t.Fatal("reader released at EOF: release must happen only in Close")
+	}
+
+	_ = pr.Close()
+	if !pr.released {
+		t.Fatal("Close did not release the reader back to the pool")
+	}
+}
+
+// TestBuild_MultipartCRLFInjectionRejected verifies that control characters
+// in multipart field names, filenames, and per-file Content-Types are
+// rejected at the encoding sink. *FormData is a public struct constructible
+// without going through WithFile's validation, and mime/multipart.Writer
+// writes Content-Disposition values verbatim — CRLF in a token would inject
+// arbitrary MIME headers/parts into the outgoing body.
+func TestBuild_MultipartCRLFInjectionRejected(t *testing.T) {
+	tests := []struct {
+		name    string
+		fields  map[string]string
+		files   map[string]*fileDataHelper
+		wantErr bool
+	}{
+		{
+			name:    "CRLF in field name",
+			fields:  map[string]string{"field\r\nX-Injected: 1": "v"},
+			wantErr: true,
+		},
+		{
+			name:   "CRLF in field value is legal (part body, not a header)",
+			fields: map[string]string{"note": "line1\r\nline2"},
+			files:  map[string]*fileDataHelper{},
+		},
+		{
+			name:    "CRLF in filename",
+			files:   map[string]*fileDataHelper{"f": {Filename: "a\"\r\nX-Injected: 1\r\n.txt", Content: []byte("x")}},
+			wantErr: true,
+		},
+		{
+			name:    "CRLF in file field name",
+			files:   map[string]*fileDataHelper{"f\r\nX-Injected: 1": {Filename: "a.txt", Content: []byte("x")}},
+			wantErr: true,
+		},
+		{
+			name:    "CRLF in file Content-Type",
+			files:   map[string]*fileDataHelper{"f": {Filename: "a.txt", Content: []byte("x"), ContentType: "text/plain\r\nX-Injected: 1"}},
+			wantErr: true,
+		},
+		{
+			name:    "NUL in filename",
+			files:   map[string]*fileDataHelper{"f": {Filename: "a\x00.txt", Content: []byte("x")}},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var fields map[string]string
+			if tt.fields != nil {
+				fields = tt.fields
+			}
+			formData := formDataHelper(fields, tt.files)
+			req := testRequestBuilder().
+				Method("POST").
+				URL("https://api.example.com/upload").
+				Context(context.Background()).
+				Body(formData).
+				Build()
+
+			httpReq, err := newRequestProcessor(&Config{Timeout: 30 * time.Second}).Build(req)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Build() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if err == nil {
+				bodyBytes, readErr := io.ReadAll(httpReq.Body)
+				if readErr != nil {
+					t.Fatalf("read body: %v", readErr)
+				}
+				if strings.Contains(string(bodyBytes), "X-Injected") {
+					t.Fatalf("injection leaked into multipart body:\n%s", bodyBytes)
+				}
+			}
+		})
+	}
+}
+
+// TestRequest_SetHeadersAndQueryParams_Nil pins the nil-input contract of the
+// pooled-map setters: a nil map must clear the field (not allocate a pooled
+// map), and a non-nil map must be COPIED so the caller's map can never leak
+// into a recycled request (pool-poisoning guard).
+func TestRequest_SetHeadersAndQueryParams_Nil(t *testing.T) {
+	t.Run("SetHeaders nil clears", func(t *testing.T) {
+		r := AcquireRequest()
+		defer ReleaseRequest(r)
+		r.SetHeader("X-A", "1")
+		r.SetHeaders(nil)
+		if r.headers != nil {
+			t.Errorf("SetHeaders(nil) should clear headers, got %v", r.headers)
+		}
+	})
+
+	t.Run("SetHeaders copies caller map", func(t *testing.T) {
+		r := AcquireRequest()
+		defer ReleaseRequest(r)
+		src := map[string]string{"X-A": "1"}
+		r.SetHeaders(src)
+		src["X-A"] = "mutated" // caller mutates its map afterwards
+		if got := r.headers["X-A"]; got != "1" {
+			t.Errorf("SetHeaders stored caller map by reference: got %q, want %q", got, "1")
+		}
+	})
+
+	t.Run("SetQueryParams nil clears", func(t *testing.T) {
+		r := AcquireRequest()
+		defer ReleaseRequest(r)
+		r.EnsureQueryParams()["q"] = "1"
+		r.SetQueryParams(nil)
+		if r.queryParams != nil {
+			t.Errorf("SetQueryParams(nil) should clear queryParams, got %v", r.queryParams)
+		}
+	})
+
+	t.Run("SetQueryParams copies caller map", func(t *testing.T) {
+		r := AcquireRequest()
+		defer ReleaseRequest(r)
+		src := map[string]any{"page": 1}
+		r.SetQueryParams(src)
+		src["page"] = 99
+		if got := r.queryParams["page"]; got != 1 {
+			t.Errorf("SetQueryParams stored caller map by reference: got %v, want 1", got)
+		}
+	})
 }

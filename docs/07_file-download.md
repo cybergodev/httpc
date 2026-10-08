@@ -12,7 +12,10 @@ This guide covers all aspects of downloading files using HTTPC, from simple down
 - [Large Files](#large-files)
 - [Authentication](#authentication)
 - [Advanced Options](#advanced-options)
+- [Implementation Notes](#implementation-notes)
 - [Best Practices](#best-practices)
+- [Helper Functions](#helper-functions)
+- [Examples](#examples)
 
 ## Quick Start
 
@@ -314,10 +317,19 @@ The HTTPC download implementation:
 - Supports resume downloads using HTTP Range requests
 - Automatically creates parent directories
 - Includes security checks to prevent path traversal attacks (UNC path blocking, symlink prevention, control character filtering)
+- Writes atomically: a fresh (non-resumed) download streams to a `<path>.httpc-tmp` sibling and is renamed into the final location only after the body completes and any checksum verifies. An interrupted or checksum-failing download never truncates or corrupts the destination file; a leftover `.httpc-tmp` from a crash is overwritten by the next attempt. Resumed downloads append to the destination itself (required by Range semantics) and preserve the partial file on failure for the next resume attempt — including on checksum mismatch, where the file is truncated back to the offset the session started at, so the previously downloaded prefix survives for the next resume
+- Serializes same-path downloads within one process: a second `Download` targeting a path already being downloaded fails fast with `ErrDownloadInProgress` instead of corrupting the first download's writes. The guard is in-process only; coordinating downloads across separate processes is the caller's responsibility
+- Rejects compressed streaming responses: downloads request `Accept-Encoding: identity`, and a non-conforming server that sends `Content-Encoding: gzip` (or any other encoding) anyway causes an error rather than silently writing compressed bytes to disk. If you explicitly want the encoded bytes, set your own `Accept-Encoding` header via `WithHeader` on the download call
+- Enforces `Security.MaxResponseBodySize` (default 10 MB): a download whose response body exceeds the limit fails with a "streamed response body exceeds size limit" error and leaves no file behind — it is never silently truncated. Raise the limit for large files (see below)
 
 ### Memory Considerations
 
 The streaming download implementation is memory-efficient even for large files. For additional control:
+- Raise `Security.MaxResponseBodySize` to cover the largest file you download — the limit guards against unbounded reads, and a download exceeding it fails (it is not truncated):
+  ```go
+  cfg := httpc.DefaultConfig()
+  cfg.Security.MaxResponseBodySize = 1024 * 1024 * 1024 // 1 GB (the validation ceiling)
+  ```
 - Use resume functionality (`ResumeDownload: true`) to handle interrupted downloads
 - Set appropriate timeouts for large files (`httpc.WithTimeout(30*time.Minute)`)
 - Pass a `context.Context` to `Download` for cancellation control
@@ -360,11 +372,18 @@ opts.ResumeDownload = true  // Always enable for large files
 ```go
 result, err := client.Download(context.Background(), url, &httpc.DownloadConfig{FilePath: filePath})
 if err != nil {
-    // Check if it's a partial download
-    if fileInfo, statErr := os.Stat(filePath); statErr == nil {
-        log.Printf("Partial download: %s", httpc.FormatBytes(fileInfo.Size()))
-        log.Printf("Use ResumeDownload to continue")
+    if errors.Is(err, httpc.ErrFileExists) {
+        // filePath already holds a file and neither Overwrite nor
+        // ResumeDownload is set — nothing was written this time
+        log.Printf("File already exists: %s", filePath)
+        return err
     }
+    // A failed fresh download leaves no partial file behind: httpc
+    // removes the file on write/sync/close failure and on checksum
+    // mismatch. To keep partial progress across failures, set
+    // ResumeDownload — a failed resumed attempt then preserves the
+    // bytes already on disk for the next attempt.
+    log.Printf("Download failed: %v", err)
     return err
 }
 ```

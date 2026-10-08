@@ -356,3 +356,98 @@ func BenchmarkNormalizeDomain(b *testing.B) {
 		})
 	}
 }
+
+// TestDomainWhitelist_BoundaryConditions pins matcher edge cases that were
+// previously untested: empty non-nil whitelist, trailing-dot hosts,
+// host:port inputs, and IPv6 literals (which never suffix-match domains).
+func TestDomainWhitelist_BoundaryConditions(t *testing.T) {
+	t.Run("empty non-nil whitelist denies everything", func(t *testing.T) {
+		w := NewDomainWhitelist()
+		if w.IsAllowed("example.com") {
+			t.Error("empty whitelist must not allow any host")
+		}
+	})
+
+	t.Run("trailing dot host matches", func(t *testing.T) {
+		w := NewDomainWhitelist("example.com")
+		if !w.IsAllowed("example.com.") {
+			t.Error("trailing-dot FQDN should match its domain entry")
+		}
+	})
+
+	t.Run("host with port does not match", func(t *testing.T) {
+		w := NewDomainWhitelist("example.com")
+		if w.IsAllowed("example.com:8080") {
+			t.Error("host:port input must not match a bare domain entry")
+		}
+	})
+
+	t.Run("IPv6 literal does not match domain entry", func(t *testing.T) {
+		w := NewDomainWhitelist("example.com")
+		if w.IsAllowed("[::1]") {
+			t.Error("IPv6 literal must not match a domain entry")
+		}
+	})
+}
+
+// TestDomainWhitelist_AddRemoveEdges covers the guard clauses and wildcard
+// arms of Add/Remove: nil receiver, empty/whitespace domain, wildcard
+// deduplication, and wildcard removal.
+func TestDomainWhitelist_AddRemoveEdges(t *testing.T) {
+	t.Run("nil receiver is a no-op", func(t *testing.T) {
+		var w *DomainWhitelist
+		w.Add("example.com")    // must not panic
+		w.Remove("example.com") // must not panic
+	})
+
+	t.Run("empty and whitespace domains are ignored", func(t *testing.T) {
+		w := NewDomainWhitelist()
+		w.Add("")
+		w.Add("   ")
+		exact, _ := w.Domains()
+		if len(exact) != 0 {
+			t.Errorf("empty/whitespace Add stored something: %v", exact)
+		}
+		w.Remove("") // must not panic
+	})
+
+	t.Run("wildcard add is deduplicated", func(t *testing.T) {
+		w := NewDomainWhitelist()
+		w.Add("*.example.com")
+		w.Add("*.example.com") // second add must be a no-op
+		_, wildcards := w.Domains()
+		if len(wildcards) != 1 || wildcards[0] != ".example.com" {
+			t.Errorf("wildcards = %v, want single [.example.com]", wildcards)
+		}
+	})
+
+	t.Run("bare dot wildcard is ignored", func(t *testing.T) {
+		w := NewDomainWhitelist()
+		w.Add("*.") // pattern "." has len 1 → not stored
+		_, wildcards := w.Domains()
+		if len(wildcards) != 0 {
+			t.Errorf("degenerate wildcard stored: %v", wildcards)
+		}
+	})
+
+	t.Run("wildcard remove", func(t *testing.T) {
+		w := NewDomainWhitelist()
+		w.Add("*.example.com")
+		w.Add("*.other.com")
+		w.Remove("*.example.com")
+		_, wildcards := w.Domains()
+		if len(wildcards) != 1 || wildcards[0] != ".other.com" {
+			t.Errorf("wildcards after remove = %v, want [.other.com]", wildcards)
+		}
+	})
+
+	t.Run("exact remove of absent domain is a no-op", func(t *testing.T) {
+		w := NewDomainWhitelist()
+		w.Add("example.com")
+		w.Remove("absent.com")
+		exact, _ := w.Domains()
+		if len(exact) != 1 {
+			t.Errorf("exact = %v, want [example.com]", exact)
+		}
+	})
+}

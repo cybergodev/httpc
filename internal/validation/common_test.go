@@ -7,6 +7,26 @@ import (
 	"testing"
 )
 
+// assertValidationResult is the shared wantErr/errContains runner used by the
+// table tests in this file: on wantErr the error must be non-nil and contain
+// errContains (when set); otherwise the error must be nil.
+func assertValidationResult(t *testing.T, fn string, err error, wantErr bool, errContains string) {
+	t.Helper()
+	if wantErr {
+		if err == nil {
+			t.Errorf("%s() expected error, got nil", fn)
+			return
+		}
+		if errContains != "" && !strings.Contains(err.Error(), errContains) {
+			t.Errorf("%s() error = %v, want to contain %v", fn, err, errContains)
+		}
+		return
+	}
+	if err != nil {
+		t.Errorf("%s() unexpected error = %v", fn, err)
+	}
+}
+
 func TestValidateInputString(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -85,19 +105,7 @@ func TestValidateInputString(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateInputString(tt.input, tt.maxLen, tt.fieldName, tt.additionalFunc)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("validateInputString() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("validateInputString() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("validateInputString() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "validateInputString", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -151,19 +159,7 @@ func TestValidateCredential(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateCredential(tt.cred, tt.maxLen, tt.checkColon, tt.credType)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("ValidateCredential() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("ValidateCredential() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ValidateCredential() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "ValidateCredential", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -203,19 +199,7 @@ func TestValidateToken(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateToken(tt.token)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("ValidateToken() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("ValidateToken() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ValidateToken() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "ValidateToken", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -255,19 +239,7 @@ func TestValidateQueryKey(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateQueryKey(tt.key)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("ValidateQueryKey() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("ValidateQueryKey() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ValidateQueryKey() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "ValidateQueryKey", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -325,19 +297,7 @@ func TestValidateHeaderKeyValue(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateHeaderKeyValue(tt.key, tt.value)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("ValidateHeaderKeyValue() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("ValidateHeaderKeyValue() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ValidateHeaderKeyValue() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "ValidateHeaderKeyValue", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -377,19 +337,7 @@ func TestValidateCookieName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateCookieName(tt.cookieName)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("validateCookieName() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("validateCookieName() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("validateCookieName() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "validateCookieName", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -419,19 +367,7 @@ func TestValidateCookieValue(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := validateCookieValue(tt.cookieValue)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("validateCookieValue() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("validateCookieValue() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("validateCookieValue() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "validateCookieValue", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -506,19 +442,7 @@ func TestValidateCookie(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateCookie(tt.cookie)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("ValidateCookie() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("ValidateCookie() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ValidateCookie() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "ValidateCookie", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -573,19 +497,7 @@ func TestValidateFieldName(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateFieldName(tt.fieldName, tt.fieldType)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("ValidateFieldName() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("ValidateFieldName() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ValidateFieldName() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "ValidateFieldName", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -614,19 +526,7 @@ func TestValidateHeaderKeyValue_EdgeCases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := ValidateHeaderKeyValue(tt.key, tt.value)
-			if tt.wantErr {
-				if err == nil {
-					t.Errorf("ValidateHeaderKeyValue() expected error, got nil")
-					return
-				}
-				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
-					t.Errorf("ValidateHeaderKeyValue() error = %v, want to contain %v", err, tt.errContains)
-				}
-			} else {
-				if err != nil {
-					t.Errorf("ValidateHeaderKeyValue() unexpected error = %v", err)
-				}
-			}
+			assertValidationResult(t, "ValidateHeaderKeyValue", err, tt.wantErr, tt.errContains)
 		})
 	}
 }
@@ -790,3 +690,45 @@ func TestValidateCookie_ControlCharsInPath(t *testing.T) {
 
 // TestValidateHeaderKeyValue_PseudoHeader is retired: the ":path" and ":method"
 // pseudo-header cases are already rows in TestValidateHeaderKeyValue_EdgeCases.
+
+// TestValidateMultipartToken covers the multipart Content-Disposition token
+// policy: control characters (the quoted-string breakout vector) and length
+// are rejected, while characters that cannot escape a quoted-string — but are
+// rejected by the stricter ValidateFieldName — remain legal.
+func TestValidateMultipartToken(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		what        string
+		wantErr     bool
+		errContains string
+	}{
+		{"plain filename", "report.pdf", "filename", false, ""},
+		{"empty string is legal", "", "filename", false, ""},
+		// Legal here but rejected by ValidateFieldName: the encoder
+		// backslash-escapes and quotes the value, so these cannot inject.
+		{"slash allowed", "sub/dir/file.txt", "filename", false, ""},
+		{"ampersand allowed", "a&b", "field name", false, ""},
+		{"quote allowed (escaped by encoder)", "he said \"hi\"", "filename", false, ""},
+		{"non-ASCII allowed", "résumé.pdf", "filename", false, ""},
+		// Breakout vectors: CR/LF inject MIME headers; other controls corrupt
+		// the part stream.
+		{"CR rejected", "file\rname", "filename", true, "control characters"},
+		{"LF rejected", "file\nname", "filename", true, "control characters"},
+		{"CRLF rejected", "file\r\nname", "filename", true, "control characters"},
+		{"NUL rejected", "file\x00name", "filename", true, "control characters"},
+		{"DEL 0x7F rejected", "file\x7fname", "filename", true, "control characters"},
+		{"first control byte 0x01", "file\x01name", "filename", true, "control characters"},
+		{"last control byte 0x1F", "file\x1fname", "filename", true, "control characters"},
+		{"space 0x20 is legal", "my file.txt", "filename", false, ""},
+		{"exact max length", strings.Repeat("a", MaxFilenameLen), "filename", false, ""},
+		{"one over max length", strings.Repeat("a", MaxFilenameLen+1), "filename", true, "too long"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateMultipartToken(tt.input, tt.what)
+			assertValidationResult(t, "ValidateMultipartToken", err, tt.wantErr, tt.errContains)
+		})
+	}
+}

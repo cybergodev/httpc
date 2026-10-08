@@ -3,6 +3,7 @@ package validation
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -84,6 +85,13 @@ func TestIsPrivateOrReservedIP(t *testing.T) {
 		{"NAT64 mapped metadata", "64:ff9b::a9fe:a9fe", true},
 		{"NAT64 mapped private", "64:ff9b::a00:1", true},
 		{"NAT64 mapped public", "64:ff9b::808:808", false},
+
+		// Remaining SSRF bypass literals (formerly TestSSRFBypassPrevention,
+		// retired as a strict subset of this table)
+		{"IPv4-mapped loopback variant", "::ffff:127.0.0.2", true},
+		{"IPv4-mapped unspecified", "::ffff:0.0.0.0", true},
+		{"IPv4-mapped public Cloudflare", "::ffff:1.1.1.1", false},
+		{"IPv6 unique local max", "fdff:ffff:ffff:ffff::1", true},
 	}
 
 	for _, tt := range tests {
@@ -166,40 +174,48 @@ func TestIsLocalhost(t *testing.T) {
 	}
 }
 
-func TestSSRFBypassPrevention(t *testing.T) {
-	// This test specifically validates SSRF bypass prevention techniques
+// TestSSRFBypassPrevention is retired: every row was a strict subset of
+// TestIsPrivateOrReservedIP (same function, same equivalence classes); the
+// rows not already present there were folded into its table.
+
+// TestCanonicalProxyAddr verifies the host:port canonicalization against
+// net/http's dial-time address, including default-port application, explicit
+// empty port ("http://proxy:"), and the nil short-circuit.
+func TestCanonicalProxyAddr(t *testing.T) {
 	tests := []struct {
 		name    string
-		ip      string
-		blocked bool
+		rawURL  string
+		want    string
+		wantNil bool
 	}{
-		// Common SSRF bypass attempts
-		{"IPv4-mapped IPv6 localhost", "::ffff:127.0.0.1", true},
-		{"IPv4-mapped IPv6 private", "::ffff:10.0.0.1", true},
-		{"IPv4-mapped IPv6 loopback variant", "::ffff:127.0.0.2", true},
-		{"IPv4-mapped IPv6 0.0.0.0", "::ffff:0.0.0.0", true},
-		{"IPv4-mapped IPv6 169.254", "::ffff:169.254.1.1", true},
-
-		// IPv6 local ranges
-		{"IPv6 link-local fe80", "fe80::1", true},
-		{"IPv6 unique local fc00", "fc00::1", true},
-		{"IPv6 unique local fd00", "fdff:ffff:ffff:ffff::1", true},
-
-		// Should NOT be blocked
-		{"IPv4-mapped public", "::ffff:1.1.1.1", false},
-		{"IPv6 public", "2606:4700:4700::1111", false},
+		{"nil URL", "", "", true},
+		{"http with explicit port", "http://proxy:8080", "proxy:8080", false},
+		{"http default port applied", "http://proxy", "proxy:80", false},
+		{"https default port applied", "https://proxy", "proxy:443", false},
+		{"socks5 default port applied", "socks5://proxy", "proxy:1080", false},
+		{"socks5h default port applied", "socks5h://proxy", "proxy:1080", false},
+		// url.Port() returns "" for a present-but-empty port, so the scheme
+		// default must still apply (mirrors net/http canonicalAddr).
+		{"http empty port gets default", "http://proxy:", "proxy:80", false},
+		{"unknown scheme no default", "gopher://proxy", "proxy:", false},
+		{"ipv6 literal with port", "http://[::1]:3128", "[::1]:3128", false},
+		{"ipv6 literal default port", "http://[::1]", "[::1]:80", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ip := net.ParseIP(tt.ip)
-			if ip == nil {
-				t.Fatalf("Failed to parse IP: %s", tt.ip)
+			var u *url.URL
+			if !tt.wantNil {
+				parsed, err := url.Parse(tt.rawURL)
+				if err != nil {
+					t.Fatalf("url.Parse(%q) error: %v", tt.rawURL, err)
+				}
+				u = parsed
 			}
 
-			blocked := isPrivateOrReservedIP(ip)
-			if blocked != tt.blocked {
-				t.Errorf("SSRF bypass check for %s: blocked=%v, want=%v", tt.ip, blocked, tt.blocked)
+			got := CanonicalProxyAddr(u)
+			if got != tt.want {
+				t.Errorf("CanonicalProxyAddr(%q) = %q, want %q", tt.rawURL, got, tt.want)
 			}
 		})
 	}
@@ -308,18 +324,28 @@ func TestValidateSSRFHost(t *testing.T) {
 		name       string
 		host       string
 		exemptNets []string
-		resolveDNS bool
 		wantErr    bool
 		errContain string
 	}{
-		{"localhost blocked", "localhost", nil, false, true, "localhost"},
-		{"localhost with port blocked", "localhost:8080", nil, false, true, "localhost"},
-		{"127.0.0.1 blocked", "127.0.0.1", nil, false, true, "localhost"},
-		{"private IP blocked", "192.168.1.1", nil, false, true, "private/reserved"},
-		{"public IP allowed", "8.8.8.8", nil, false, false, ""},
-		{"public IP with port allowed", "8.8.8.8:443", nil, false, false, ""},
-		{"exempt private IP allowed", "10.0.0.1", []string{"10.0.0.0/8"}, false, false, ""},
-		{"non-exempt private IP blocked", "192.168.1.1", []string{"10.0.0.0/8"}, false, true, "private/reserved"},
+		{"localhost blocked", "localhost", nil, true, "localhost"},
+		{"localhost with port blocked", "localhost:8080", nil, true, "localhost"},
+		{"127.0.0.1 blocked", "127.0.0.1", nil, true, "localhost"},
+		{"private IP blocked", "192.168.1.1", nil, true, "private/reserved"},
+		{"public IP allowed", "8.8.8.8", nil, false, ""},
+		{"public IP with port allowed", "8.8.8.8:443", nil, false, ""},
+		{"exempt private IP allowed", "10.0.0.1", []string{"10.0.0.0/8"}, false, ""},
+		{"non-exempt private IP blocked", "192.168.1.1", []string{"10.0.0.0/8"}, true, "private/reserved"},
+		{"normal hostname allowed", "api.example.com", nil, false, ""},
+		// Short-form inet_aton literals must be blocked: proxied requests
+		// resolve the host remotely where libc resolvers still accept them.
+		{"short-form two-part IP blocked", "10.1", nil, true, "legacy"},
+		{"short-form three-part IP blocked", "192.168.1", nil, true, "legacy"},
+		{"out-of-range octet blocked", "1.2.3.256", nil, true, "legacy"},
+		{"short-form with port blocked", "10.1:8080", nil, true, "legacy"},
+		// Trailing-dot FQDN spellings must not bypass hostname checks.
+		{"trailing-dot localhost blocked", "localhost.", nil, true, "localhost"},
+		{"trailing-dot loopback blocked", "127.0.0.1.", nil, true, "localhost"},
+		{"trailing-dot private IP blocked", "10.0.0.1.", nil, true, "private/reserved"},
 	}
 
 	for _, tt := range tests {
@@ -332,7 +358,7 @@ func TestValidateSSRFHost(t *testing.T) {
 					t.Fatalf("parseExemptCIDRs error: %v", err)
 				}
 			}
-			err := ValidateSSRFHost(tt.host, nets, tt.resolveDNS)
+			err := ValidateSSRFHost(tt.host, nets)
 			if tt.wantErr && err == nil {
 				t.Errorf("ValidateSSRFHost(%q) expected error, got nil", tt.host)
 			}
@@ -555,26 +581,17 @@ func TestValidateProxyURL(t *testing.T) {
 func TestValidateSSRFHost_BoundaryConditions(t *testing.T) {
 	t.Parallel()
 	t.Run("host with port", func(t *testing.T) {
-		err := ValidateSSRFHost("example.com:8080", nil, false)
+		err := ValidateSSRFHost("example.com:8080", nil)
 		if err != nil {
 			t.Errorf("public host with port should pass: %v", err)
 		}
 	})
 	t.Run("domain without DNS resolution", func(t *testing.T) {
-		err := ValidateSSRFHost("example.com", nil, false)
+		// ValidateSSRFHost no longer resolves DNS: hostname strings pass the
+		// pre-check, and the dialer validates the resolved IPs.
+		err := ValidateSSRFHost("example.com", nil)
 		if err != nil {
-			t.Errorf("domain with resolveDNS=false should pass: %v", err)
-		}
-	})
-	t.Run("DNS resolution failure", func(t *testing.T) {
-		// Use a domain under .test (RFC 2606 reserved) with random suffix
-		// to avoid DNS cache/proxy interference
-		err := ValidateSSRFHost("nonexistent-dns-test-xyz123.test", nil, true)
-		if err == nil {
-			t.Skip("DNS resolved unexpectedly; skipping DNS failure test")
-		}
-		if !strings.Contains(err.Error(), "DNS") {
-			t.Errorf("error should mention DNS, got: %v", err)
+			t.Errorf("domain should pass pre-check without DNS resolution: %v", err)
 		}
 	})
 }
@@ -625,7 +642,7 @@ func TestValidateSSRFHost_IPv6WithPort(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateSSRFHost(tt.host, nil, false)
+			err := ValidateSSRFHost(tt.host, nil)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ValidateSSRFHost(%q) err = %v, wantErr %v", tt.host, err, tt.wantErr)
 			}
@@ -653,6 +670,13 @@ func TestLooksLikeLegacyIPLiteral(t *testing.T) {
 		// Octal via leading-zero octets
 		{"octal localhost", "0177.0.0.1", true},
 		{"octal leading octet", "010.0.0.1", true},
+		// Short-form inet_aton literals ("a.b" → a.b.0.1... family) and
+		// out-of-range octets: the final label is all digits.
+		{"short-form two parts", "10.1", true},
+		{"short-form three parts", "192.168.1", true},
+		{"short-form public", "1.2", true},
+		{"out-of-range octet", "1.2.3.256", true},
+		{"hex last octet", "192.168.0x1", true},
 
 		// --- Not legacy literals ---
 		{"empty string", "", false},
@@ -661,6 +685,8 @@ func TestLooksLikeLegacyIPLiteral(t *testing.T) {
 		{"max dotted decimal", "255.255.255.255", false},
 		{"hostname", "example.com", false},
 		{"single zero octet is not octal", "0.0.0.0", false},
+		{"hostname with digits in label", "x123.example.com", false},
+		{"trailing dot hostname", "example.com.", false},
 	}
 
 	for _, tt := range tests {

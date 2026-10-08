@@ -12,6 +12,20 @@ import (
 // It maintains cookies and headers across requests and provides convenient methods
 // for making HTTP requests relative to a base URL.
 //
+// When a method receives an absolute URL pointing at a host other than the
+// base host, session headers and cookies are neither sent nor captured, so
+// base-domain credentials cannot leak to third-party origins.
+//
+// NOTE — request options run TWICE. Every request executes in two passes: a
+// capture pass that observes the request to update the session (cookies set
+// via WithCookies, headers via WithHeaderMap), followed by the real pass.
+// Per-request options are therefore invoked twice, with panics contained and
+// side-effecting callbacks disabled in the capture pass — but an option that
+// mutates shared state (counters, nonces, a *FormData reused across calls)
+// still fires twice or races. Keep per-request options pure; register shared
+// state on the session instead. *FormData in particular must not be shared
+// across concurrent requests (see WithFile).
+//
 // For better flexibility, use the DomainClienter interface instead of the concrete type:
 //
 //	var dc httpc.DomainClienter
@@ -60,12 +74,9 @@ func NewDomain(baseURL string, cfg Config) (DomainClienter, error) {
 		return nil, fmt.Errorf("base URL must include scheme and host")
 	}
 
-	if err := ValidateConfig(&cfg); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
-	}
-	cfg = copyConfig(cfg)
-	if err := cfg.parseSSRFExemptCIDRs(); err != nil {
-		return nil, fmt.Errorf("invalid configuration: %w", err)
+	cfg, err = validatedCopy(cfg)
+	if err != nil {
+		return nil, err
 	}
 	cfg.Connection.EnableCookies = true
 	client, err := newFromConfig(cfg)
@@ -160,18 +171,42 @@ func (dc *DomainClient) Request(ctx context.Context, method, path string, option
 		return nil, err
 	}
 
-	allOptions := dc.prepareSessionOptions(options)
+	// Session state (Authorization headers, cookies) is scoped to the base
+	// host. When an absolute-URL path targets a different origin, neither send
+	// that state nor capture cookies from the response — otherwise a single
+	// absolute-URL request would leak credentials cross-origin.
+	sessionScoped := dc.targetsBaseHost(fullURL)
+	var allOptions []RequestOption
+	if sessionScoped {
+		allOptions = dc.prepareSessionOptions(options)
+	} else {
+		allOptions = options
+	}
 
 	result, err := dc.client.Request(ctx, method, fullURL, allOptions...)
 	if err != nil {
 		return nil, err
 	}
 
-	if result != nil {
+	if result != nil && sessionScoped {
 		dc.UpdateFromResult(result)
 	}
 
 	return result, nil
+}
+
+// targetsBaseHost reports whether the fully built URL points at the client's
+// base origin (host:port, case-insensitive). Session headers are
+// origin-scoped, so a different port on the same hostname must not receive
+// them either. Unparseable URLs are treated as base-origin: buildURL already
+// validated them, so this only guards against regressions without withholding
+// session state on false alarms.
+func (dc *DomainClient) targetsBaseHost(fullURL string) bool {
+	u, err := url.Parse(fullURL)
+	if err != nil || u.Host == "" {
+		return true
+	}
+	return strings.EqualFold(u.Host, dc.parsedURL.Host)
 }
 
 // Download downloads a file from the specified path to cfg.FilePath.
@@ -183,25 +218,11 @@ func (dc *DomainClient) Request(ctx context.Context, method, path string, option
 // Use DefaultDownloadConfig() as the starting point, then set FilePath and any
 // of ProgressCallback / Overwrite / ResumeDownload / Checksum as needed.
 func (dc *DomainClient) Download(ctx context.Context, path string, cfg *DownloadConfig, options ...RequestOption) (*DownloadResult, error) {
-	if cfg == nil {
-		return nil, fmt.Errorf("download config cannot be nil")
-	}
-	return dc.downloadWithContext(ctx, path,
-		func(ctx context.Context, url string, opts *DownloadConfig, additional ...RequestOption) (*DownloadResult, error) {
-			return dc.client.Download(ctx, url, opts, additional...)
-		},
-		cfg, options,
-	)
-}
-
-// downloadFunc is the signature for delegating a download to the underlying client.
-type downloadFunc func(ctx context.Context, url string, opts *DownloadConfig, options ...RequestOption) (*DownloadResult, error)
-
-// downloadWithContext is the shared implementation for DomainClient download methods.
-// It handles initialization checks, URL building, session option merging, and cookie capture.
-func (dc *DomainClient) downloadWithContext(ctx context.Context, path string, doDownload downloadFunc, downloadOpts *DownloadConfig, options []RequestOption) (*DownloadResult, error) {
 	if err := dc.checkInit(); err != nil {
 		return nil, err
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("download config cannot be nil")
 	}
 
 	fullURL, err := dc.buildURL(path)
@@ -209,14 +230,24 @@ func (dc *DomainClient) downloadWithContext(ctx context.Context, path string, do
 		return nil, err
 	}
 
-	allOptions := dc.prepareSessionOptions(options)
+	// Same cross-origin gate as Request: session headers and cookie capture
+	// apply only when the download targets the base origin.
+	sessionScoped := dc.targetsBaseHost(fullURL)
+	var allOptions []RequestOption
+	if sessionScoped {
+		allOptions = dc.prepareSessionOptions(options)
+	} else {
+		allOptions = options
+	}
 
-	result, err := doDownload(ctx, fullURL, downloadOpts, allOptions...)
+	result, err := dc.client.Download(ctx, fullURL, cfg, allOptions...)
 	if err != nil {
 		return nil, err
 	}
 
-	dc.captureDownloadCookies(result)
+	if sessionScoped {
+		dc.captureDownloadCookies(result)
+	}
 	return result, nil
 }
 
@@ -255,13 +286,22 @@ func (dc *DomainClient) checkInit() error {
 	return nil
 }
 
+// hasHTTPSchemePrefix reports whether s begins with an "http://" or "https://"
+// scheme, ASCII case-insensitively. url.Parse lowercases schemes, so an
+// uppercase "HTTP://host" is still an absolute URL — but the previous
+// case-sensitive prefix check missed it and joined it onto the base path.
+func hasHTTPSchemePrefix(s string) bool {
+	return (len(s) >= 7 && strings.EqualFold(s[:7], "http://")) ||
+		(len(s) >= 8 && strings.EqualFold(s[:8], "https://"))
+}
+
 func (dc *DomainClient) buildURL(pathStr string) (string, error) {
 	if pathStr == "" {
 		return dc.baseURL, nil
 	}
 
 	// Check if pathStr is already a full URL
-	if strings.HasPrefix(pathStr, "http://") || strings.HasPrefix(pathStr, "https://") {
+	if hasHTTPSchemePrefix(pathStr) {
 		parsedURL, err := url.Parse(pathStr)
 		if err == nil && parsedURL.Scheme != "" && parsedURL.Host != "" {
 			return pathStr, nil

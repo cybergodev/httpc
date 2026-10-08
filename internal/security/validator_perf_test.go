@@ -5,7 +5,7 @@ import (
 )
 
 func BenchmarkValidateURL_Valid(b *testing.B) {
-	v := NewValidator()
+	v := newValidator()
 	url := "https://api.example.com/v1/users?page=1&limit=10"
 
 	b.ReportAllocs()
@@ -17,7 +17,7 @@ func BenchmarkValidateURL_Valid(b *testing.B) {
 }
 
 func BenchmarkValidateURL_Invalid(b *testing.B) {
-	v := NewValidator()
+	v := newValidator()
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -29,7 +29,7 @@ func BenchmarkValidateURL_Invalid(b *testing.B) {
 }
 
 func BenchmarkValidateRequest_Minimal(b *testing.B) {
-	v := NewValidator()
+	v := newValidator()
 	req := &Request{
 		Method: "GET",
 		URL:    "https://api.example.com/v1/users",
@@ -44,7 +44,7 @@ func BenchmarkValidateRequest_Minimal(b *testing.B) {
 }
 
 func BenchmarkValidateRequest_WithHeaders(b *testing.B) {
-	v := NewValidator()
+	v := newValidator()
 	req := &Request{
 		Method: "POST",
 		URL:    "https://api.example.com/v1/users",

@@ -87,12 +87,19 @@ func isSameSiteNone(sameSite http.SameSite) bool {
 // ValidateCookieSecurity validates a cookie against the security configuration.
 // Returns an error if the cookie does not meet the security requirements.
 // This is the standard validation for general use.
+//
+// SECURITY: a nil config is a caller error, not "no requirements" — a
+// security gate must not silently pass open. Callers that want optional
+// enforcement nil-check the config themselves before calling (as every
+// in-repo caller does: SessionManager.validateCookieSecurity,
+// httpc.WithSecureCookie). The zero-value CookieSecurityConfig (non-nil, all
+// flags false) is the legitimate "no requirements" policy.
 func ValidateCookieSecurity(cookie *http.Cookie, config *CookieSecurityConfig) error {
 	if cookie == nil {
 		return fmt.Errorf("cookie is nil")
 	}
 	if config == nil {
-		return nil // No security requirements
+		return fmt.Errorf("cookie security config is nil (pass a zero-value config for no requirements)")
 	}
 
 	var errors []string
@@ -109,12 +116,13 @@ func ValidateCookieSecurity(cookie *http.Cookie, config *CookieSecurityConfig) e
 
 	// Check SameSite requirement
 	if config.RequireSameSite != "" {
-		if err := validateSameSite(cookie, config.RequireSameSite, config.AllowSameSiteNone); err != nil {
+		if err := validateSameSite(cookie, config.RequireSameSite); err != nil {
 			errors = append(errors, err.Error())
 		}
 	}
 
-	// Check if SameSite=None is allowed
+	// Check if SameSite=None is allowed (single source of truth: also covers
+	// the RequireSameSite path above without duplicating the message)
 	if !config.AllowSameSiteNone && isSameSiteNone(cookie.SameSite) {
 		errors = append(errors, "SameSite=None is not allowed")
 	}
@@ -132,7 +140,9 @@ func ValidateCookieSecurity(cookie *http.Cookie, config *CookieSecurityConfig) e
 }
 
 // validateSameSite checks if the cookie's SameSite attribute matches the required value.
-func validateSameSite(cookie *http.Cookie, required string, allowNone bool) error {
+// The SameSite=None-allowed policy is enforced by the caller (ValidateCookieSecurity),
+// which is the single source of truth for that message.
+func validateSameSite(cookie *http.Cookie, required string) error {
 	cookieSameSite := sameSiteToString(cookie.SameSite)
 
 	// Handle empty/unknown SameSite
@@ -142,11 +152,6 @@ func validateSameSite(cookie *http.Cookie, required string, allowNone bool) erro
 			return nil // Default is acceptable for Lax requirement
 		}
 		return fmt.Errorf("missing SameSite attribute (required: %s)", required)
-	}
-
-	// Check if SameSite=None is allowed
-	if isSameSiteNone(cookie.SameSite) && !allowNone {
-		return fmt.Errorf("SameSite=None is not allowed")
 	}
 
 	// Validate match using zero-allocation case-insensitive comparison

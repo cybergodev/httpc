@@ -22,10 +22,83 @@ import (
 // DOWNLOAD TESTS - File downloads, resume, progress tracking
 // ============================================================================
 
-func TestDownload_Basic(t *testing.T) {
-	content := []byte("test file content")
+// TestDownload_HappyPath consolidates the former Basic / EmptyFile /
+// LargeFile / CreateDirectories tests (identical scaffold; only content size
+// and path nesting varied).
+func TestDownload_HappyPath(t *testing.T) {
+	tests := []struct {
+		name        string
+		contentSize int
+		nestedDirs  int // directory levels below the temp dir
+		wantSpeed   bool
+	}{
+		{"basic file", 15, 0, false},
+		{"empty file", 0, 0, false},
+		{"1MB file", 1024 * 1024, 0, true},
+		{"nested directories created", 12, 2, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := []byte(strings.Repeat("x", tt.contentSize))
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(content)
+			}))
+			defer server.Close()
+
+			config := DefaultConfig()
+			config.Security.AllowPrivateIPs = true
+			client, err := New(config)
+			if err != nil {
+				t.Fatalf("New() failed: %v", err)
+			}
+			defer func() { _ = client.Close() }()
+
+			filePath := filepath.Join(t.TempDir(), "file.bin")
+			for range tt.nestedDirs {
+				filePath = filepath.Join(filepath.Dir(filePath), "sub", filepath.Base(filePath))
+			}
+
+			result, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
+			if err != nil {
+				t.Fatalf("Download failed: %v", err)
+			}
+			if result.FilePath != filePath {
+				t.Errorf("file path = %s, want %s", result.FilePath, filePath)
+			}
+			if result.BytesWritten != int64(tt.contentSize) {
+				t.Errorf("bytes written = %d, want %d", result.BytesWritten, tt.contentSize)
+			}
+			if result.StatusCode != 200 {
+				t.Errorf("status = %d, want 200", result.StatusCode)
+			}
+			if tt.wantSpeed && result.AverageSpeed <= 0 {
+				t.Error("AverageSpeed should be positive for a non-empty download")
+			}
+
+			fileInfo, err := os.Stat(filePath)
+			if err != nil {
+				t.Fatalf("File not created: %v", err)
+			}
+			if fileInfo.Size() != int64(tt.contentSize) {
+				t.Errorf("file size = %d, want %d", fileInfo.Size(), tt.contentSize)
+			}
+		})
+	}
+}
+
+// TestDownload_BodyExceedsLimit verifies that a download larger than
+// Security.MaxResponseBodySize fails loudly instead of silently truncating
+// the file at the limit. The streaming path used to hit the limit reader's
+// synthetic EOF and report success, writing a corrupted (truncated) file.
+func TestDownload_BodyExceedsLimit(t *testing.T) {
+	content := []byte(strings.Repeat("x", 2000)) // server serves 2000 bytes
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(content)))
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(content)
@@ -34,99 +107,42 @@ func TestDownload_Basic(t *testing.T) {
 
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
-	client, _ := New(config)
-	defer client.Close()
+	config.Security.MaxResponseBodySize = 1000
+	client, err := New(config)
+	if err != nil {
+		t.Fatalf("New failed: %v", err)
+	}
+	defer func() { _ = client.Close() }()
 
 	tempDir := t.TempDir()
-	filePath := filepath.Join(tempDir, "test.txt")
 
-	result, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
-	if err != nil {
-		t.Fatalf("Download failed: %v", err)
-	}
-
-	if result.FilePath != filePath {
-		t.Errorf("Expected file path %s, got %s", filePath, result.FilePath)
-	}
-	if result.BytesWritten != int64(len(content)) {
-		t.Errorf("Expected %d bytes, got %d", len(content), result.BytesWritten)
-	}
-	if result.StatusCode != 200 {
-		t.Errorf("Expected status 200, got %d", result.StatusCode)
-	}
-
-	// Verify file exists
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		t.Fatalf("File not created: %v", err)
-	}
-	if fileInfo.Size() != result.BytesWritten {
-		t.Errorf("File size mismatch: expected %d, got %d", result.BytesWritten, fileInfo.Size())
-	}
-}
-
-func TestDownload_EmptyFile(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.Header().Set("Content-Length", "0")
+	// Body exactly at the limit: must succeed (limit is inclusive).
+	exactPath := filepath.Join(tempDir, "exact.bin")
+	exactServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1000")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(content[:1000])
 	}))
-	defer server.Close()
-
-	config := DefaultConfig()
-	config.Security.AllowPrivateIPs = true
-	client, _ := New(config)
-	defer client.Close()
-
-	tempDir := t.TempDir()
-	filePath := filepath.Join(tempDir, "empty.txt")
-
-	result, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
+	defer exactServer.Close()
+	result, err := client.Download(context.Background(), exactServer.URL, &DownloadConfig{FilePath: exactPath})
 	if err != nil {
-		t.Fatalf("Download of empty file failed: %v", err)
+		t.Fatalf("Download at exact limit should succeed, got: %v", err)
 	}
-	if result.BytesWritten != 0 {
-		t.Errorf("Expected 0 bytes, got %d", result.BytesWritten)
-	}
-
-	fileInfo, err := os.Stat(filePath)
-	if err != nil {
-		t.Fatalf("File not created: %v", err)
-	}
-	if fileInfo.Size() != 0 {
-		t.Errorf("File should be empty, got %d bytes", fileInfo.Size())
-	}
-}
-
-func TestDownload_LargeFile(t *testing.T) {
-	largeContent := []byte(strings.Repeat("x", 1024*1024)) // 1MB
-
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/octet-stream")
-		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(largeContent)))
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(largeContent)
-	}))
-	defer server.Close()
-
-	config := DefaultConfig()
-	config.Security.AllowPrivateIPs = true
-	client, _ := New(config)
-	defer client.Close()
-
-	tempDir := t.TempDir()
-	filePath := filepath.Join(tempDir, "large-file.bin")
-
-	result, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
-	if err != nil {
-		t.Fatalf("Large file download failed: %v", err)
+	if result.BytesWritten != 1000 {
+		t.Errorf("Exact-limit download: expected 1000 bytes, got %d", result.BytesWritten)
 	}
 
-	if result.BytesWritten != int64(len(largeContent)) {
-		t.Errorf("Expected %d bytes, got %d", len(largeContent), result.BytesWritten)
+	// Body over the limit: must fail and leave no file behind.
+	overPath := filepath.Join(tempDir, "over.bin")
+	result, err = client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: overPath})
+	if err == nil {
+		t.Fatalf("Download over limit should fail, got success with %d bytes", result.BytesWritten)
 	}
-	if result.AverageSpeed <= 0 {
-		t.Error("Average speed should be positive")
+	if !strings.Contains(err.Error(), "exceeds size limit") {
+		t.Errorf("Expected size-limit error, got: %v", err)
+	}
+	if _, statErr := os.Stat(overPath); statErr == nil {
+		t.Error("Truncated download file should have been removed on failure")
 	}
 }
 
@@ -143,7 +159,7 @@ func TestDownload_WithProgress(t *testing.T) {
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "progress-test.bin")
@@ -184,7 +200,7 @@ func TestDownload_WithTimeout(t *testing.T) {
 	config.Security.AllowPrivateIPs = true
 	config.Timeouts.Request = 100 * time.Millisecond
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "timeout-test.txt")
@@ -208,7 +224,7 @@ func TestDownload_ResumeNotSupported(t *testing.T) {
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "resume-test.txt")
@@ -255,7 +271,7 @@ func TestDownload_PartialContent(t *testing.T) {
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "partial-test.txt")
@@ -288,7 +304,7 @@ func TestDownload_InvalidPath(t *testing.T) {
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Invalid path with directory traversal attempt
 	_, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: "../../../etc/passwd"})
@@ -308,7 +324,7 @@ func TestDownload_FileAlreadyExists(t *testing.T) {
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "existing.txt")
@@ -347,7 +363,7 @@ func TestDownload_HTTPError(t *testing.T) {
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	tempDir := t.TempDir()
 	filePath := filepath.Join(tempDir, "error-test.txt")
@@ -358,36 +374,8 @@ func TestDownload_HTTPError(t *testing.T) {
 	}
 }
 
-func TestDownload_CreateDirectories(t *testing.T) {
-	content := []byte("test content")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(content)
-	}))
-	defer server.Close()
-
-	config := DefaultConfig()
-	config.Security.AllowPrivateIPs = true
-	client, _ := New(config)
-	defer client.Close()
-
-	tempDir := t.TempDir()
-	filePath := filepath.Join(tempDir, "subdir1", "subdir2", "file.txt")
-
-	result, err := client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
-	if err != nil {
-		t.Fatalf("Download failed: %v", err)
-	}
-
-	if result.BytesWritten != int64(len(content)) {
-		t.Errorf("Expected %d bytes, got %d", len(content), result.BytesWritten)
-	}
-
-	// Verify directories were created
-	if _, err := os.Stat(filepath.Dir(filePath)); os.IsNotExist(err) {
-		t.Error("Directories were not created")
-	}
-}
+// TestDownload_CreateDirectories was folded into TestDownload_HappyPath
+// ("nested directories created" row).
 
 func TestResult_SaveToFile(t *testing.T) {
 	content := []byte("response content")
@@ -400,7 +388,7 @@ func TestResult_SaveToFile(t *testing.T) {
 	config := DefaultConfig()
 	config.Security.AllowPrivateIPs = true
 	client, _ := New(config)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Get(server.URL)
 	if err != nil {
@@ -441,7 +429,7 @@ func TestDownload_PackageLevel(t *testing.T) {
 		config := TestingConfig()
 		client, _ := New(config)
 		_ = SetDefaultClient(client)
-		defer CloseDefaultClient()
+		defer func() { _ = CloseDefaultClient() }() // best-effort cleanup
 
 		tempDir := t.TempDir()
 		filePath := filepath.Join(tempDir, "pkg-level-test.txt")
@@ -453,6 +441,15 @@ func TestDownload_PackageLevel(t *testing.T) {
 
 		if result.BytesWritten != int64(len(content)) {
 			t.Errorf("Expected %d bytes, got %d", len(content), result.BytesWritten)
+		}
+
+		// BytesWritten reports success; verify the file itself holds the content.
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			t.Fatalf("ReadFile failed: %v", err)
+		}
+		if string(data) != string(content) {
+			t.Errorf("file content mismatch: got %q, want %q", data, content)
 		}
 	})
 
@@ -468,7 +465,7 @@ func TestDownload_PackageLevel(t *testing.T) {
 		config := TestingConfig()
 		client, _ := New(config)
 		_ = SetDefaultClient(client)
-		defer CloseDefaultClient()
+		defer func() { _ = CloseDefaultClient() }() // best-effort cleanup
 
 		tempDir := t.TempDir()
 		filePath := filepath.Join(tempDir, "opts-test.txt")
@@ -504,7 +501,7 @@ func TestDownload_EdgeCases(t *testing.T) {
 		config := DefaultConfig()
 		config.Security.AllowPrivateIPs = true
 		client, _ := New(config)
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Download(context.Background(), "http://example.com/file.txt", &DownloadConfig{FilePath: ""})
 		if err == nil {
@@ -516,7 +513,7 @@ func TestDownload_EdgeCases(t *testing.T) {
 		config := DefaultConfig()
 		config.Security.AllowPrivateIPs = true
 		client, _ := New(config)
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Download(context.Background(), "http://example.com/file.txt", nil)
 		if err == nil {
@@ -524,13 +521,28 @@ func TestDownload_EdgeCases(t *testing.T) {
 		}
 	})
 
-	t.Run("DefaultDownloadConfig", func(t *testing.T) {
-		filePath := "/tmp/test.txt"
-		opts := DefaultDownloadConfig()
-		opts.FilePath = filePath
+	t.Run("InvalidURL", func(t *testing.T) {
+		config := DefaultConfig()
+		config.Security.AllowPrivateIPs = true
+		client, _ := New(config)
+		defer func() { _ = client.Close() }()
 
-		if opts.FilePath != filePath {
-			t.Errorf("Expected FilePath=%s, got %s", filePath, opts.FilePath)
+		for _, u := range []string{"://invalid", "not a url", ""} {
+			_, err := client.Download(context.Background(), u, &DownloadConfig{FilePath: filepath.Join(t.TempDir(), "out.bin")})
+			if err == nil {
+				t.Errorf("Expected error for invalid URL %q", u)
+			}
+		}
+	})
+
+	t.Run("DefaultDownloadConfig", func(t *testing.T) {
+		opts := DefaultDownloadConfig()
+
+		// The former assertion here was a tautology (assign then compare the
+		// same variable). Meaningful default: no fixed output path, and the
+		// destructive/resume behaviors opt-in only.
+		if opts.FilePath != "" {
+			t.Errorf("Expected empty default FilePath, got %q", opts.FilePath)
 		}
 		if opts.Overwrite {
 			t.Error("Expected Overwrite=false by default")
@@ -690,10 +702,13 @@ func TestPrepareFilePath_ValidPaths(t *testing.T) {
 				tt.path = filepath.Join(tempDir, tt.path)
 			}
 
-			_, err := prepareFilePath(tt.path)
-			// We expect this to succeed for valid paths
-			// Note: system path check may fail for some paths
-			t.Logf("Path %q: err=%v", tt.path, err)
+			got, err := prepareFilePath(tt.path)
+			if err != nil {
+				t.Fatalf("prepareFilePath(%q) error: %v", tt.path, err)
+			}
+			if got != tt.path {
+				t.Errorf("prepareFilePath(%q) = %q, want unchanged path", tt.path, got)
+			}
 		})
 	}
 }
@@ -744,66 +759,6 @@ func TestIsSystemPath(t *testing.T) {
 				t.Errorf("isSystemPath(%q) = %v, want %v", tt.path, result, tt.isSystem)
 			}
 		})
-	}
-}
-
-// ----------------------------------------------------------------------------
-// Package-Level Download Functions
-// ----------------------------------------------------------------------------
-
-func TestPackageLevel_Download_VerifiesContent(t *testing.T) {
-	config := DefaultConfig()
-	config.Security.AllowPrivateIPs = true
-	client, _ := New(config)
-	_ = SetDefaultClient(client)
-	defer CloseDefaultClient()
-
-	content := []byte("download with context test")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write(content)
-	}))
-	defer server.Close()
-
-	filePath := filepath.Join(t.TempDir(), "ctx_test.txt")
-	result, err := Download(context.Background(), server.URL, &DownloadConfig{FilePath: filePath})
-	if err != nil {
-		t.Fatalf("Download failed: %v", err)
-	}
-	if result == nil {
-		t.Fatal("result should not be nil")
-	}
-
-	data, _ := os.ReadFile(filePath)
-	if string(data) != string(content) {
-		t.Errorf("file content mismatch")
-	}
-}
-
-func TestPackageLevel_Download_WithDefaultConfig(t *testing.T) {
-	config := DefaultConfig()
-	config.Security.AllowPrivateIPs = true
-	client, _ := New(config)
-	_ = SetDefaultClient(client)
-	defer CloseDefaultClient()
-
-	content := []byte("download with options and context test")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write(content)
-	}))
-	defer server.Close()
-
-	filePath := filepath.Join(t.TempDir(), "ctx_opts_test.txt")
-	opts := DefaultDownloadConfig()
-	opts.FilePath = filePath
-
-	result, err := Download(context.Background(), server.URL, opts)
-	if err != nil {
-		t.Fatalf("Download failed: %v", err)
-	}
-	if result == nil {
-		t.Fatal("result should not be nil")
 	}
 }
 
@@ -878,7 +833,16 @@ func TestWriteDownloadBody_ChecksumVerification(t *testing.T) {
 			Checksum:          expectedChecksum,
 			ChecksumAlgorithm: ChecksumSHA256,
 		}
-		result, err := writeDownloadBody(bytes.NewReader(content), opts.FilePath, opts, false, 0, 200, int64(len(content)), time.Now(), nil)
+		result, err := writeDownloadBody(downloadWriteParams{
+			bodyReader:    bytes.NewReader(content),
+			filePath:      opts.FilePath,
+			opts:          opts,
+			resumed:       false,
+			resumeOffset:  0,
+			statusCode:    200,
+			contentLength: int64(len(content)),
+			downloadStart: time.Now(),
+		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -894,7 +858,16 @@ func TestWriteDownloadBody_ChecksumVerification(t *testing.T) {
 			Checksum:          "0000000000000000000000000000000000000000000000000000000000000000",
 			ChecksumAlgorithm: ChecksumSHA256,
 		}
-		_, err := writeDownloadBody(bytes.NewReader(content), opts.FilePath, opts, false, 0, 200, int64(len(content)), time.Now(), nil)
+		_, err := writeDownloadBody(downloadWriteParams{
+			bodyReader:    bytes.NewReader(content),
+			filePath:      opts.FilePath,
+			opts:          opts,
+			resumed:       false,
+			resumeOffset:  0,
+			statusCode:    200,
+			contentLength: int64(len(content)),
+			downloadStart: time.Now(),
+		})
 		if err == nil {
 			t.Fatal("expected checksum mismatch error")
 		}
@@ -912,7 +885,16 @@ func TestWriteDownloadBody_ChecksumVerification(t *testing.T) {
 		opts := &DownloadConfig{
 			FilePath: filePath3,
 		}
-		result, err := writeDownloadBody(bytes.NewReader(content), opts.FilePath, opts, false, 0, 200, int64(len(content)), time.Now(), nil)
+		result, err := writeDownloadBody(downloadWriteParams{
+			bodyReader:    bytes.NewReader(content),
+			filePath:      opts.FilePath,
+			opts:          opts,
+			resumed:       false,
+			resumeOffset:  0,
+			statusCode:    200,
+			contentLength: int64(len(content)),
+			downloadStart: time.Now(),
+		})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -1038,20 +1020,11 @@ func TestProgressWriter_BoundaryConditions(t *testing.T) {
 	})
 }
 
-func TestGetSystemPaths_TableDriven(t *testing.T) {
-	paths := getSystemPaths()
-	if len(paths) == 0 {
-		t.Error("getSystemPaths() should return at least one path")
-	}
-
-	// Verify all paths end with separator (Windows env-var patterns like
-	// "${SystemRoot}" are exempt — they are expanded at check time).
-	for _, p := range paths {
-		if !(strings.HasPrefix(p, "${") && strings.HasSuffix(p, "}")) && !strings.HasSuffix(p, "/") && !strings.HasSuffix(p, "\\") {
-			t.Errorf("system path %q should end with separator", p)
-		}
-	}
-}
+// TestGetSystemPaths_TableDriven was removed: it pinned the strings'
+// formatting (trailing separators) rather than behavior. What matters — that
+// these paths are actually enforced — is covered by TestIsSystemPath_* and
+// TestPrepareFilePath_* below; cross-platform branch selection is inherently
+// single-branch per GOOS.
 
 func TestIsSystemPath_CurrentDirectory(t *testing.T) {
 	// Current working directory should NOT be a system path
@@ -1128,9 +1101,6 @@ func TestCheckParentDirSymlinks_BoundaryConditions(t *testing.T) {
 // likewise platform-gated.
 // ----------------------------------------------------------------------------
 
-// helloSHA256 is the SHA-256 of the literal "hello", used for checksum tests.
-const helloSHA256 = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
-
 func TestWriteDownloadBody_UnsupportedChecksumAlgorithm(t *testing.T) {
 	// A bad algorithm must be rejected BEFORE the destination file is touched
 	// (the SEC guard at download.go:343 — a config error must not O_TRUNC a file).
@@ -1141,7 +1111,16 @@ func TestWriteDownloadBody_UnsupportedChecksumAlgorithm(t *testing.T) {
 		ChecksumAlgorithm: "md5", // unsupported
 	}
 
-	_, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, false, 0, 200, 5, time.Now(), nil)
+	_, err := writeDownloadBody(downloadWriteParams{
+		bodyReader:    strings.NewReader("hello"),
+		filePath:      dest,
+		opts:          opts,
+		resumed:       false,
+		resumeOffset:  0,
+		statusCode:    200,
+		contentLength: 5,
+		downloadStart: time.Now(),
+	})
 	if err == nil || !strings.Contains(err.Error(), "unsupported checksum algorithm") {
 		t.Fatalf("expected unsupported-algorithm error, got %v", err)
 	}
@@ -1151,55 +1130,28 @@ func TestWriteDownloadBody_UnsupportedChecksumAlgorithm(t *testing.T) {
 }
 
 func TestWriteDownloadBody_OpenFileFailure(t *testing.T) {
-	// Passing a directory as FilePath makes OpenFile fail (cannot open a dir for writing).
+	// Passing a directory as FilePath makes the final rename fail (the body is
+	// streamed to the .httpc-tmp sibling, which cannot replace a directory).
+	// The full Download() flow rejects directories earlier, in prepareResumeState.
 	dir := t.TempDir()
 	opts := &DownloadConfig{FilePath: dir, ChecksumAlgorithm: ChecksumSHA256}
 
-	_, err := writeDownloadBody(strings.NewReader("hello"), dir, opts, false, 0, 200, 5, time.Now(), nil)
-	if err == nil || !strings.Contains(err.Error(), "failed to open file") {
-		t.Errorf("expected 'failed to open file' error, got %v", err)
+	_, err := writeDownloadBody(downloadWriteParams{
+		bodyReader:    strings.NewReader("hello"),
+		filePath:      dir,
+		opts:          opts,
+		resumed:       false,
+		resumeOffset:  0,
+		statusCode:    200,
+		contentLength: 5,
+		downloadStart: time.Now(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "failed to finalize download") {
+		t.Errorf("expected 'failed to finalize download' error, got %v", err)
 	}
-}
-
-func TestWriteDownloadBody_ChecksumMatch(t *testing.T) {
-	dest := filepath.Join(t.TempDir(), "out.bin")
-	opts := &DownloadConfig{
-		FilePath:          dest,
-		Checksum:          helloSHA256,
-		ChecksumAlgorithm: ChecksumSHA256,
-	}
-
-	res, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, false, 0, 200, 5, time.Now(), nil)
-	if err != nil {
-		t.Fatalf("expected success on matching checksum, got %v", err)
-	}
-	if res.BytesWritten != 5 {
-		t.Errorf("expected 5 bytes written, got %d", res.BytesWritten)
-	}
-	got, readErr := os.ReadFile(dest)
-	if readErr != nil {
-		t.Fatalf("dest not readable: %v", readErr)
-	}
-	if string(got) != "hello" {
-		t.Errorf("dest content = %q, want %q", got, "hello")
-	}
-}
-
-func TestWriteDownloadBody_ChecksumMismatchRemovesFile(t *testing.T) {
-	dest := filepath.Join(t.TempDir(), "corrupt.bin")
-	opts := &DownloadConfig{
-		FilePath:          dest,
-		Checksum:          "00", // intentionally wrong
-		ChecksumAlgorithm: ChecksumSHA256,
-	}
-
-	_, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, false, 0, 200, 5, time.Now(), nil)
-	if err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
-		t.Fatalf("expected checksum mismatch error, got %v", err)
-	}
-	// A mismatched checksum must remove the corrupted download.
-	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
-		t.Errorf("corrupted file must be removed; statErr=%v", statErr)
+	// The temp sibling must not linger after the failed rename.
+	if _, statErr := os.Stat(dir + downloadTmpSuffix); !os.IsNotExist(statErr) {
+		t.Errorf("temp sibling must be cleaned up after rename failure; statErr=%v", statErr)
 	}
 }
 
@@ -1217,7 +1169,16 @@ func TestWriteDownloadBody_ProgressCallback(t *testing.T) {
 		ChecksumAlgorithm: ChecksumSHA256,
 	}
 
-	res, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, false, 0, 200, 5, time.Now(), nil)
+	res, err := writeDownloadBody(downloadWriteParams{
+		bodyReader:    strings.NewReader("hello"),
+		filePath:      dest,
+		opts:          opts,
+		resumed:       false,
+		resumeOffset:  0,
+		statusCode:    200,
+		contentLength: 5,
+		downloadStart: time.Now(),
+	})
 	if err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
@@ -1270,7 +1231,16 @@ func TestWriteDownloadBody_WriteFailureRemovesFile(t *testing.T) {
 		err:  errors.New("simulated network error"),
 	}
 
-	_, err := writeDownloadBody(body, dest, opts, false, 0, 200, 11, time.Now(), nil)
+	_, err := writeDownloadBody(downloadWriteParams{
+		bodyReader:    body,
+		filePath:      dest,
+		opts:          opts,
+		resumed:       false,
+		resumeOffset:  0,
+		statusCode:    200,
+		contentLength: 11,
+		downloadStart: time.Now(),
+	})
 	if err == nil || !strings.Contains(err.Error(), "failed to write file") {
 		t.Fatalf("expected 'failed to write file' error, got %v", err)
 	}
@@ -1298,7 +1268,16 @@ func TestWriteDownloadBody_ResumeWriteFailurePreservesFile(t *testing.T) {
 		err:  errors.New("simulated write error"),
 	}
 
-	_, err := writeDownloadBody(body, dest, opts, true, int64(len("existing")), 206, 15, time.Now(), nil)
+	_, err := writeDownloadBody(downloadWriteParams{
+		bodyReader:    body,
+		filePath:      dest,
+		opts:          opts,
+		resumed:       true,
+		resumeOffset:  int64(len("existing")),
+		statusCode:    206,
+		contentLength: 15,
+		downloadStart: time.Now(),
+	})
 	if err == nil || !strings.Contains(err.Error(), "failed to write file") {
 		t.Fatalf("expected 'failed to write file' error, got %v", err)
 	}
@@ -1333,7 +1312,16 @@ func TestWriteDownloadBody_ResumeWithProgressCallback(t *testing.T) {
 
 	// resumed=true, resumeOffset=8 (len("existing")), contentLength=5.
 	// The progress callback's total should be 8 + 5 = 13.
-	res, err := writeDownloadBody(strings.NewReader("hello"), dest, opts, true, int64(len("existing")), 206, 5, time.Now(), nil)
+	res, err := writeDownloadBody(downloadWriteParams{
+		bodyReader:    strings.NewReader("hello"),
+		filePath:      dest,
+		opts:          opts,
+		resumed:       true,
+		resumeOffset:  int64(len("existing")),
+		statusCode:    206,
+		contentLength: 5,
+		downloadStart: time.Now(),
+	})
 	if err != nil {
 		t.Fatalf("expected success, got %v", err)
 	}
@@ -1343,4 +1331,219 @@ func TestWriteDownloadBody_ResumeWithProgressCallback(t *testing.T) {
 	if observedTotal != 13 {
 		t.Errorf("progress total = %d, want 13 (resumeOffset 8 + contentLength 5)", observedTotal)
 	}
+}
+
+// TestDownload_ResumeWithChecksum verifies that resuming a download with a
+// checksum over the FULL content succeeds: the hasher must be seeded with the
+// already-downloaded prefix, not just hash the newly received bytes.
+func TestDownload_ResumeWithChecksum(t *testing.T) {
+	fullContent := []byte("0123456789abcdefghij") // 20 bytes
+	prefixLen := 8
+	prefix := fullContent[:prefixLen]
+
+	fullHash := sha256.Sum256(fullContent)
+	fullChecksum := hex.EncodeToString(fullHash[:])
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		if start := strings.Index(rangeHeader, "bytes="); start == 0 {
+			var offset int
+			if _, err := fmt.Sscanf(rangeHeader, "bytes=%d-", &offset); err != nil || offset < 0 || offset > len(fullContent) {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			remaining := fullContent[offset:]
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, len(fullContent)-1, len(fullContent)))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(remaining)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(remaining)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fullContent)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(fullContent)
+	}))
+	defer server.Close()
+
+	config := DefaultConfig()
+	config.Security.AllowPrivateIPs = true
+	client, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "resume-checksum.bin")
+
+	// Simulate a previously interrupted download: only the prefix exists.
+	if err := os.WriteFile(filePath, prefix, 0o644); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	result, err := client.Download(context.Background(), server.URL, &DownloadConfig{
+		FilePath:          filePath,
+		ResumeDownload:    true,
+		Checksum:          fullChecksum,
+		ChecksumAlgorithm: ChecksumSHA256,
+	})
+	if err != nil {
+		t.Fatalf("Download with resume+checksum failed: %v", err)
+	}
+	if result.StatusCode != http.StatusPartialContent {
+		t.Errorf("Expected status 206, got %d", result.StatusCode)
+	}
+
+	got, err := os.ReadFile(filePath)
+	if err != nil {
+		t.Fatalf("ReadFile() error: %v", err)
+	}
+	if !bytes.Equal(got, fullContent) {
+		t.Errorf("File content mismatch after resume: got %q, want %q", got, fullContent)
+	}
+}
+
+// TestDownload_ResumeWithWrongChecksum verifies a genuinely corrupted file is
+// still rejected (fail-closed) after the prefix-seeding fix.
+func TestDownload_ResumeWithWrongChecksum(t *testing.T) {
+	fullContent := []byte("0123456789abcdefghij")
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" {
+			remaining := fullContent[8:]
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 8-%d/%d", len(fullContent)-1, len(fullContent)))
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(remaining)))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(remaining)
+			return
+		}
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fullContent)))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(fullContent)
+	}))
+	defer server.Close()
+
+	config := DefaultConfig()
+	config.Security.AllowPrivateIPs = true
+	client, err := New(config)
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	tempDir := t.TempDir()
+	filePath := filepath.Join(tempDir, "resume-wrong-checksum.bin")
+
+	// Prefix on disk does NOT match the served content: checksum must fail.
+	corruptedPrefix := append([]byte{}, fullContent[:8]...)
+	corruptedPrefix[0] = 'X'
+	if err := os.WriteFile(filePath, corruptedPrefix, 0o644); err != nil {
+		t.Fatalf("WriteFile() error: %v", err)
+	}
+
+	_, err = client.Download(context.Background(), server.URL, &DownloadConfig{
+		FilePath:          filePath,
+		ResumeDownload:    true,
+		Checksum:          "deadbeef",
+		ChecksumAlgorithm: ChecksumSHA256,
+	})
+	if err == nil {
+		t.Fatal("Expected checksum mismatch error, got nil")
+	}
+	if !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Errorf("Error should mention checksum mismatch, got: %v", err)
+	}
+}
+
+// TestDownload_ResumeContentRangeMismatch verifies a 206 response whose
+// Content-Range does not start at the local file length is rejected instead
+// of being blindly appended (which would silently corrupt the file).
+func TestDownload_ResumeContentRangeMismatch(t *testing.T) {
+	fullContent := []byte("0123456789abcdefghij")
+
+	t.Run("RangeStartsAtZero", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Range") != "" {
+				// Server ignores the offset and restarts from byte 0.
+				w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", len(fullContent)-1, len(fullContent)))
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fullContent)))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(fullContent)
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fullContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fullContent)
+		}))
+		defer server.Close()
+
+		config := DefaultConfig()
+		config.Security.AllowPrivateIPs = true
+		client, err := New(config)
+		if err != nil {
+			t.Fatalf("New() error: %v", err)
+		}
+		defer func() { _ = client.Close() }()
+
+		filePath := filepath.Join(t.TempDir(), "mismatch.bin")
+		if err := os.WriteFile(filePath, fullContent[:8], 0o644); err != nil {
+			t.Fatalf("WriteFile() error: %v", err)
+		}
+
+		_, err = client.Download(context.Background(), server.URL, &DownloadConfig{
+			FilePath:       filePath,
+			ResumeDownload: true,
+		})
+		if err == nil {
+			t.Fatal("Expected content-range mismatch error, got nil")
+		}
+		if !strings.Contains(err.Error(), "range starting at byte 0") || !strings.Contains(err.Error(), "8 bytes") {
+			t.Errorf("Error should describe the mismatch, got: %v", err)
+		}
+		// The partial file must be preserved, not truncated or corrupted.
+		got, readErr := os.ReadFile(filePath)
+		if readErr != nil {
+			t.Fatalf("ReadFile() error: %v", readErr)
+		}
+		if !bytes.Equal(got, fullContent[:8]) {
+			t.Errorf("Partial file must be preserved, got %q", got)
+		}
+	})
+
+	t.Run("MissingContentRangeHeader", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Range") != "" {
+				remaining := fullContent[8:]
+				w.Header().Set("Content-Length", fmt.Sprintf("%d", len(remaining)))
+				w.WriteHeader(http.StatusPartialContent)
+				_, _ = w.Write(remaining)
+				return
+			}
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(fullContent)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(fullContent)
+		}))
+		defer server.Close()
+
+		config := DefaultConfig()
+		config.Security.AllowPrivateIPs = true
+		client, err := New(config)
+		if err != nil {
+			t.Fatalf("New() error: %v", err)
+		}
+		defer func() { _ = client.Close() }()
+
+		filePath := filepath.Join(t.TempDir(), "missing-cr.bin")
+		if err := os.WriteFile(filePath, fullContent[:8], 0o644); err != nil {
+			t.Fatalf("WriteFile() error: %v", err)
+		}
+
+		_, err = client.Download(context.Background(), server.URL, &DownloadConfig{
+			FilePath:       filePath,
+			ResumeDownload: true,
+		})
+		if err == nil || !strings.Contains(err.Error(), "Content-Range") {
+			t.Fatalf("Expected missing Content-Range error, got %v", err)
+		}
+	})
 }

@@ -15,127 +15,17 @@ import (
 	"time"
 )
 
-// TestStreamModeContextCancelCleanup verifies that the context cancel function
-// is properly cleaned up when streaming mode is used and ReleaseResponse is called.
-// This prevents timer leaks from context.WithTimeout.
-func TestStreamModeContextCancelCleanup(t *testing.T) {
+// TestStreamModeContextCancelCleanup was removed: TestStreamingBody
+// (coverage_test.go) asserts the same streaming->RawBodyReader->ReleaseResponse
+// path and additionally checks body content.
 
-	mock := &mockTransport{
-		Response: &http.Response{
-			StatusCode: http.StatusOK,
-			Status:     "OK",
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader("streaming body")),
-		},
-	}
+// TestStreamModeContextCancelOnEarlyError was removed: its only assertion was
+// err != nil for a pre-cancelled context (equivalent to the general
+// context-cancellation test in client_test.go). The cancel-func-leak concern
+// it documented is behaviorally covered by TestReleaseResponseCleansUpStreamingResources.
 
-	config := &Config{
-		Timeout:         30 * time.Second,
-		AllowPrivateIPs: true,
-	}
-
-	client, err := NewClient(config, func(opts *clientOptions) {
-		opts.customTransport = mock
-	})
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	resp, err := client.Request(context.Background(), "GET", "https://example.com",
-		func(r *Request) error {
-			r.SetStreamBody(true)
-			return nil
-		},
-	)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
-
-	if resp == nil {
-		t.Fatal("Response should not be nil")
-	}
-
-	// Verify streaming response has a body reader
-	if resp.RawBodyReader() == nil {
-		t.Fatal("Streaming response should have a raw body reader")
-	}
-
-	// Cancel function should be set for streaming mode
-	// (ReleaseResponse is responsible for calling it)
-	ReleaseResponse(resp)
-
-	// Verify cleanup completed without panic.
-	// ReleaseResponse handles cancel func internally.
-}
-
-// TestStreamModeContextCancelOnEarlyError verifies that the context cancel function
-// is called when a streaming-mode request fails before the response is created.
-// This prevents timer leaks from context.WithTimeout when the context is already expired.
-func TestStreamModeContextCancelOnEarlyError(t *testing.T) {
-	config := &Config{
-		Timeout:         5 * time.Second,
-		AllowPrivateIPs: true,
-	}
-
-	client, err := NewClient(config, func(opts *clientOptions) {
-		opts.customTransport = newMockTransport(200, "OK")
-	})
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	// Create an already-expired context to trigger early error
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
-
-	_, err = client.Request(ctx, "GET", "https://example.com",
-		func(r *Request) error {
-			r.SetStreamBody(true)
-			return nil
-		},
-	)
-	if err == nil {
-		t.Fatal("Expected error from cancelled context")
-	}
-
-	// The key assertion: no goroutine or timer leak.
-	// The cancel func from context.WithTimeout (created in executeRequest)
-	// must have been called even though streaming mode was requested.
-	// We can't directly observe cancel calls, but the test verifies
-	// the error path completes without hanging or leaking.
-}
-
-// TestNonStreamModeContextCancel verifies that non-streaming requests
-// always have their context cancelled (baseline for comparison).
-func TestNonStreamModeContextCancel(t *testing.T) {
-	mock := newMockTransport(200, "hello world")
-
-	config := &Config{
-		Timeout:         10 * time.Second,
-		AllowPrivateIPs: true,
-	}
-
-	client, err := NewClient(config, func(opts *clientOptions) {
-		opts.customTransport = mock
-	})
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	resp, err := client.Request(context.Background(), "GET", "https://example.com")
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
-
-	if resp.StatusCode() != http.StatusOK {
-		t.Errorf("Expected status 200, got %d", resp.StatusCode())
-	}
-
-	ReleaseResponse(resp)
-}
+// TestNonStreamModeContextCancel was removed: the "baseline" observed nothing
+// about cancellation — it was equivalent to a plain successful mock request.
 
 // TestReleaseResponseCleansUpStreamingResources verifies that ReleaseResponse
 // properly closes the raw body reader and calls the cancel function for
@@ -174,9 +64,19 @@ func TestReleaseResponseNilSafe(t *testing.T) {
 	ReleaseResponse(nil)
 	ReleaseResponse(&Response{})
 
-	resp := getResponse()
+	// Normal release zeroes the response in place (folded in from the former
+	// standalone TestReleaseResponse in coverage_test.go).
+	resp := &Response{}
+	resp.SetStatusCode(200)
+	resp.SetBody("test")
 	ReleaseResponse(resp)
-	ReleaseResponse(resp) // Double release should not panic
+	if resp.StatusCode() != 0 {
+		t.Error("Expected zeroed response after release")
+	}
+
+	resp2 := getResponse()
+	ReleaseResponse(resp2)
+	ReleaseResponse(resp2) // Double release should not panic
 }
 
 // trackingReadCloser tracks Close calls for testing.
@@ -299,15 +199,7 @@ func TestDecompressorPoolCleanup(t *testing.T) {
 		AllowPrivateIPs: true,
 	}
 
-	client, err := NewClient(config, func(opts *clientOptions) {
-		opts.customTransport = newMockTransport(200, "test response data")
-	})
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	// Verify gzip decompression works correctly
+	// Verify gzip decompression works correctly and the reader returns to the pool.
 	mock := &mockTransport{
 		Response: &http.Response{
 			StatusCode: http.StatusOK,
@@ -318,21 +210,24 @@ func TestDecompressorPoolCleanup(t *testing.T) {
 		},
 	}
 
-	client2, err := NewClient(config, func(opts *clientOptions) {
+	client, err := NewClient(config, func(opts *clientOptions) {
 		opts.customTransport = mock
 	})
 	if err != nil {
-		t.Fatalf("Failed to create client2: %v", err)
+		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client2.Close()
+	defer func() { _ = client.Close() }()
 
-	resp, err := client2.Request(context.Background(), "GET", "https://example.com")
+	resp, err := client.Request(context.Background(), "GET", "https://example.com")
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
+	if got := resp.Body(); got != "compressed data" {
+		t.Errorf("gzip body = %q, want %q (decompression broken)", got, "compressed data")
+	}
 	ReleaseResponse(resp)
 
-	// Verify deflate decompression works correctly
+	// Verify deflate decompression works correctly and the reader returns to the pool.
 	mock2 := &mockTransport{
 		Response: &http.Response{
 			StatusCode: http.StatusOK,
@@ -343,17 +238,20 @@ func TestDecompressorPoolCleanup(t *testing.T) {
 		},
 	}
 
-	client3, err := NewClient(config, func(opts *clientOptions) {
+	client2, err := NewClient(config, func(opts *clientOptions) {
 		opts.customTransport = mock2
 	})
 	if err != nil {
-		t.Fatalf("Failed to create client3: %v", err)
+		t.Fatalf("Failed to create client2: %v", err)
 	}
-	defer client3.Close()
+	defer func() { _ = client2.Close() }()
 
-	resp2, err := client3.Request(context.Background(), "GET", "https://example.com")
+	resp2, err := client2.Request(context.Background(), "GET", "https://example.com")
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
+	}
+	if got := resp2.Body(); got != "deflated data" {
+		t.Errorf("deflate body = %q, want %q (decompression broken)", got, "deflated data")
 	}
 	ReleaseResponse(resp2)
 }

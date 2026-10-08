@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,131 +25,12 @@ import (
 	"github.com/cybergodev/httpc/internal/validation"
 )
 
-// maxRetriesUnset is the sentinel value for "not configured — use default".
-// Request.maxRetries is initialized to this value in pool New functions.
-const maxRetriesUnset = -1
-
 // httpcDebug caches the HTTPC_DEBUG environment-variable check to avoid a
 // syscall on every retry attempt and proxy selection. Evaluated once at first
 // use via sync.OnceValue; subsequent calls return the cached bool.
 var httpcDebug = sync.OnceValue(func() bool {
 	return os.Getenv("HTTPC_DEBUG") != ""
 })
-
-// headersMapPool reduces allocations for the per-request headers map (map[string]string).
-// Pooled maps are cleared before reuse and must not exceed 32 entries to prevent bloat.
-// Stores the map value directly: boxing a map into any is allocation-free, whereas
-// storing &m would force the parameter to escape (see httpHeaderPool for details).
-var headersMapPool = sync.Pool{
-	New: func() any {
-		return make(map[string]string, 4)
-	},
-}
-
-// queryParamsPool reduces allocations for the per-request query params map (map[string]any).
-// Pooled maps are cleared before reuse and must not exceed 32 entries to prevent bloat.
-var queryParamsPool = sync.Pool{
-	New: func() any {
-		return make(map[string]any, 4)
-	},
-}
-
-func getHeadersMap() map[string]string {
-	m, ok := headersMapPool.Get().(map[string]string)
-	if !ok || m == nil {
-		return make(map[string]string, 4)
-	}
-	return m
-}
-
-func putHeadersMap(m map[string]string) {
-	if m == nil || len(m) > 32 {
-		return
-	}
-	for k := range m {
-		delete(m, k)
-	}
-	headersMapPool.Put(m)
-}
-
-func getQueryParamsMap() map[string]any {
-	m, ok := queryParamsPool.Get().(map[string]any)
-	if !ok || m == nil {
-		return make(map[string]any, 4)
-	}
-	return m
-}
-
-func putQueryParamsMap(m map[string]any) {
-	if m == nil || len(m) > 32 {
-		return
-	}
-	for k := range m {
-		delete(m, k)
-	}
-	queryParamsPool.Put(m)
-}
-
-// requestPool is a typed pool for Request objects that eliminates
-// repetitive get/put/zeroing boilerplate.
-type requestPool struct {
-	pool sync.Pool
-}
-
-func newRequestPool() requestPool {
-	return requestPool{
-		pool: sync.Pool{
-			New: func() any {
-				return &Request{maxRetries: maxRetriesUnset}
-			},
-		},
-	}
-}
-
-func (p *requestPool) get() *Request {
-	req, ok := p.pool.Get().(*Request)
-	if !ok || req == nil {
-		return &Request{maxRetries: maxRetriesUnset}
-	}
-	return req
-}
-
-func (p *requestPool) put(req *Request) {
-	putHeadersMap(req.headers)
-	putQueryParamsMap(req.queryParams)
-	*req = Request{maxRetries: maxRetriesUnset}
-	p.pool.Put(req)
-}
-
-// sharedRequestPool is a global pool for Request objects used by external packages
-// (httpc middleware path, session capture). Consolidating into a single pool improves
-// hit rates under concurrency compared to multiple separate pools.
-// maxRetries defaults to maxRetriesUnset so middleware-path requests use config defaults.
-var sharedRequestPool = sync.Pool{
-	New: func() any { return &Request{maxRetries: maxRetriesUnset} },
-}
-
-// AcquireRequest retrieves a Request from the shared pool.
-// The caller must call ReleaseRequest when done.
-func AcquireRequest() *Request {
-	req, ok := sharedRequestPool.Get().(*Request)
-	if !ok || req == nil {
-		return &Request{maxRetries: maxRetriesUnset}
-	}
-	return req
-}
-
-// ReleaseRequest returns a Request to the shared pool after clearing all fields.
-// Resets maxRetries to maxRetriesUnset so recycled requests inherit the client's retry config.
-func ReleaseRequest(req *Request) {
-	if req == nil {
-		return
-	}
-	putHeadersMap(req.headers)
-	putQueryParamsMap(req.queryParams)
-	*req = Request{maxRetries: maxRetriesUnset}
-	sharedRequestPool.Put(req)
-}
 
 // Client is the internal HTTP client that manages requests, responses, retries,
 // and connection pooling.
@@ -222,6 +104,13 @@ type Config struct {
 	BackoffFactor float64
 	Jitter        bool
 
+	// RetryNonIdempotent allows retrying non-idempotent methods (POST, PATCH,
+	// and custom methods). Default false: a timeout or retryable 5xx may
+	// arrive after the server already committed the operation, and replaying
+	// the buffered body would duplicate it (duplicate payment, double insert,
+	// ...). See the retry guard in executeWithRetry.
+	RetryNonIdempotent bool
+
 	// ExtraRetryableStatusCodes are HTTP status codes beyond the built-in set
 	// (408/429/500/502/503/504) that should trigger a retry. Seeded from
 	// Connection.ProxyRotateOnStatus to rotate proxies on WAF/CF blocks.
@@ -249,226 +138,6 @@ type Config struct {
 
 	// Certificate pinning
 	CertificatePinner security.CertificatePinner
-}
-
-// requestCallback is a callback function invoked before a request is sent.
-type requestCallback func(req *Request) error
-
-// responseCallback is a callback function invoked after a response is received.
-type responseCallback func(resp *Response) error
-
-// Request represents an HTTP request with method, URL, headers, body, and options.
-//
-// The exported accessor and mutator methods below implement the
-// types.RequestMutator interface (which embeds both read and write methods).
-// They are trivial field pass-throughs and intentionally lack per-method godoc;
-// refer to the interface definition for their contract.
-type Request struct {
-	method      string
-	url         string
-	headers     map[string]string
-	queryParams map[string]any
-	body        any
-	timeout     time.Duration
-	maxRetries  int
-	// context carries the request's cancellation/deadline. Storing it here is an
-	// intentional, narrow exception to the "do not store context in a struct"
-	// guideline: Request is a short-lived, pooled, request-scoped object whose
-	// lifetime is bounded by a single request — mirroring net/http.Request. It is
-	// reset to its zero value when returned to the pool (see requestPool.put /
-	// ReleaseRequest) and is never retained beyond the request. Long-lived structs
-	// that outlive a request must continue to take context.Context as the first
-	// parameter instead.
-	context         context.Context
-	cookies         []http.Cookie
-	followRedirects *bool
-	maxRedirects    *int
-	onRequest       requestCallback
-	onResponse      responseCallback
-	streamBody      bool   // When true, skip buffering response body; caller reads via RawBodyReader
-	sanitizedURL    string // Cached per-request sanitized URL, set by middleware on first access
-	allowPrivateIPs *bool  // Per-request override of client-level AllowPrivateIPs (nil = use client policy)
-}
-
-// Compile-time interface check
-var _ types.RequestMutator = (*Request)(nil)
-
-// Accessors (implement RequestMutator)
-func (r *Request) Method() string              { return r.method }
-func (r *Request) URL() string                 { return r.url }
-func (r *Request) Headers() map[string]string  { return r.headers }
-func (r *Request) QueryParams() map[string]any { return r.queryParams }
-func (r *Request) Body() any                   { return r.body }
-func (r *Request) Timeout() time.Duration      { return r.timeout }
-func (r *Request) MaxRetries() int             { return r.maxRetries }
-func (r *Request) Context() context.Context    { return r.context }
-func (r *Request) Cookies() []http.Cookie      { return r.cookies }
-func (r *Request) FollowRedirects() *bool      { return r.followRedirects }
-func (r *Request) MaxRedirects() *int          { return r.maxRedirects }
-func (r *Request) AllowPrivateIPs() *bool      { return r.allowPrivateIPs }
-func (r *Request) SanitizedURL() string        { return r.sanitizedURL }
-func (r *Request) SetSanitizedURL(v string)    { r.sanitizedURL = v }
-
-// Mutators
-func (r *Request) SetMethod(v string)             { r.method = v }
-func (r *Request) SetURL(v string)                { r.url = v }
-func (r *Request) SetHeaders(v map[string]string) { r.headers = v }
-func (r *Request) SetHeader(key, value string) {
-	if r.headers == nil {
-		r.headers = getHeadersMap()
-	}
-	r.headers[key] = value
-}
-func (r *Request) SetQueryParams(v map[string]any) { r.queryParams = v }
-func (r *Request) EnsureQueryParams() map[string]any {
-	if r.queryParams == nil {
-		r.queryParams = getQueryParamsMap()
-	}
-	return r.queryParams
-}
-func (r *Request) SetBody(v any)                { r.body = v }
-func (r *Request) SetTimeout(v time.Duration)   { r.timeout = v }
-func (r *Request) SetMaxRetries(v int)          { r.maxRetries = v }
-func (r *Request) SetContext(v context.Context) { r.context = v }
-func (r *Request) SetCookies(v []http.Cookie)   { r.cookies = v }
-func (r *Request) SetFollowRedirects(v *bool)   { r.followRedirects = v }
-func (r *Request) SetMaxRedirects(v *int)       { r.maxRedirects = v }
-func (r *Request) SetAllowPrivateIPs(v *bool)   { r.allowPrivateIPs = v }
-func (r *Request) StreamBody() bool             { return r.streamBody }
-func (r *Request) SetStreamBody(v bool)         { r.streamBody = v }
-
-// Callback accessors
-func (r *Request) OnRequest() requestCallback        { return r.onRequest }
-func (r *Request) OnResponse() responseCallback      { return r.onResponse }
-func (r *Request) SetOnRequest(cb requestCallback)   { r.onRequest = cb }
-func (r *Request) SetOnResponse(cb responseCallback) { r.onResponse = cb }
-
-// Response represents an HTTP response.
-// Response objects are safe to read from multiple goroutines after they are returned.
-//
-// The exported accessor and mutator methods below implement the
-// types.ResponseMutator interface (which embeds ResponseReader and write
-// methods). They are trivial field pass-throughs and intentionally lack
-// per-method godoc; refer to the interface definition for their contract.
-type Response struct {
-	statusCode     int
-	status         string
-	headers        http.Header
-	body           string
-	rawBody        []byte
-	bodyMu         sync.RWMutex       // Protects body/bodyReady for concurrent SetBody/Body access
-	bodyReady      bool               // True after body string has been computed from rawBody
-	rawBodyReader  io.ReadCloser      // Set when streamBody=true; caller must close
-	cancelFunc     context.CancelFunc // Stored for streaming mode cleanup
-	contentLength  int64
-	proto          string
-	duration       time.Duration
-	attempts       int
-	cookies        []*http.Cookie
-	redirectChain  []string
-	redirectCount  int
-	requestHeaders http.Header // Actual headers sent with the request
-	requestURL     string      // The actual URL that was requested (with query params)
-	requestMethod  string      // The HTTP method used
-}
-
-// Compile-time interface check
-var _ types.ResponseMutator = (*Response)(nil)
-
-// Accessors (implement ResponseAccessor)
-func (r *Response) StatusCode() int      { return r.statusCode }
-func (r *Response) Status() string       { return r.status }
-func (r *Response) Headers() http.Header { return r.headers }
-func (r *Response) Body() string {
-	r.bodyMu.RLock()
-	if r.bodyReady {
-		b := r.body
-		r.bodyMu.RUnlock()
-		return b
-	}
-	r.bodyMu.RUnlock()
-
-	// Slow path: compute body string under write lock.
-	r.bodyMu.Lock()
-	// Double-check after acquiring write lock.
-	if !r.bodyReady && r.rawBody != nil {
-		r.body = string(r.rawBody)
-		r.bodyReady = true
-	}
-	b := r.body
-	r.bodyMu.Unlock()
-	return b
-}
-func (r *Response) RawBody() []byte              { return r.rawBody }
-func (r *Response) ContentLength() int64         { return r.contentLength }
-func (r *Response) Proto() string                { return r.proto }
-func (r *Response) Duration() time.Duration      { return r.duration }
-func (r *Response) Attempts() int                { return r.attempts }
-func (r *Response) Cookies() []*http.Cookie      { return r.cookies }
-func (r *Response) RedirectChain() []string      { return r.redirectChain }
-func (r *Response) RedirectCount() int           { return r.redirectCount }
-func (r *Response) RequestHeaders() http.Header  { return r.requestHeaders }
-func (r *Response) RequestURL() string           { return r.requestURL }
-func (r *Response) RequestMethod() string        { return r.requestMethod }
-func (r *Response) RawBodyReader() io.ReadCloser { return r.rawBodyReader }
-
-// TransferHeaders returns the response headers and clears the internal reference.
-// The caller takes ownership of the returned map. Used by the public layer to
-// avoid a redundant CloneHeader when converting engine.Response to Result.
-func (r *Response) TransferHeaders() http.Header {
-	h := r.headers
-	r.headers = nil
-	return h
-}
-
-// TransferRequestHeaders returns the request headers and clears the internal reference.
-func (r *Response) TransferRequestHeaders() http.Header {
-	h := r.requestHeaders
-	r.requestHeaders = nil
-	return h
-}
-
-// SetRawBodyReader replaces the raw body reader. Passing nil transfers ownership
-// away from the response so that ReleaseResponse will not close it.
-func (r *Response) SetRawBodyReader(rc io.ReadCloser) {
-	r.bodyMu.Lock()
-	r.rawBodyReader = rc
-	r.bodyMu.Unlock()
-}
-
-// Mutators (implement ResponseMutator)
-func (r *Response) SetStatusCode(v int)      { r.statusCode = v }
-func (r *Response) SetStatus(v string)       { r.status = v }
-func (r *Response) SetHeaders(v http.Header) { r.headers = v }
-func (r *Response) SetBody(v string) {
-	r.bodyMu.Lock()
-	r.body = v
-	r.bodyReady = true
-	r.bodyMu.Unlock()
-}
-func (r *Response) SetRawBody(v []byte) {
-	r.bodyMu.Lock()
-	r.rawBody = v
-	r.bodyReady = false
-	r.bodyMu.Unlock()
-}
-func (r *Response) SetContentLength(v int64)        { r.contentLength = v }
-func (r *Response) SetProto(v string)               { r.proto = v }
-func (r *Response) SetDuration(v time.Duration)     { r.duration = v }
-func (r *Response) SetAttempts(v int)               { r.attempts = v }
-func (r *Response) SetCookies(v []*http.Cookie)     { r.cookies = v }
-func (r *Response) SetRedirectChain(v []string)     { r.redirectChain = v }
-func (r *Response) SetRedirectCount(v int)          { r.redirectCount = v }
-func (r *Response) SetRequestHeaders(v http.Header) { r.requestHeaders = v }
-func (r *Response) SetRequestURL(v string)          { r.requestURL = v }
-func (r *Response) SetRequestMethod(v string)       { r.requestMethod = v }
-
-// SetHeader sets a header with multiple values (implements ResponseMutator)
-func (r *Response) SetHeader(key string, values ...string) {
-	if r.headers == nil {
-		r.headers = make(http.Header)
-	}
-	r.headers[key] = values
 }
 
 // NewClient creates a new engine Client with the given configuration and optional client options.
@@ -502,45 +171,14 @@ func NewClient(config *Config, opts ...clientOption) (*Client, error) {
 		client.transport = options.customTransport
 		// Connection pool not needed for custom transport
 	} else {
-		connConfig := connection.DefaultConfig()
-		connConfig.MaxIdleConns = config.MaxIdleConns
-		connConfig.MaxIdleConnsPerHost = config.MaxIdleConnsPerHost
-		connConfig.MaxConnsPerHost = config.MaxConnsPerHost
-		connConfig.MaxResponseHeaderBytes = config.MaxResponseHeaderBytes
-		connConfig.DialTimeout = config.DialTimeout
-		connConfig.KeepAlive = config.KeepAlive
-		connConfig.TLSHandshakeTimeout = config.TLSHandshakeTimeout
-		connConfig.ResponseHeaderTimeout = config.ResponseHeaderTimeout
-		connConfig.IdleConnTimeout = config.IdleConnTimeout
-		connConfig.MinTLSVersion = config.MinTLSVersion
-		connConfig.MaxTLSVersion = config.MaxTLSVersion
-		connConfig.InsecureSkipVerify = config.InsecureSkipVerify
-		connConfig.EnableHTTP2 = config.EnableHTTP2
-		connConfig.ProxyURL = config.ProxyURL
-		connConfig.EnableSystemProxy = config.EnableSystemProxy
-		connConfig.ProxyPool = config.ProxyPool
-		connConfig.ProxyPoolStrategy = config.ProxyPoolStrategy
-		connConfig.ProxyFailureThreshold = config.ProxyFailureThreshold
-		connConfig.ProxyCooldown = config.ProxyCooldown
-		connConfig.CookieJar = config.CookieJar
-		connConfig.AllowPrivateIPs = config.AllowPrivateIPs
-		connConfig.ExemptNets = config.ExemptNets
-		connConfig.EnableDoH = config.EnableDoH
-		connConfig.DoHCacheTTL = config.DoHCacheTTL
-		connConfig.TLSConfig = config.TLSConfig
-
-		if config.CertificatePinner != nil {
-			connConfig.SetCertPinner(config.CertificatePinner)
-		}
-
-		client.connectionPool, err = connection.NewPoolManager(connConfig)
+		client.connectionPool, err = connection.NewPoolManager(buildConnectionConfig(config))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create connection pool: %w", err)
 		}
 
 		client.transport, err = newTransport(config, client.connectionPool)
 		if err != nil {
-			client.connectionPool.Close()
+			_ = client.connectionPool.Close() // best-effort cleanup on init failure
 			return nil, fmt.Errorf("failed to create transport: %w", err)
 		}
 	}
@@ -550,16 +188,58 @@ func NewClient(config *Config, opts ...clientOption) (*Client, error) {
 	client.retryEngine = newRetryEngine(config)
 
 	validatorConfig := &security.Config{
-		ValidateURL:         config.ValidateURL,
-		ValidateHeaders:     config.ValidateHeaders,
-		MaxResponseBodySize: config.MaxResponseBodySize,
-		MaxRequestBodySize:  config.MaxRequestBodySize,
-		AllowPrivateIPs:     config.AllowPrivateIPs,
-		ExemptNets:          config.ExemptNets,
+		ValidateURL:        config.ValidateURL,
+		ValidateHeaders:    config.ValidateHeaders,
+		MaxRequestBodySize: config.MaxRequestBodySize,
+		AllowPrivateIPs:    config.AllowPrivateIPs,
+		ExemptNets:         config.ExemptNets,
 	}
 	client.validator = security.NewValidatorWithConfig(validatorConfig)
 
 	return client, nil
+}
+
+// buildConnectionConfig maps engine.Config onto connection.Config, starting
+// from connection defaults and overriding with the engine's values.
+//
+// MAINTENANCE MIRROR: engine.Config and connection.Config carry many
+// same-named fields that must be copied field-by-field here. A field added to
+// either Config but missing from this mapping compiles cleanly and silently
+// keeps its zero/default value — when adding a field, update this mapping in
+// the same change. connection.DefaultConfig fields with no engine counterpart
+// (e.g. MaxTotalConns, ExpectContinueTimeout) intentionally keep defaults.
+func buildConnectionConfig(config *Config) *connection.Config {
+	connConfig := connection.DefaultConfig()
+	connConfig.MaxIdleConns = config.MaxIdleConns
+	connConfig.MaxIdleConnsPerHost = config.MaxIdleConnsPerHost
+	connConfig.MaxConnsPerHost = config.MaxConnsPerHost
+	connConfig.MaxResponseHeaderBytes = config.MaxResponseHeaderBytes
+	connConfig.DialTimeout = config.DialTimeout
+	connConfig.KeepAlive = config.KeepAlive
+	connConfig.TLSHandshakeTimeout = config.TLSHandshakeTimeout
+	connConfig.ResponseHeaderTimeout = config.ResponseHeaderTimeout
+	connConfig.IdleConnTimeout = config.IdleConnTimeout
+	connConfig.MinTLSVersion = config.MinTLSVersion
+	connConfig.MaxTLSVersion = config.MaxTLSVersion
+	connConfig.InsecureSkipVerify = config.InsecureSkipVerify
+	connConfig.EnableHTTP2 = config.EnableHTTP2
+	connConfig.ProxyURL = config.ProxyURL
+	connConfig.EnableSystemProxy = config.EnableSystemProxy
+	connConfig.ProxyPool = config.ProxyPool
+	connConfig.ProxyPoolStrategy = config.ProxyPoolStrategy
+	connConfig.ProxyFailureThreshold = config.ProxyFailureThreshold
+	connConfig.ProxyCooldown = config.ProxyCooldown
+	connConfig.CookieJar = config.CookieJar
+	connConfig.AllowPrivateIPs = config.AllowPrivateIPs
+	connConfig.ExemptNets = config.ExemptNets
+	connConfig.EnableDoH = config.EnableDoH
+	connConfig.DoHCacheTTL = config.DoHCacheTTL
+	connConfig.TLSConfig = config.TLSConfig
+
+	if config.CertificatePinner != nil {
+		connConfig.SetCertPinner(config.CertificatePinner)
+	}
+	return connConfig
 }
 
 // ErrClientClosed is returned when attempting to use a closed client.
@@ -576,7 +256,7 @@ func (c *Client) Request(ctx context.Context, method, url string, options ...Req
 
 	startTime := time.Now()
 
-	// Get Request from pool (already zeroed by putRequest via *req = Request{})
+	// Get Request from pool (already zeroed by putRequest via resetRequest)
 	req := c.getRequest()
 	req.SetMethod(method)
 	req.SetURL(url)
@@ -598,8 +278,14 @@ func (c *Client) Request(ctx context.Context, method, url string, options ...Req
 	// Propagate a per-request AllowPrivateIPs override to the connection dialer
 	// and the redirect-target validator via the request context. The pre-flight
 	// validator reads the same override directly from secReq below.
+	// A nil context must be tolerated here like everywhere else in the engine
+	// (context.WithValue(nil, ...) panics).
 	if override := req.AllowPrivateIPs(); override != nil {
-		req.SetContext(connection.WithAllowPrivateIPsOverride(req.Context(), *override))
+		reqCtx := req.Context()
+		if reqCtx == nil {
+			reqCtx = backgroundCtx
+		}
+		req.SetContext(connection.WithAllowPrivateIPsOverride(reqCtx, *override))
 	}
 
 	// Use pooled security.Request for validation
@@ -708,6 +394,27 @@ func (c *Client) sleepWithContext(ctx context.Context, duration time.Duration) e
 	}
 }
 
+// drainAndCloseBody drains a bounded prefix of an unwanted response body and
+// closes it, letting net/http reuse the underlying connection. The drain cap
+// (defaultMaxDrain, tightened to MaxResponseBodySize when smaller) prevents a
+// huge body from stalling cleanup. Shared by the buffered-path cleanup defer
+// and the streaming Content-Encoding guard.
+func (c *Client) drainAndCloseBody(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+	maxDrain := defaultMaxDrain
+	if c.config.MaxResponseBodySize > 0 && c.config.MaxResponseBodySize < maxDrain {
+		maxDrain = c.config.MaxResponseBodySize
+	}
+	// io.Discard implements io.ReaderFrom with its own internal pooled buffer,
+	// so io.Copy(io.Discard, ...) already avoids per-call heap allocation.
+	drainLr := getLimitReader(body, maxDrain)
+	_, _ = io.Copy(io.Discard, drainLr)
+	putLimitReader(drainLr)
+	_ = body.Close() // best-effort cleanup
+}
+
 // executeWithRetry executes a request with intelligent retry logic.
 // Optimized for performance with minimal allocations and efficient error handling.
 func (c *Client) executeWithRetry(req *Request) (*Response, error) {
@@ -720,23 +427,56 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 			maxRetries = c.retryEngine.MaxRetries()
 		}
 	}
+	// A custom policy returning a negative MaxRetries violates the RetryPolicy
+	// contract. Clamp to 0 so the request still executes once via the fast
+	// path below — without this it fell into a never-entered retry loop and
+	// returned "request failed after N attempts" without ever sending.
+	if maxRetries < 0 {
+		maxRetries = 0
+	}
+
+	// SAFETY: non-idempotent methods (POST, PATCH, custom methods) are not
+	// retried by default. A timeout or retryable 5xx may arrive after the
+	// server already committed the operation, and replaying the buffered body
+	// would duplicate it (duplicate payment, double insert, ...). Opt in via
+	// Config.RetryNonIdempotent or the WithRetryNonIdempotent per-request
+	// option. Zeroing the budget here also takes the fast path below, which
+	// skips the 100MB retry body buffering — large POST bodies stream instead
+	// of being buffered solely for replay.
+	if maxRetries > 0 && !isIdempotentMethod(req.Method()) {
+		allowNonIdempotent := c.config.RetryNonIdempotent
+		if override := req.RetryNonIdempotent(); override != nil {
+			allowNonIdempotent = *override
+		}
+		if !allowNonIdempotent {
+			maxRetries = 0
+		}
+	}
 
 	// Fast path: no retries configured (most common case)
 	// Skip deep copy since request is only executed once — original req
 	// is returned to pool by caller's defer putRequest regardless.
 	if maxRetries == 0 {
-		// Per-request proxy rotation: even without retries, reserve a unique
-		// proxy index and close idle connections so the transport calls Proxy()
-		// instead of reusing the previous request's tunnel.
-		if c.config.ProxyRotatePerRequest && c.connectionPool != nil {
-			if baseIdx, ok := c.connectionPool.NextProxyIndex(); ok {
-				baseCtx := req.Context()
-				if baseCtx == nil {
-					baseCtx = backgroundCtx
-				}
-				req.SetContext(connection.WithProxyAttempt(baseCtx, baseIdx))
-				c.connectionPool.CloseIdleConnections()
+		// Attach a per-request proxy recorder so the transport's Proxy
+		// callback can report which proxy it selected. Only when a proxy is
+		// actually configured — keeps the direct-connection path allocation-free.
+		var proxyRec *connection.ProxyRecorder
+		if c.connectionPool != nil && c.connectionPool.HasProxy() {
+			proxyRec = &connection.ProxyRecorder{}
+			baseCtx := req.Context()
+			if baseCtx == nil {
+				baseCtx = backgroundCtx
 			}
+			// Per-request proxy rotation: even without retries, reserve a unique
+			// proxy index and close idle connections so the transport calls Proxy()
+			// instead of reusing the previous request's tunnel.
+			if c.config.ProxyRotatePerRequest {
+				if baseIdx, ok := c.connectionPool.NextProxyIndex(); ok {
+					baseCtx = connection.WithProxyAttempt(baseCtx, baseIdx)
+					c.connectionPool.CloseIdleConnections()
+				}
+			}
+			req.SetContext(connection.WithProxyRecorder(baseCtx, proxyRec))
 		}
 		resp, err := c.executeRequest(req, true)
 		if err != nil {
@@ -744,6 +484,7 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 		}
 		if resp != nil {
 			resp.SetAttempts(1)
+			resp.SetProxyURL(proxyRec.Last())
 		}
 		return resp, nil
 	}
@@ -763,7 +504,10 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 		retryCtx = backgroundCtx
 	}
 	retryTimeout := req.Timeout()
-	if retryTimeout <= 0 && c.config.Timeout > 0 {
+	// NoTimeout suppresses only the client-level default; an explicit
+	// per-request timeout (req.Timeout() > 0) and any context deadline are
+	// still honored.
+	if !req.NoTimeout() && retryTimeout <= 0 && c.config.Timeout > 0 {
 		retryTimeout = c.config.Timeout
 	}
 	var overallCancel context.CancelFunc
@@ -830,6 +574,15 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 	//   - Redirect-safe: all Proxy calls within one attempt share the same index,
 	//     so redirect-following cannot desynchronize the rotation.
 	retryBaseCtx := req.Context()
+	// Attach the proxy recorder before the loop so every attempt (and each
+	// redirect hop within an attempt) records its selected proxy; Last()
+	// after the final attempt yields the proxy that produced the response.
+	// As in the fast path, only when a proxy is actually configured.
+	var proxyRec *connection.ProxyRecorder
+	if c.connectionPool != nil && c.connectionPool.HasProxy() {
+		proxyRec = &connection.ProxyRecorder{}
+		retryBaseCtx = connection.WithProxyRecorder(retryBaseCtx, proxyRec)
+	}
 	baseProxyIdx := 0
 	useProxyRotation := len(c.config.ExtraRetryableStatusCodes) > 0 || c.config.ProxyRotatePerRequest
 	if useProxyRotation && c.connectionPool != nil {
@@ -907,7 +660,7 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 
 			if sleepErr := c.sleepWithContext(req.Context(), delay); sleepErr != nil {
 				releaseLastResp(&lastResp)
-				return nil, classifyError(sleepErr, req.URL(), req.Method(), attempt+1)
+				return nil, classifyErrorWithSanitizedURL(sleepErr, sanitizedURL, reqMethod, attempt+1)
 			}
 			continue
 		}
@@ -959,11 +712,22 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 
 			// Success - set attempt count and return
 			resp.SetAttempts(attempt + 1)
+			resp.SetProxyURL(proxyRec.Last())
 			// Transfer context cancel ownership: streaming responses
 			// need the cancel to stay alive until ReleaseResponse.
 			// Setting overallCancel=nil prevents the defer from cancelling.
+			// CHAIN, don't overwrite: executeRequest may already have stored a
+			// per-attempt streamCancel in resp.cancelFunc. Overwriting would
+			// orphan that cancel func and pin its timer until the deadline.
+			// (Currently the retry deadline makes the per-attempt timeout
+			// context unreachable, so this is defensive — but cheap.)
 			if overallCancel != nil && resp.rawBodyReader != nil {
-				resp.cancelFunc = overallCancel
+				if prev := resp.cancelFunc; prev != nil {
+					inner, outer := prev, overallCancel
+					resp.cancelFunc = func() { inner(); outer() }
+				} else {
+					resp.cancelFunc = overallCancel
+				}
 				overallCancel = nil
 			}
 			return resp, nil
@@ -975,10 +739,17 @@ func (c *Client) executeWithRetry(req *Request) (*Response, error) {
 	// never occur with the current implementation. Included for robustness.
 	if lastResp != nil {
 		lastResp.SetAttempts(maxRetries + 1)
+		lastResp.SetProxyURL(proxyRec.Last())
 		// Transfer context cancel ownership for streaming responses,
-		// matching the success-path logic above.
+		// matching the success-path logic above (chained, never overwritten —
+		// see the comment there).
 		if overallCancel != nil && lastResp.rawBodyReader != nil {
-			lastResp.cancelFunc = overallCancel
+			if prev := lastResp.cancelFunc; prev != nil {
+				inner, outer := prev, overallCancel
+				lastResp.cancelFunc = func() { inner(); outer() }
+			} else {
+				lastResp.cancelFunc = overallCancel
+			}
 			overallCancel = nil
 		}
 		return lastResp, nil
@@ -1077,7 +848,10 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 	}
 
 	timeout := req.Timeout()
-	if timeout <= 0 && c.config.Timeout > 0 {
+	// NoTimeout suppresses only the client-level default; an explicit
+	// per-request timeout (req.Timeout() > 0) and any context deadline are
+	// still honored.
+	if !req.NoTimeout() && timeout <= 0 && c.config.Timeout > 0 {
 		timeout = c.config.Timeout
 	}
 
@@ -1105,10 +879,13 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 	// response, preventing the deferred cleanup from double-cancelling.
 	setCancelFuncToNil := func() { cancelCtx = nil }
 
-	select {
-	case <-execCtx.Done():
-		return nil, classifyErrorWithSanitizedURL(execCtx.Err(), validation.SanitizeURL(req.URL()), req.Method(), 0)
-	default:
+	// Fast pre-flight cancellation check. Err() instead of a select on
+	// Done(): the select forces cancelCtx to materialize its done channel
+	// eagerly (net/http allocates it later during the round trip anyway),
+	// and the direct error read expresses the "already canceled or
+	// expired" intent without the select machinery.
+	if err := execCtx.Err(); err != nil {
+		return nil, classifyErrorWithSanitizedURL(err, validation.SanitizeURL(req.URL()), req.Method(), 0)
 	}
 
 	// Get a pooled Request copy — deep copy reference types to prevent cross-retry mutation
@@ -1190,6 +967,24 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 	// Streaming mode: skip body buffering, hand raw reader to caller.
 	// Caller is responsible for closing the body reader.
 	if reqCopy.StreamBody() {
+		// The streaming path hands raw bytes to the caller, bypassing the
+		// decompression applied to buffered bodies. Build() requests
+		// "Accept-Encoding: identity" for streaming requests, but a
+		// non-conforming server may compress anyway — the caller would then
+		// silently persist compressed bytes as the "downloaded" file (e.g. a
+		// gzip archive with the original's name). Fail loudly instead. A
+		// caller-supplied Accept-Encoding (anything other than the engine's
+		// identity hint) means the encoding was explicitly requested, so the
+		// raw bytes are passed through untouched.
+		if enc := httpResp.Header.Get("Content-Encoding"); enc != "" && !strings.EqualFold(enc, "identity") {
+			if ae := httpReq.Header.Get("Accept-Encoding"); ae == "" || ae == "identity" {
+				c.drainAndCloseBody(httpResp.Body)
+				return nil, classifyErrorWithSanitizedURL(
+					fmt.Errorf("streaming response has Content-Encoding %q: server ignored Accept-Encoding: identity; use a buffered (non-streaming) request so the client can decompress it", enc),
+					sanitizeOnce(), req.Method(), 0)
+			}
+		}
+
 		resp := getResponse()
 		resp.SetStatusCode(httpResp.StatusCode)
 		resp.SetStatus(httpResp.Status)
@@ -1201,8 +996,11 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 		if streamLimit <= 0 {
 			streamLimit = defaultMaxDecompressedSize
 		}
-		lr := getLimitReader(httpResp.Body, streamLimit)
-		resp.rawBodyReader = &streamBodyReader{reader: lr, source: httpResp.Body}
+		// Budget one byte beyond the limit so streamBodyReader can distinguish
+		// an oversize body (error) from one ending exactly at the limit (clean
+		// EOF) — see its Read implementation.
+		lr := getLimitReader(httpResp.Body, streamLimit+1)
+		resp.rawBodyReader = &streamBodyReader{reader: lr, source: httpResp.Body, limit: streamLimit}
 		resp.cancelFunc = streamCancel
 		setCancelFuncToNil() // Prevent deferred cancel; ReleaseResponse handles cleanup
 
@@ -1214,10 +1012,14 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 			resp.SetRequestMethod(httpResp.Request.Method)
 		}
 
-		// Capture redirect metadata for streaming responses
-		if redirectChain := c.transport.GetRedirectChain(reqCopy.context); len(redirectChain) > 0 {
-			resp.SetRedirectChain(redirectChain)
-			resp.SetRedirectCount(len(redirectChain))
+		// Capture redirect metadata for streaming responses. Reading the chain
+		// straight off the settings object avoids a ctx.Value chain walk (the
+		// settings pointer is already in scope from SetRedirectPolicy).
+		if redirectSettings != nil {
+			if redirectChain := redirectSettings.getChain(); len(redirectChain) > 0 {
+				resp.SetRedirectChain(redirectChain)
+				resp.SetRedirectCount(len(redirectChain))
+			}
 		}
 
 		// Invoke OnResponse callback for streaming responses
@@ -1233,16 +1035,7 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 
 	defer func() {
 		if httpResp.Body != nil {
-			maxDrain := defaultMaxDrain
-			if c.config.MaxResponseBodySize > 0 && c.config.MaxResponseBodySize < maxDrain {
-				maxDrain = c.config.MaxResponseBodySize
-			}
-			// io.Discard implements io.ReaderFrom with its own internal pooled buffer,
-			// so io.Copy(io.Discard, ...) already avoids per-call heap allocation.
-			drainLr := getLimitReader(httpResp.Body, maxDrain)
-			_, _ = io.Copy(io.Discard, drainLr)
-			putLimitReader(drainLr)
-			_ = httpResp.Body.Close() // best-effort cleanup
+			c.drainAndCloseBody(httpResp.Body)
 		}
 	}()
 
@@ -1251,9 +1044,13 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 		return nil, classifyErrorWithSanitizedURL(err, sanitizeOnce(), req.Method(), 0)
 	}
 
-	if redirectChain := c.transport.GetRedirectChain(reqCopy.context); len(redirectChain) > 0 {
-		resp.SetRedirectChain(redirectChain)
-		resp.SetRedirectCount(len(redirectChain))
+	// Read the chain straight off the settings object (see the streaming-path
+	// note above) rather than walking the request context.
+	if redirectSettings != nil {
+		if redirectChain := redirectSettings.getChain(); len(redirectChain) > 0 {
+			resp.SetRedirectChain(redirectChain)
+			resp.SetRedirectCount(len(redirectChain))
+		}
 	}
 
 	if httpResp.Request != nil {
@@ -1322,6 +1119,9 @@ func (c *Client) Close() error {
 type RequestOption func(*Request) error
 
 // clientOption is a functional option for configuring the Client.
+// It exists solely as a seam for tests to inject a custom transportManager;
+// it is not instance configuration — new client settings belong on Config
+// (the engine follows the same Config-struct convention as the public API).
 type clientOption func(*clientOptions)
 
 type clientOptions struct {

@@ -3,8 +3,10 @@ package httpc
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/cybergodev/httpc/internal/engine"
 	"github.com/cybergodev/httpc/internal/validation"
 )
 
@@ -12,21 +14,9 @@ import (
 // SESSION MANAGER TESTS
 // ============================================================================
 
-func TestNewSessionManager(t *testing.T) {
-	session, err := NewSessionManager(DefaultSessionConfig())
-	if err != nil {
-		t.Fatalf("NewSessionManager error: %v", err)
-	}
-	if session == nil {
-		t.Fatal("Expected non-nil SessionManager")
-	}
-	if len(session.cookies) != 0 {
-		t.Error("Expected empty cookies map")
-	}
-	if len(session.headers) != 0 {
-		t.Error("Expected empty headers map")
-	}
-}
+// TestNewSessionManager construction with defaults is covered by
+// TestNewSessionManagerDefault (DefaultSessionConfig is its input), so no
+// separate minimal-constructor test is kept here.
 
 func TestNewSessionManagerWithConfig(t *testing.T) {
 	securityConfig := validation.StrictCookieSecurityConfig()
@@ -62,6 +52,58 @@ func TestNewSessionManagerDefault(t *testing.T) {
 	}
 	if session.cookieSecurity != nil {
 		t.Error("Expected nil cookieSecurity with default config")
+	}
+}
+
+// TestSessionManagerZeroValue exercises the write methods on a zero-value
+// SessionManager (&SessionManager{} instead of NewSessionManager): the maps
+// are initialized lazily on first write, so a mis-constructed manager behaves
+// as an empty session instead of panicking with "assignment to entry in nil
+// map" (SEC-003 regression guard).
+func TestSessionManagerZeroValue(t *testing.T) {
+	s := &SessionManager{}
+
+	if err := s.SetHeader("Accept", "application/json"); err != nil {
+		t.Fatalf("SetHeader on zero value: %v", err)
+	}
+	if err := s.SetHeaders(map[string]string{"X-A": "b"}); err != nil {
+		t.Fatalf("SetHeaders on zero value: %v", err)
+	}
+	if err := s.SetCookie(&http.Cookie{Name: "sid", Value: "1"}); err != nil {
+		t.Fatalf("SetCookie on zero value: %v", err)
+	}
+	if err := s.SetCookies([]*http.Cookie{{Name: "c2", Value: "v"}}); err != nil {
+		t.Fatalf("SetCookies on zero value: %v", err)
+	}
+	s.UpdateFromCookies([]*http.Cookie{{Name: "c3", Value: "v"}})
+	s.UpdateFromResult(&Result{Response: &ResponseInfo{Cookies: []*http.Cookie{{Name: "c4", Value: "v"}}}})
+	s.captureFromOptions([]RequestOption{
+		WithHeader("X-Zero", "1"),
+		WithCookies([]http.Cookie{{Name: "c5", Value: "v"}}),
+	})
+
+	if got := s.GetCookie("sid"); got == nil || got.Value != "1" {
+		t.Errorf("GetCookie(sid) = %+v, want value %q", got, "1")
+	}
+	if v, ok := s.GetHeaders()["X-A"]; !ok || v != "b" {
+		t.Errorf("GetHeaders()[X-A] = %q, %v", v, ok)
+	}
+	for _, name := range []string{"c2", "c3", "c4", "c5"} {
+		if s.GetCookie(name) == nil {
+			t.Errorf("cookie %s missing after write on zero value", name)
+		}
+	}
+
+	// Reads on a never-written zero value must also work (nil-map reads).
+	s2 := &SessionManager{}
+	if h := s2.GetHeaders(); len(h) != 0 {
+		t.Errorf("GetHeaders on untouched zero value = %v, want empty", h)
+	}
+	if c := s2.GetCookies(); c != nil {
+		t.Errorf("GetCookies on untouched zero value = %v, want nil", c)
+	}
+	if c := s2.GetCookie("missing"); c != nil {
+		t.Errorf("GetCookie on untouched zero value = %v, want nil", c)
 	}
 }
 
@@ -228,6 +270,14 @@ func TestSessionManager_SetHeader(t *testing.T) {
 	if err := session.SetHeader("X-Bad", "value\r\nX-Injected: malicious"); err == nil {
 		t.Error("Expected error for header with CRLF")
 	}
+
+	// Oversize key / value are rejected by ValidateHeaderKeyValue limits.
+	if err := session.SetHeader("X-"+strings.Repeat("k", validation.MaxHeaderKeyLen), "value"); err == nil {
+		t.Error("Expected error for oversize header key")
+	}
+	if err := session.SetHeader("X-Key", strings.Repeat("v", validation.MaxValueLen+1)); err == nil {
+		t.Error("Expected error for oversize header value")
+	}
 }
 
 func TestSessionManager_SetHeaders(t *testing.T) {
@@ -309,7 +359,7 @@ func TestSessionManager_prepareOptions(t *testing.T) {
 	defer server.Close()
 
 	client, _ := newTestClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Get(server.URL, options...)
 	if err != nil {
@@ -413,5 +463,111 @@ func TestSessionManager_SetCookies_NilElement(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("expected error for nil cookie element")
+	}
+}
+
+// ----------------------------------------------------------------------------
+// Nil-receiver safety
+// ----------------------------------------------------------------------------
+
+// TestSessionManager_NilReceiverSafety verifies every SessionManager method
+// either returns an error or is a safe no-op when called on a nil receiver.
+func TestSessionManager_NilReceiverSafety(t *testing.T) {
+	var s *SessionManager // nil receiver
+
+	t.Run("SetCookieSecurity does not panic", func(t *testing.T) {
+		s.SetCookieSecurity(nil)
+	})
+
+	t.Run("SetHeader returns error", func(t *testing.T) {
+		if err := s.SetHeader("key", "val"); err == nil {
+			t.Error("expected error on nil receiver")
+		}
+	})
+
+	t.Run("SetHeaders returns error", func(t *testing.T) {
+		if err := s.SetHeaders(map[string]string{"k": "v"}); err == nil {
+			t.Error("expected error on nil receiver")
+		}
+	})
+
+	t.Run("SetHeaders with invalid header returns error", func(t *testing.T) {
+		sm, _ := NewSessionManagerDefault()
+		badHeaders := map[string]string{"": "empty-key"}
+		if err := sm.SetHeaders(badHeaders); err == nil {
+			t.Error("expected error for empty header key")
+		}
+	})
+
+	t.Run("DeleteHeader does not panic", func(t *testing.T) {
+		s.DeleteHeader("key")
+	})
+
+	t.Run("ClearHeaders does not panic", func(t *testing.T) {
+		s.ClearHeaders()
+	})
+
+	t.Run("GetHeaders returns nil", func(t *testing.T) {
+		if h := s.GetHeaders(); h != nil {
+			t.Errorf("expected nil, got %v", h)
+		}
+	})
+
+	t.Run("SetCookie returns error", func(t *testing.T) {
+		if err := s.SetCookie(&http.Cookie{Name: "k", Value: "v"}); err == nil {
+			t.Error("expected error on nil receiver")
+		}
+	})
+
+	t.Run("SetCookies returns error", func(t *testing.T) {
+		if err := s.SetCookies([]*http.Cookie{{Name: "k", Value: "v"}}); err == nil {
+			t.Error("expected error on nil receiver")
+		}
+	})
+
+	t.Run("DeleteCookie does not panic", func(t *testing.T) {
+		s.DeleteCookie("key")
+	})
+
+	t.Run("ClearCookies does not panic", func(t *testing.T) {
+		s.ClearCookies()
+	})
+
+	t.Run("GetCookies returns nil", func(t *testing.T) {
+		if c := s.GetCookies(); c != nil {
+			t.Errorf("expected nil, got %v", c)
+		}
+	})
+
+	t.Run("GetCookie returns nil", func(t *testing.T) {
+		if c := s.GetCookie("key"); c != nil {
+			t.Errorf("expected nil, got %v", c)
+		}
+	})
+}
+
+// Moved from quality_regression_test.go (dissolved grab-bag file):
+// TestCaptureFromOptionsSkipsInvalidCookies guards the ValidateCookie gate in
+// captureFromOptions: cookies set by raw options that bypass WithCookies
+// validation must not enter the session store.
+func TestCaptureFromOptionsSkipsInvalidCookies(t *testing.T) {
+	sm, err := NewSessionManagerDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := RequestOption(func(r *engine.Request) error {
+		r.SetCookies([]http.Cookie{
+			{Name: "good", Value: "fine"},
+			{Name: "bad;name", Value: "invalid"}, // control/separator chars in name
+		})
+		return nil
+	})
+	sm.captureFromOptions([]RequestOption{raw})
+
+	if got := sm.GetCookie("good"); got == nil {
+		t.Error("valid cookie from option should be captured")
+	}
+	if got := sm.GetCookie("bad;name"); got != nil {
+		t.Errorf("invalid cookie should be rejected, got %v", got)
 	}
 }

@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== Concurrent Requests Examples ===\n ")
+	fmt.Println("=== Concurrent Requests Examples ===")
 
 	// Example 1: Parallel requests
 	demonstrateParallelRequests()

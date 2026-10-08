@@ -171,33 +171,10 @@ func TestClearPools(t *testing.T) {
 	}
 }
 
-func TestCrossOriginRedirectHostComparison(t *testing.T) {
-	tests := []struct {
-		name         string
-		originalHost string
-		redirectHost string
-		shouldStrip  bool
-	}{
-		{"same host", "example.com", "example.com", false},
-		{"different host", "example.com", "evil.com", true},
-		{"same host different port", "example.com:8080", "example.com:9090", false},
-		{"different subdomain", "api.example.com", "www.example.com", true},
-		{"ip vs hostname", "example.com", "127.0.0.1", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			original, _ := url.Parse("http://" + tt.originalHost + "/path")
-			redirect, _ := url.Parse("http://" + tt.redirectHost + "/path")
-
-			stripNeeded := original.Hostname() != redirect.Hostname()
-			if stripNeeded != tt.shouldStrip {
-				t.Errorf("hostname comparison: %q vs %q, stripNeeded=%v, want=%v",
-					original.Hostname(), redirect.Hostname(), stripNeeded, tt.shouldStrip)
-			}
-		})
-	}
-}
+// TestCrossOriginRedirectHostComparison was removed: it asserted Go
+// stdlib url.URL.Hostname() semantics without invoking any engine code.
+// Cross-origin redirect stripping is behaviorally covered by
+// TestCheckRedirect_* tests below.
 
 // TestCheckRedirect_WhitelistBlock covers the redirect-whitelist branch
 // (transport.go:195-198): when a whitelist is configured, redirects to
@@ -353,10 +330,15 @@ func TestCheckRedirect_PolicyArms(t *testing.T) {
 		}
 	})
 
-	t.Run("no settings in context defaults to allow", func(t *testing.T) {
+	t.Run("no settings in context fails closed", func(t *testing.T) {
+		// Missing settings must REJECT, not silently allow: installing
+		// CheckRedirect replaces net/http's default 10-hop policy, so "allow"
+		// here would mean unlimited redirects with no SSRF validation.
+		// Current call paths always inject settings (SetRedirectPolicy before
+		// RoundTrip); this arm guards against future context-plumbing losses.
 		req, _ := http.NewRequest("GET", "https://example.com/x", nil)
-		if err := trans.checkRedirect(req, nil); err != nil {
-			t.Errorf("expected nil when no redirect settings present, got %v", err)
+		if err := trans.checkRedirect(req, nil); err == nil {
+			t.Error("expected error when no redirect settings present, got nil")
 		}
 	})
 

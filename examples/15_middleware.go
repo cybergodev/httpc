@@ -15,7 +15,7 @@ import (
 // This example demonstrates middleware usage patterns
 
 func main() {
-	fmt.Println("=== Middleware Examples ===\n ")
+	fmt.Println("=== Middleware Examples ===")
 
 	// Example 1: Basic logging middleware
 	demonstrateLoggingMiddleware()
@@ -160,17 +160,26 @@ func demonstrateMetricsMiddleware() {
 	fmt.Println()
 }
 
-// demonstrateRecoveryMiddleware shows panic recovery
+// demonstrateRecoveryMiddleware shows panic recovery in action.
+// A deliberately panicking custom middleware is installed after
+// RecoveryMiddleware, so the panic is converted into a regular error
+// instead of crashing the program.
 func demonstrateRecoveryMiddleware() {
 	fmt.Println("--- Example 4: Recovery Middleware ---")
 
-	// Create client with recovery middleware
+	// A middleware that panics — simulating a bug in custom middleware code.
+	panicking := func(next httpc.Handler) httpc.Handler {
+		return func(ctx context.Context, req httpc.RequestMutator) (httpc.ResponseMutator, error) {
+			panic("simulated middleware bug")
+		}
+	}
+
+	// Middlewares run in the order provided (first wraps the rest), so
+	// RecoveryMiddleware must be listed BEFORE the middleware it protects.
 	config := httpc.DefaultConfig()
-	recoveryLogCfg := httpc.DefaultLoggingConfig()
-	recoveryLogCfg.LogFunc = log.Printf
 	config.Middleware.Middlewares = []httpc.MiddlewareFunc{
 		httpc.RecoveryMiddleware(),
-		httpc.LoggingMiddleware(recoveryLogCfg),
+		panicking,
 	}
 
 	client, err := httpc.New(config)
@@ -180,12 +189,13 @@ func demonstrateRecoveryMiddleware() {
 	}
 	defer client.Close()
 
-	// Normal request - should succeed
-	resp, err := client.Get("https://httpbin.org/get")
+	// Without recovery this panic would crash the process; with it, the
+	// panic surfaces as a normal error the caller can handle.
+	_, err = client.Get("https://httpbin.org/get")
 	if err != nil {
-		log.Printf("Normal request: %v\n", err)
+		fmt.Printf("[OK] Panic recovered, returned as error: %v\n", err)
 	} else {
-		fmt.Printf("Normal request succeeded: Status %d\n", resp.StatusCode())
+		fmt.Println("[X] Request succeeded — panic was not triggered")
 	}
 
 	fmt.Println()
@@ -255,7 +265,7 @@ func demonstrateHeaderMiddleware() {
 	}
 
 	fmt.Printf("Status: %d\n", resp.StatusCode())
-	fmt.Println("Headers added to every request via middleware\n ")
+	fmt.Println("Headers added to every request via middleware")
 }
 
 // demonstrateMiddlewareChain shows combining multiple middlewares

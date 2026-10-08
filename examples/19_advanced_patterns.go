@@ -4,7 +4,9 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"time"
 
 	"github.com/cybergodev/httpc"
@@ -14,6 +16,12 @@ import (
 
 func main() {
 	fmt.Println("=== Advanced Patterns & Optimization ===")
+
+	// demonstrateSaveToFile writes into downloads/; make sure it exists
+	// before any example runs.
+	if err := os.MkdirAll("downloads", 0755); err != nil {
+		log.Printf("Warning: Failed to create downloads directory: %v\n", err)
+	}
 
 	// 1. Request/Response Callbacks
 	demonstrateCallbacks()
@@ -154,6 +162,13 @@ func demonstrateTestingConfig() {
 
 	// TestingConfig is optimized for unit tests
 	config := httpc.TestingConfig()
+
+	// TestingConfig disables TLS verification and warns about it on stderr
+	// (the default warning writer). Redirect the warning elsewhere — or
+	// suppress it entirely with io.Discard — when stderr is reserved for
+	// test output.
+	httpc.SetSecurityWarnOutput(io.Discard)
+
 	fmt.Println("TestingConfig settings:")
 	fmt.Println("  - Reduced timeouts (5-10s)")
 	fmt.Println("  - Minimal retries (1 attempt)")

@@ -1,6 +1,7 @@
 package validation
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -38,6 +39,9 @@ func isPrivateOrReservedIP(ip net.IP) bool {
 			(ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113) { // Documentation TEST-NET-3 (203.0.113.0/24)
 			return true
 		}
+		// NOTE: 198.18.0.0/15 (RFC 2544 benchmarking) is deliberately allowed:
+		// Clash/Surge-style proxy tools allocate their fake-IP pool there, and
+		// blocking it would break those setups (see netutil_test).
 		return false
 	}
 
@@ -47,12 +51,35 @@ func isPrivateOrReservedIP(ip net.IP) bool {
 		if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x0d && ip[3] == 0xb8 {
 			return true
 		}
+		// Teredo 2001::/32 (RFC 4380): the last 4 bytes carry the client's
+		// IPv4 address in obfuscated (complemented) form, so ANY target —
+		// including 127.0.0.1 — can be hidden there. Checking the embedded
+		// address is unreliable (the complement of an arbitrary public IP
+		// quasi-randomly lands in reserved space), so the whole prefix is
+		// blocked, matching common SSRF filter practice. Teredo is obsolete
+		// (removed from Windows 10+), making the false-positive cost negligible.
+		if ip[0] == 0x20 && ip[1] == 0x01 && ip[2] == 0x00 && ip[3] == 0x00 {
+			return true
+		}
+		// Site-local fec0::/10 (deprecated but still routable in some nets)
+		if ip[0] == 0xfe && (ip[1]&0xc0) == 0xc0 {
+			return true
+		}
 		// NAT64 well-known prefix 64:ff9b::/96 (RFC 6052)
 		// Validates embedded IPv4 to prevent SSRF bypass via IPv6.
 		if ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b &&
 			ip[4] == 0 && ip[5] == 0 && ip[6] == 0 && ip[7] == 0 &&
 			ip[8] == 0 && ip[9] == 0 && ip[10] == 0 && ip[11] == 0 {
 			embeddedIP := net.IPv4(ip[12], ip[13], ip[14], ip[15])
+			return isPrivateOrReservedIP(embeddedIP)
+		}
+		// 6to4 2002::/16 (RFC 7526, deprecated): bytes 2-5 embed the public
+		// IPv4 target of the relay, so a private target (e.g. 2002:7f00:1::
+		// = 127.0.0.1) hides inside a globally-routed prefix. Validate the
+		// embedded address, mirroring the NAT64 handling above — the same
+		// embedded-IPv4 SSRF bypass the Teredo/NAT64 comments describe.
+		if ip[0] == 0x20 && ip[1] == 0x02 {
+			embeddedIP := net.IPv4(ip[2], ip[3], ip[4], ip[5])
 			return isPrivateOrReservedIP(embeddedIP)
 		}
 	}
@@ -97,7 +124,8 @@ func FilterAllowedIPs(ips []net.IP, exemptNets []*net.IPNet) []net.IP {
 // isLocalhost detects localhost variations by hostname string:
 //   - "localhost" (case-insensitive)
 //   - 127.0.0.1, ::1, 0.0.0.0, ::
-//   - the 127.x.x.x range
+//   - full dotted-quad 127.x.x.x loopback addresses (but NOT domains that
+//     merely start with "127." — 127.net and 127.com are real public domains)
 //   - "localhost.localdomain" and "localhost.localdomain." (case-insensitive)
 //
 // Arbitrary localhost.* subdomains are intentionally NOT matched here: names
@@ -114,12 +142,17 @@ func isLocalhost(hostname string) bool {
 		return false
 	}
 
-	// Check for 127.x.x.x range first (most common localhost pattern)
-	// Use direct byte comparison to avoid string allocation
-	// SECURITY: Must check hlen >= 4 to safely access hostname[3]
-	// "127." prefix indicates 127.x.x.x range (loopback network)
+	// Check for dotted-quad 127.x.x.x loopback forms first (most common
+	// localhost pattern). The bare "127." prefix check this replaces
+	// misclassified legitimate public domains such as 127.net / 127.com as
+	// localhost; the remainder must now parse as a full dotted-quad IPv4
+	// loopback address. Legacy short forms that net.ParseIP rejects (127.1,
+	// 127.0.0.1.2) are still blocked by looksLikeLegacyIPLiteral in
+	// ValidateSSRFHost.
 	if hlen >= 4 && hostname[0] == '1' && hostname[1] == '2' && hostname[2] == '7' && hostname[3] == '.' {
-		return true
+		if ip := net.ParseIP(hostname); ip != nil && ip.IsLoopback() {
+			return true
+		}
 	}
 
 	// Check exact matches - handle both cases for "localhost"
@@ -244,35 +277,100 @@ func ValidateProxyURL(rawURL string) (*url.URL, error) {
 
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return nil, fmt.Errorf("invalid proxy URL: %w", err)
+		// SECURITY: url.Parse errors embed the raw input verbatim
+		// (`parse "…": …`), which may contain proxy credentials. Redact both
+		// the echoed URL and the wrapped error text so the password cannot
+		// reach application logs through the error chain.
+		return nil, fmt.Errorf("invalid proxy URL %q: %w", SanitizeURL(rawURL), redactErrorURL(err, rawURL))
 	}
 
 	switch u.Scheme {
 	case "http", "https", "socks5", "socks5h":
 	default:
 		if u.Scheme == "" {
-			return nil, fmt.Errorf("invalid proxy URL %q: missing scheme", rawURL)
+			return nil, fmt.Errorf("invalid proxy URL %q: missing scheme", SanitizeURL(rawURL))
 		}
 		return nil, fmt.Errorf("unsupported proxy URL scheme %q (want http, https, socks5, or socks5h)", u.Scheme)
 	}
 
 	if u.Host == "" {
-		return nil, fmt.Errorf("invalid proxy URL %q: missing host", rawURL)
+		return nil, fmt.Errorf("invalid proxy URL %q: missing host", SanitizeURL(rawURL))
 	}
 
 	return u, nil
 }
 
+// redactErrorURL replaces any occurrence of rawURL inside err's message with
+// its sanitized form, so a wrapped url.Parse error ("parse \"raw\": …") does
+// not carry credentials up the error chain. When rawURL has nothing to
+// sanitize the original error is returned unchanged, preserving its type for
+// errors.Is/As; otherwise a new error is built from the scrubbed message.
+func redactErrorURL(err error, rawURL string) error {
+	sanitized := SanitizeURL(rawURL)
+	if sanitized == rawURL || !strings.Contains(err.Error(), rawURL) {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), rawURL, sanitized))
+}
+
+// schemeDefaultPorts maps proxy URL schemes to the port net/http appends when
+// the proxy URL omits one (mirrors net/http transport.schemePort, which drives
+// the address the transport actually dials).
+var schemeDefaultPorts = map[string]string{
+	"http":    "80",
+	"https":   "443",
+	"socks5":  "1080",
+	"socks5h": "1080",
+}
+
+// CanonicalProxyAddr returns the host:port form of a proxy URL as net/http
+// will actually DIAL it. net/http's transport dials canonicalAddr(proxyURL) —
+// the URL hostname with the scheme's default port appended when the URL omits
+// one — so any comparison against the dial address (proxy SSRF exemptions,
+// proxypool health-report keys) must use this canonical form, not url.Host.
+// Before this existed, a portless entry like "socks5://internal-proxy" was
+// keyed as "internal-proxy" while the dialer saw "internal-proxy:1080": the
+// proxy SSRF exemption silently never applied and circuit-breaking failure
+// counts never incremented.
+//
+// LIMITATION: internationalized (non-ASCII) hostnames are not punycoded here
+// (net/http applies IDNA at dial time); an IDN proxy URL without an explicit
+// port still will not match. Explicit-port IDN proxies match — the port is
+// never rewritten.
+func CanonicalProxyAddr(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	// Mirror stdlib exactly: canonicalAddr uses url.Port() — which returns ""
+	// both for a missing port AND for a syntactically present but EMPTY port
+	// ("http://proxy:" → Host "proxy:", Port() "") — and then appends the
+	// scheme default. Testing SplitHostPort instead would keep the literal
+	// "proxy:" and never match the dialed "proxy:80".
+	if u.Port() != "" {
+		return u.Host // already carries a real port
+	}
+	return net.JoinHostPort(u.Hostname(), schemeDefaultPorts[u.Scheme])
+}
+
 // ValidateSSRFHost checks whether a hostname (which may include a port) should be
 // blocked under SSRF protection rules. It checks localhost, direct IP addresses,
-// and optionally resolves DNS for domain names.
+// and legacy IP-literal notation.
 // Returns nil if the host is allowed, or an error describing why it was blocked.
-func ValidateSSRFHost(host string, exemptNets []*net.IPNet, resolveDNS bool) error {
+//
+// DNS resolution of hostnames is deliberately NOT performed here: the
+// connection pool dialer (internal/connection) resolves once, validates every
+// IP, and dials the validated IP directly, which also prevents DNS-rebinding
+// TOCTOU attacks a pre-check could not.
+func ValidateSSRFHost(host string, exemptNets []*net.IPNet) error {
 	// Extract hostname from host:port format
 	hostname := host
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		hostname = h
 	}
+
+	// Normalize the fully-qualified trailing dot ("localhost." is a legal FQDN
+	// spelling of "localhost") so hostname checks cannot be bypassed by it.
+	hostname = strings.TrimSuffix(hostname, ".")
 
 	if isLocalhost(hostname) {
 		return fmt.Errorf("localhost access blocked for security")
@@ -286,24 +384,12 @@ func ValidateSSRFHost(host string, exemptNets []*net.IPNet, resolveDNS bool) err
 	}
 
 	// Block legacy integer/hex/octal IPv4 notation (e.g. "2130706433",
-	// "0x7f000001", "0177.0.0.1"). net.ParseIP rejects these, so without this
-	// guard they fall through and are allowed when resolveDNS is false. On cgo
-	// builds, getaddrinfo accepts them and may map them to private IPs (e.g.
-	// 127.0.0.1), bypassing SSRF protection.
+	// "0x7f000001", "0177.0.0.1", "10.1"). net.ParseIP rejects these, so
+	// without this guard they fall through to the dialer, where libc-family
+	// resolvers (directly or via proxies) may map them to private IPs
+	// (e.g. 127.0.0.1), bypassing SSRF protection.
 	if looksLikeLegacyIPLiteral(hostname) {
 		return fmt.Errorf("legacy IP literal notation blocked for security: %s", hostname)
-	}
-
-	if resolveDNS {
-		ips, err := net.LookupIP(hostname)
-		if err != nil {
-			return fmt.Errorf("DNS resolution failed: %w", err)
-		}
-		for _, ip := range ips {
-			if err := ValidateIPWithExemptions(ip, exemptNets); err != nil {
-				return fmt.Errorf("domain resolves to blocked address")
-			}
-		}
 	}
 
 	return nil
@@ -330,16 +416,11 @@ func looksLikeLegacyIPLiteral(s string) bool {
 	if !strings.Contains(s, ".") {
 		// Pure decimal integer host (no dots): 2130706433. A bare all-numeric
 		// label is not a legitimate DNS hostname.
-		for i := 0; i < len(s); i++ {
-			if s[i] < '0' || s[i] > '9' {
-				return false
-			}
-		}
-		return true
+		return isAllDigits(s)
 	}
 
 	// Dotted form: flag leading-zero octets (octal) or hex octets.
-	for _, part := range strings.Split(s, ".") {
+	for part := range strings.SplitSeq(s, ".") {
 		if part == "" {
 			continue
 		}
@@ -351,5 +432,56 @@ func looksLikeLegacyIPLiteral(s string) bool {
 			return true
 		}
 	}
+
+	// Short-form inet_aton literals ("10.1" → 10.0.0.1, "192.168.1" →
+	// 192.168.0.1) and out-of-range octets ("1.2.3.256"): net.ParseIP has
+	// already rejected this string, and a legal DNS hostname cannot have an
+	// all-numeric final label (RFC 1123 §2.1), so treat it as a legacy IP
+	// literal. Proxied requests resolve the host remotely, where libc-family
+	// resolvers still accept these forms — this pre-check is then the only
+	// line of SSRF defense. Full dotted quads with every octet in range are
+	// excluded: net.ParseIP accepts those before this helper is consulted.
+	parts := strings.Split(s, ".")
+	if last := parts[len(parts)-1]; isAllDigits(last) {
+		if len(parts) != 4 {
+			return true
+		}
+		for _, part := range parts {
+			if !isAllDigits(part) {
+				// A non-numeric label (e.g. "a.1.2.3") makes this a hostname,
+				// not an IP literal.
+				return false
+			}
+			if v := octetValue(part); v < 0 || v > 255 {
+				return true
+			}
+		}
+	}
 	return false
+}
+
+// octetValue parses a digits-only label into its decimal value. Returns -1
+// for labels longer than 3 digits, which no valid octet can be.
+func octetValue(s string) int {
+	if len(s) > 3 {
+		return -1
+	}
+	v := 0
+	for i := 0; i < len(s); i++ {
+		v = v*10 + int(s[i]-'0')
+	}
+	return v
+}
+
+// isAllDigits reports whether s is non-empty and consists only of ASCII digits.
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }

@@ -5,13 +5,14 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/cybergodev/httpc"
 )
 
 func main() {
-	fmt.Println("=== Proxy Configuration Examples ===\n ")
+	fmt.Println("=== Proxy Configuration Examples ===")
 
 	// Example 1: Direct connection (no proxy) - default behavior
 	demonstrateDirectConnection()
@@ -68,7 +69,7 @@ func demonstrateDirectConnection() {
 	fmt.Printf("Status: %d\n", resp.StatusCode())
 	body := resp.Body()
 	fmt.Printf("Response: %s\n", body[:min(100, len(body))])
-	fmt.Println("Connection: Direct (no proxy)\n ")
+	fmt.Println("Connection: Direct (no proxy)")
 }
 
 // demonstrateSystemProxy shows automatic system proxy detection
@@ -102,14 +103,16 @@ func demonstrateSystemProxy() {
 	fmt.Printf("Status: %d\n", resp.StatusCode())
 	body := resp.Body()
 	fmt.Printf("Response: %s\n", body[:min(100, len(body))])
-	fmt.Println("Connection: System proxy (if configured) or direct\n ")
+	// Meta.ProxyURL reports the proxy that actually served the request
+	fmt.Printf("Proxy used (result.Meta.ProxyURL): %q (empty = direct)\n", resp.Meta.ProxyURL)
+	fmt.Println("Connection: System proxy (if configured) or direct")
 
 	// Show environment variables that affect system proxy
 	fmt.Println("Environment variables for system proxy:")
 	fmt.Println("  HTTP_PROXY  - Proxy for HTTP requests")
 	fmt.Println("  HTTPS_PROXY - Proxy for HTTPS requests")
 	fmt.Println("  NO_PROXY    - Hosts to bypass proxy")
-	fmt.Println("  (case-insensitive on most systems)\n ")
+	fmt.Println("  (case-insensitive on most systems)")
 }
 
 // demonstrateManualProxy shows manual proxy configuration
@@ -143,14 +146,14 @@ func demonstrateManualProxy() {
 	if err != nil {
 		fmt.Printf("Request failed: %v\n", err)
 		fmt.Println("\nNote: This is expected if no proxy is running at 127.0.0.1:7890")
-		fmt.Println("Start your proxy software (Clash, V2Ray, etc.) to test this example.\n ")
+		fmt.Println("Start your proxy software (Clash, V2Ray, etc.) to test this example.")
 		return
 	}
 
 	fmt.Printf("Status: %d\n", resp.StatusCode())
 	body := resp.Body()
 	fmt.Printf("Response: %s\n", body[:min(100, len(body))])
-	fmt.Printf("Connection: Via proxy %s\n\n", proxyURL)
+	fmt.Printf("Connection: Via proxy %s (reported by result.Meta.ProxyURL)\n\n", resp.Meta.ProxyURL)
 }
 
 // demonstrateProxyPriority shows how proxy settings are prioritized
@@ -180,11 +183,11 @@ func demonstrateProxyPriority() {
 	resp, err := client.Get("https://httpbin.org/ip")
 	if err != nil {
 		fmt.Printf("\nRequest failed: %v\n", err)
-		fmt.Println("(Expected - no proxy running at 127.0.0.1:8080)\n ")
+		fmt.Println("(Expected - no proxy running at 127.0.0.1:8080)")
 		return
 	}
 	_ = resp
-	fmt.Println("Request succeeded through manual proxy\n ")
+	fmt.Println("Request succeeded through manual proxy")
 }
 
 // demonstrateProxyPool shows round-robin rotation across multiple proxies.
@@ -211,12 +214,13 @@ func demonstrateProxyPool() {
 	fmt.Printf("Proxy pool: %d proxies, round-robin strategy\n", len(config.Connection.ProxyPool))
 	fmt.Println("Each request rotates to the next proxy IP.")
 	fmt.Println("Dead proxies are auto-removed after 3 consecutive failures (circuit breaking).")
-	fmt.Println("Customize with ProxyFailureThreshold and ProxyCooldown.\n ")
+	fmt.Println("Customize with ProxyFailureThreshold and ProxyCooldown.")
+	fmt.Println("result.Meta.ProxyURL tells you which pool entry served each request (see Example 7).")
 
 	// Alternative: random strategy for less predictable distribution
 	fmt.Println("To use random selection instead, set ProxyPoolStrategy:")
 	fmt.Println(`  config.Connection.ProxyPoolStrategy = httpc.ProxyStrategyRandom`)
-	fmt.Println("  Random picks a healthy proxy uniformly — spreads load unpredictably.\n ")
+	fmt.Println("  Random picks a healthy proxy uniformly — spreads load unpredictably.")
 }
 
 // demonstrateStatusRotation shows proxy rotation triggered by HTTP status codes.
@@ -249,7 +253,7 @@ func demonstrateStatusRotation() {
 
 	fmt.Println("ProxyRotateOnStatus: [403]")
 	fmt.Println("On 403 -> retry -> next proxy IP (round-robin advances automatically)")
-	fmt.Println("Requires Retry.MaxRetries > 0 to take effect.\n ")
+	fmt.Println("Requires Retry.MaxRetries > 0 to take effect.")
 }
 
 // demonstratePerRequestRotation shows how to ensure each independent request
@@ -278,7 +282,24 @@ func demonstratePerRequestRotation() {
 
 	fmt.Println("ProxyRotatePerRequest: true")
 	fmt.Println("Each client.Get() call uses a different proxy IP.")
-	fmt.Println("Idle connections are closed between requests (no reuse).\n ")
+	fmt.Println("Idle connections are closed between requests (no reuse).")
+
+	// Verify which proxy served each request: Result.Meta.ProxyURL reports
+	// the pool entry selected for the final attempt of each request, and the
+	// IP-echo service reports the matching exit IP.
+	fmt.Println("Sending 3 requests to an IP-echo service (fails if the pool proxies are not running):")
+	for i := 1; i <= len(config.Connection.ProxyPool); i++ {
+		resp, err := client.Get("https://ipinfo.io/ip",
+			httpc.WithTimeout(10*time.Second),
+		)
+		if err != nil {
+			fmt.Printf("  request %d: failed: %v\n", i, err)
+			continue
+		}
+		fmt.Printf("  request %d: proxy=%s exit IP=%s\n",
+			i, resp.Meta.ProxyURL, strings.TrimSpace(resp.Body()))
+	}
+	fmt.Println()
 }
 
 // printSummary shows configuration summary and common use cases

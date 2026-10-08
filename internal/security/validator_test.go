@@ -1,6 +1,7 @@
 package security
 
 import (
+	"net"
 	"net/url"
 	"strings"
 	"testing"
@@ -12,8 +13,8 @@ import (
 // SECURITY VALIDATOR UNIT TESTS
 // ============================================================================
 
-func TestValidator_NewValidator(t *testing.T) {
-	validator := NewValidator()
+func TestValidator_newValidator(t *testing.T) {
+	validator := newValidator()
 	if validator == nil {
 		t.Fatal("Expected validator to be created")
 	}
@@ -34,10 +35,9 @@ func TestValidator_NewValidator(t *testing.T) {
 func TestNewValidatorWithConfig(t *testing.T) {
 	t.Run("CustomConfig", func(t *testing.T) {
 		cfg := &Config{
-			AllowPrivateIPs:     true,
-			MaxResponseBodySize: 10 * 1024 * 1024,
-			ValidateURL:         true,
-			ValidateHeaders:     true,
+			AllowPrivateIPs: true,
+			ValidateURL:     true,
+			ValidateHeaders: true,
 		}
 
 		validator := NewValidatorWithConfig(cfg)
@@ -55,7 +55,7 @@ func TestNewValidatorWithConfig(t *testing.T) {
 }
 
 func TestValidator_ValidateURL(t *testing.T) {
-	validator := NewValidator()
+	validator := newValidator()
 
 	tests := []struct {
 		name      string
@@ -151,7 +151,7 @@ func TestValidator_ValidateURL(t *testing.T) {
 }
 
 func TestValidator_ValidateHeaders(t *testing.T) {
-	validator := NewValidator()
+	validator := newValidator()
 
 	tests := []struct {
 		name      string
@@ -251,7 +251,7 @@ func TestValidator_ValidateHeaders(t *testing.T) {
 }
 
 func TestValidator_ValidateRequestSize(t *testing.T) {
-	validator := NewValidator()
+	validator := newValidator()
 	// Override max size for testing
 	validator.config.MaxRequestBodySize = 1024 // 1KB limit
 
@@ -315,10 +315,10 @@ func TestValidator_ValidateRequestSize(t *testing.T) {
 }
 
 // TestValidator_ValidateRequestSize_BodyTypes tests the size validation for url.Values
-// and *types.FormData body types, plus the MaxResponseBodySize<=0 early return path.
+// and *types.FormData body types, plus the MaxRequestBodySize<=0 early return path.
 func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 	t.Run("url.Values small", func(t *testing.T) {
-		validator := NewValidator()
+		validator := newValidator()
 		validator.config.MaxRequestBodySize = 1024
 
 		values := url.Values{"key": {"value"}}
@@ -331,7 +331,7 @@ func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 	})
 
 	t.Run("url.Values too large", func(t *testing.T) {
-		validator := NewValidator()
+		validator := newValidator()
 		validator.config.MaxRequestBodySize = 10
 
 		values := url.Values{"key": {strings.Repeat("a", 50)}}
@@ -344,7 +344,7 @@ func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 	})
 
 	t.Run("FormData small", func(t *testing.T) {
-		validator := NewValidator()
+		validator := newValidator()
 		validator.config.MaxRequestBodySize = 1024
 
 		form := &types.FormData{
@@ -360,7 +360,7 @@ func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 	})
 
 	t.Run("FormData too large", func(t *testing.T) {
-		validator := NewValidator()
+		validator := newValidator()
 		validator.config.MaxRequestBodySize = 5
 
 		form := &types.FormData{
@@ -375,7 +375,7 @@ func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 	})
 
 	t.Run("FormData files too large", func(t *testing.T) {
-		validator := NewValidator()
+		validator := newValidator()
 		validator.config.MaxRequestBodySize = 10
 
 		form := &types.FormData{
@@ -388,42 +388,10 @@ func TestValidator_ValidateRequestSize_BodyTypes(t *testing.T) {
 			t.Error("expected error for oversized FormData files")
 		}
 	})
-
-	t.Run("MaxResponseBodySize zero skips validation", func(t *testing.T) {
-		validator := NewValidator()
-		validator.config.MaxResponseBodySize = 0
-
-		req := &Request{
-			Method: "POST",
-			URL:    "http://example.com",
-			Body:   strings.Repeat("a", 100000),
-		}
-
-		err := validator.ValidateRequest(req)
-		if err != nil {
-			t.Errorf("expected no error when MaxResponseBodySize is zero, got: %v", err)
-		}
-	})
-
-	t.Run("MaxResponseBodySize negative skips validation", func(t *testing.T) {
-		validator := NewValidator()
-		validator.config.MaxResponseBodySize = -1
-
-		req := &Request{
-			Method: "POST",
-			URL:    "http://example.com",
-			Body:   strings.Repeat("a", 100000),
-		}
-
-		err := validator.ValidateRequest(req)
-		if err != nil {
-			t.Errorf("expected no error when MaxResponseBodySize is negative, got: %v", err)
-		}
-	})
 }
 
 func TestValidator_DisabledValidation(t *testing.T) {
-	validator := NewValidator()
+	validator := newValidator()
 	// Disable validation for testing
 	validator.config.ValidateURL = false
 	validator.config.ValidateHeaders = false
@@ -444,7 +412,7 @@ func TestValidator_DisabledValidation(t *testing.T) {
 }
 
 func TestValidator_ComplexScenarios(t *testing.T) {
-	validator := NewValidator()
+	validator := newValidator()
 
 	t.Run("Valid complex request", func(t *testing.T) {
 		req := &Request{
@@ -483,7 +451,7 @@ func TestValidator_ComplexScenarios(t *testing.T) {
 }
 
 func TestValidator_SpecialCharacters(t *testing.T) {
-	validator := NewValidator()
+	validator := newValidator()
 
 	tests := []struct {
 		name    string
@@ -527,10 +495,9 @@ func TestValidator_SpecialCharacters(t *testing.T) {
 
 func TestValidateHost_EdgeCases(t *testing.T) {
 	validator := NewValidatorWithConfig(&Config{
-		ValidateURL:         true,
-		ValidateHeaders:     true,
-		MaxResponseBodySize: 50 * 1024 * 1024,
-		AllowPrivateIPs:     false,
+		ValidateURL:     true,
+		ValidateHeaders: true,
+		AllowPrivateIPs: false,
 	})
 
 	tests := []struct {
@@ -608,7 +575,7 @@ func TestValidator_ValidateCommonHeaderValue(t *testing.T) {
 }
 
 func TestValidateHeader_EdgeCases(t *testing.T) {
-	validator := NewValidator()
+	validator := newValidator()
 
 	tests := []struct {
 		name      string
@@ -665,43 +632,17 @@ func TestValidateURL_WithAllowPrivateIPs(t *testing.T) {
 	}
 }
 
-// TestValidateRequestBodySize_UrlValues verifies that url.Values body size
-// is checked against MaxRequestBodySize when set.
-func TestValidateRequestBodySize_UrlValues(t *testing.T) {
-	validator := NewValidatorWithConfig(&Config{
-		ValidateURL:         true,
-		ValidateHeaders:     true,
-		MaxRequestBodySize:  10,
-		MaxResponseBodySize: 50 * 1024 * 1024,
-		AllowPrivateIPs:     true,
-	})
-
-	values := url.Values{"key": []string{strings.Repeat("x", 200)}}
-	req := &Request{
-		Method: "POST",
-		URL:    "http://example.com",
-		Body:   values,
-	}
-
-	err := validator.ValidateRequest(req)
-	if err == nil {
-		t.Fatal("expected error for oversized url.Values body, got nil")
-	}
-	if !strings.Contains(err.Error(), "exceeds limit") {
-		t.Errorf("error should mention body size limit, got: %v", err)
-	}
-}
+// TestValidateRequestBodySize_UrlValues was removed: the "url.Values too large"
+// subtest of TestValidator_ValidateRequestSize asserts the identical path.
 
 // TestValidateRequestBodySize_ZeroLimitNoValidation verifies that when
-// MaxRequestBodySize is zero, no request-body size validation is performed
-// (there is intentionally NO fallback to MaxResponseBodySize).
+// MaxRequestBodySize is zero, no request-body size validation is performed.
 func TestValidateRequestBodySize_ZeroLimitNoValidation(t *testing.T) {
 	validator := NewValidatorWithConfig(&Config{
-		ValidateURL:         true,
-		ValidateHeaders:     true,
-		MaxRequestBodySize:  0,
-		MaxResponseBodySize: 100,
-		AllowPrivateIPs:     true,
+		ValidateURL:        true,
+		ValidateHeaders:    true,
+		MaxRequestBodySize: 0,
+		AllowPrivateIPs:    true,
 	})
 
 	req := &Request{
@@ -716,33 +657,9 @@ func TestValidateRequestBodySize_ZeroLimitNoValidation(t *testing.T) {
 	}
 }
 
-// TestValidateHost_AllowPrivateIPsFastReturn verifies that validateHost
-// returns nil immediately for any host when AllowPrivateIPs is true.
-func TestValidateHost_AllowPrivateIPsFastReturn(t *testing.T) {
-	validator := NewValidatorWithConfig(&Config{
-		ValidateURL:     true,
-		ValidateHeaders: true,
-		AllowPrivateIPs: true,
-	})
-
-	hosts := []string{
-		"localhost",
-		"127.0.0.1",
-		"192.168.1.1",
-		"10.0.0.1",
-		"169.254.169.254",
-		"example.com",
-	}
-
-	for _, host := range hosts {
-		t.Run(host, func(t *testing.T) {
-			err := validator.validateHost(host, nil)
-			if err != nil {
-				t.Errorf("validateHost(%q) expected nil with AllowPrivateIPs=true, got: %v", host, err)
-			}
-		})
-	}
-}
+// TestValidateHost_AllowPrivateIPsFastReturn was removed: it tested the
+// implementation shortcut (fast return) rather than behavior; URL-level
+// AllowPrivateIPs outcomes are asserted by TestValidateURL_WithAllowPrivateIPs.
 
 // TestValidatorCacheConcurrency verifies that concurrent URL validation
 // does not create duplicate entries in the urlKeys slice.
@@ -842,4 +759,109 @@ func TestValidateURL_OverrideDoesNotPoisonCache(t *testing.T) {
 	if err := validator.validateURL(localhost, nil); err == nil {
 		t.Error("SECURITY ISSUE: validateURL without override must still block localhost after an override-allowed validation (cache poisoned)")
 	}
+}
+
+// TestValidateURL_IPv6Hosts pins SSRF handling for bracketed IPv6 literals.
+// Layering note: a bracketed IPv6 host WITH a port is rejected here at URL
+// validation. A BARE bracketed literal (no port) is not matched by
+// net.ParseIP in ValidateSSRFHost, so it passes URL validation and is blocked
+// by the connection dialer instead (see TestResolveAndValidateAddress in
+// internal/connection). If the URL layer is ever taught to strip brackets,
+// tighten the second subtest to expect an error.
+func TestValidateURL_IPv6Hosts(t *testing.T) {
+	validator := NewValidatorWithConfig(&Config{
+		ValidateURL:     true,
+		ValidateHeaders: true,
+	})
+
+	t.Run("IPv6 loopback with port blocked at URL validation", func(t *testing.T) {
+		if err := validator.validateURL("http://[::1]:8080/", nil); err == nil {
+			t.Error("expected error for IPv6 loopback URL with port")
+		}
+	})
+
+	t.Run("IPv6 unique-local with port blocked at URL validation", func(t *testing.T) {
+		if err := validator.validateURL("http://[fd00::1]:443/", nil); err == nil {
+			t.Error("expected error for unique-local IPv6 URL with port")
+		}
+	})
+
+	t.Run("bare bracketed IPv6 deferred to dialer validation", func(t *testing.T) {
+		if err := validator.validateURL("http://[::1]/", nil); err != nil {
+			t.Logf("URL layer now blocks bare bracketed IPv6 (improvement landed): %v", err)
+		}
+		// No error assertion: current contract defers portless bracketed
+		// literals to the dialer-level SSRF check.
+	})
+}
+
+// TestNewValidatorWithConfig_ExemptNetsDeepCopy pins the defensive-copy
+// contract of NewValidatorWithConfig: the validator must own its snapshot of
+// ExemptNets — mutating (or nil-ing) the caller's *net.IPNet entries after
+// construction must not affect validation, and nil entries must be tolerated.
+func TestNewValidatorWithConfig_ExemptNetsDeepCopy(t *testing.T) {
+	_, exemptNet, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	cfg := &Config{
+		ValidateURL:     true,
+		AllowPrivateIPs: false,
+		ExemptNets:      []*net.IPNet{exemptNet, nil},
+	}
+
+	validator := NewValidatorWithConfig(cfg)
+
+	// The exempt range must allow the otherwise-blocked private IP.
+	if err := validator.validateURL("http://10.1.2.3/x", nil); err != nil {
+		t.Fatalf("exempted 10/8 address rejected: %v", err)
+	}
+
+	// Caller mutates its IPNet after construction — validator must be immune.
+	exemptNet.IP = net.ParseIP("192.0.2.0")
+	exemptNet.Mask = net.CIDRMask(32, 32)
+	if err := validator.validateURL("http://10.1.2.3/x", nil); err != nil {
+		t.Fatalf("validator captured caller-owned IPNet by reference: %v", err)
+	}
+}
+
+// TestValidator_ValidateURL_CacheBehavior covers the URL-validation cache
+// branches: the hit fast path, and the two bypass conditions (per-request
+// override; userinfo embedded in the URL must not be cached).
+func TestValidator_ValidateURL_CacheBehavior(t *testing.T) {
+	t.Run("second validation hits the cache", func(t *testing.T) {
+		v := newValidator()
+		if err := v.validateURL("https://cache.example.com/a", nil); err != nil {
+			t.Fatalf("first validation: %v", err)
+		}
+		if _, ok := v.validatedURLs.Load("https://cache.example.com/a"); !ok {
+			t.Fatal("validated URL was not cached")
+		}
+		// Hit path must return nil without re-validation.
+		if err := v.validateURL("https://cache.example.com/a", nil); err != nil {
+			t.Fatalf("cache-hit validation: %v", err)
+		}
+	})
+
+	t.Run("per-request override bypasses the cache", func(t *testing.T) {
+		v := newValidator()
+		allow := true
+		// Override path: must not read or write the cache.
+		if err := v.validateURL("https://override.example.com/a", &allow); err != nil {
+			t.Fatalf("override validation: %v", err)
+		}
+		if _, ok := v.validatedURLs.Load("https://override.example.com/a"); ok {
+			t.Error("override validation must not populate the cache")
+		}
+	})
+
+	t.Run("URL with userinfo is not cached", func(t *testing.T) {
+		v := newValidator()
+		if err := v.validateURL("https://user:pass@userinfo.example.com/a", nil); err != nil {
+			t.Fatalf("userinfo validation: %v", err)
+		}
+		if _, ok := v.validatedURLs.Load("https://user:pass@userinfo.example.com/a"); ok {
+			t.Error("credentialed URL must not be cached")
+		}
+	})
 }

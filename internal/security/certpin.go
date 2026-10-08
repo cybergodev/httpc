@@ -4,9 +4,8 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -70,17 +69,6 @@ func newPublicKeyPinner(publicKeys ...[]byte) (*publicKeyPinner, error) {
 	return &publicKeyPinner{inner: inner}, nil
 }
 
-// newPublicKeyPinnerFromBase64 creates a new pinner from base64-encoded public key hashes.
-// Each hash should be the SHA-256 hash of the DER-encoded public key, base64-encoded.
-// Returns an error if no valid hashes are provided.
-func newPublicKeyPinnerFromBase64(hashes ...string) (*publicKeyPinner, error) {
-	inner, err := newSPKIHashPinner(hashes...)
-	if err != nil {
-		return nil, fmt.Errorf("no valid SPKI hashes provided: %w", err)
-	}
-	return &publicKeyPinner{inner: inner}, nil
-}
-
 // Pin returns a description of the pinned public keys.
 func (p *publicKeyPinner) Pin() string {
 	if p == nil || p.inner == nil {
@@ -92,7 +80,9 @@ func (p *publicKeyPinner) Pin() string {
 // VerifyPeerCertificate verifies that one of the peer certificates matches a pinned public key.
 func (p *publicKeyPinner) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	if p == nil || p.inner == nil {
-		return nil
+		// Fail closed (see spkiHashPinner.VerifyPeerCertificate): a pinner
+		// without pins must not silently disable pinning.
+		return fmt.Errorf("certificate pinning failed: no pins configured")
 	}
 	return p.inner.VerifyPeerCertificate(rawCerts, verifiedChains)
 }
@@ -108,7 +98,7 @@ type spkiHashPinner struct {
 	hashes      map[string]bool // Base64-encoded SHA-256 hashes of SPKI
 	mu          sync.RWMutex
 	pinCache    map[string]string // fingerprint -> base64(SPKI hash)
-	pinCacheOrd []string          // insertion order for LRU eviction
+	pinCacheOrd []string          // insertion order for FIFO eviction (cache hits do not refresh position)
 }
 
 // newSPKIHashPinner creates a new SPKI pinner from base64-encoded SHA-256 hashes.
@@ -134,9 +124,16 @@ func newSPKIHashPinner(hashes ...string) (*spkiHashPinner, error) {
 			continue
 		}
 
-		// Validate the hash is valid base64
-		if _, err := base64.StdEncoding.DecodeString(h); err != nil {
+		// Validate the hash is valid base64 of exactly 32 bytes (SHA-256).
+		// A decodable-but-wrong-length value (e.g. a truncated or doubled
+		// hash) pins nothing and fails every connection with a confusing
+		// "no matching SPKI hash" — reject it at construction instead.
+		decoded, err := base64.StdEncoding.DecodeString(h)
+		if err != nil {
 			return nil, fmt.Errorf("invalid base64 hash '%s': %w", h, err)
+		}
+		if len(decoded) != sha256.Size {
+			return nil, fmt.Errorf("invalid SPKI hash '%s': decoded %d bytes, want %d (SHA-256)", h, len(decoded), sha256.Size)
 		}
 
 		p.hashes[h] = true
@@ -158,17 +155,62 @@ func (p *spkiHashPinner) Pin() string {
 }
 
 // VerifyPeerCertificate verifies that one of the peer certificates matches a pinned SPKI hash.
-func (p *spkiHashPinner) VerifyPeerCertificate(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+//
+// TRUST MODEL: a pin is only honored on certificates that are bound to the
+// connection — never on arbitrary extra certificates the server chose to
+// append to its presented chain. A MITM can download the victim's real
+// (public) certificate and stuff it into its own chain; scanning all of
+// rawCerts would then match the pin while the handshake proceeds with the
+// attacker's key ("pin stuffing"). Therefore:
+//
+//   - verifiedChains != nil (standard verification ran): only certificates
+//     appearing in a verified chain are eligible. This keeps legitimate CA /
+//     intermediate pinning working — those certs are part of the verified
+//     chain — while a stuffed cert that was never verified is not.
+//   - verifiedChains == nil (InsecureSkipVerify mode, where pinning is the
+//     sole verification gate; see connection.PoolManager): only rawCerts[0],
+//     the leaf whose key actually keys the handshake, is eligible. Pinning a
+//     CA/intermediate is not supported in that mode.
+func (p *spkiHashPinner) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	if p == nil || len(p.hashes) == 0 {
-		return nil // No pins configured
+		// Fail closed: a pinner with no pins must not silently disable
+		// pinning. The constructors reject empty inputs, so this guards
+		// against future misuse (zero-value or emptied pinner).
+		return fmt.Errorf("certificate pinning failed: no pins configured")
 	}
 
 	if len(rawCerts) == 0 {
 		return fmt.Errorf("no peer certificates provided")
 	}
 
-	// Check each certificate in the chain
-	for _, rawCert := range rawCerts {
+	// Restrict the scan to connection-bound certificates (see TRUST MODEL).
+	var eligible [][]byte
+	if verifiedChains != nil {
+		verified := make(map[string]bool, len(verifiedChains)*2)
+		for _, chain := range verifiedChains {
+			for _, cert := range chain {
+				verified[string(cert.Raw)] = true
+			}
+		}
+		// Fresh slice, NOT an in-place filter: rawCerts is owned by crypto/tls
+		// (and may be retained by a chained VerifyPeerCertificate callback —
+		// see pool.createTLSConfig), so compacting its backing array here
+		// would be a caller-visible mutation.
+		eligible = make([][]byte, 0, len(rawCerts))
+		for _, rawCert := range rawCerts {
+			if verified[string(rawCert)] {
+				eligible = append(eligible, rawCert)
+			}
+		}
+		if len(eligible) == 0 {
+			return fmt.Errorf("certificate pinning failed: none of the presented certificates are part of a verified chain")
+		}
+	} else {
+		eligible = rawCerts[:1] // leaf only — see TRUST MODEL
+	}
+
+	// Check each eligible certificate
+	for _, rawCert := range eligible {
 		// Compute a fingerprint of the raw DER for cache lookup.
 		// Use the full 32-byte SHA-256 digest: a truncated key (e.g. 8 bytes / 64
 		// bits) risks collisions under a large or attacker-influenced cert set, in
@@ -194,14 +236,12 @@ func (p *spkiHashPinner) VerifyPeerCertificate(rawCerts [][]byte, _ [][]*x509.Ce
 			continue // Skip invalid certificates
 		}
 
-		// Get the SPKI bytes
-		spkiBytes, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-		if err != nil {
-			continue // Skip certificates with unsupported key types
-		}
-
-		// Hash the SPKI
-		hash := sha256.Sum256(spkiBytes)
+		// Hash the raw SubjectPublicKeyInfo bytes exactly as they appear in
+		// the certificate. Re-serializing the parsed key (MarshalPKIXPublicKey)
+		// can produce different DER for certificates with non-canonical
+		// AlgorithmIdentifier parameters, which would falsely reject pins
+		// generated by the documented openssl command.
+		hash := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
 		hashStr := base64.StdEncoding.EncodeToString(hash[:])
 
 		// Cache the computed hash for future lookups
@@ -260,57 +300,25 @@ func (c *certificatePinnerChain) Pin() string {
 // Returns nil if ANY pinner accepts the certificate.
 func (c *certificatePinnerChain) VerifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
 	if c == nil || len(c.pinners) == 0 {
-		return nil // No pinners means no pinning
+		// Fail closed: an empty chain accepts NOTHING (matching the public
+		// NewCertificatePinnerChain doc), not everything. A nil return here
+		// would silently disable pinning for every connection.
+		return fmt.Errorf("certificate pinning failed: no pinners configured")
 	}
 
-	var lastErr error
+	var errs error
 	for _, pinner := range c.pinners {
 		err := pinner.VerifyPeerCertificate(rawCerts, verifiedChains)
 		if err == nil {
 			return nil // Match found
 		}
-		lastErr = err
+		errs = errors.Join(errs, err)
 	}
 
-	if lastErr != nil {
-		return lastErr
+	if errs != nil {
+		return errs
 	}
+	// Unreachable when len(pinners) > 0 (the loop either returned nil or
+	// joined at least one error); kept as a fail-closed default.
 	return fmt.Errorf("certificate pinning failed: no pinner matched")
-}
-
-// noOpPinner accepts all certificates. For testing only.
-// In production environments, VerifyPeerCertificate returns an error to prevent
-// accidental use of this no-op pinner, which disables certificate pinning entirely.
-type noOpPinner struct{}
-
-// Pin returns "no-op" to indicate no pinning.
-func (n *noOpPinner) Pin() string {
-	return "no-op"
-}
-
-// VerifyPeerCertificate returns nil in test environments. In all other
-// environments, it returns an error to prevent accidental use in production,
-// as this pinner disables certificate verification.
-func (n *noOpPinner) VerifyPeerCertificate(_ [][]byte, _ [][]*x509.Certificate) error {
-	if !isTestEnvironment() {
-		return fmt.Errorf("SECURITY: noOpPinner used outside test environment - certificate pinning is DISABLED; this is a security violation")
-	}
-	return nil
-}
-
-// isTestEnvironment detects if the code is running in a test environment.
-// Consistent with the detection logic in the httpc package.
-//
-// SECURITY: Detection is based ONLY on the compiled test-binary name. We
-// deliberately do NOT honor GO_TEST / GOTEST environment variables: any
-// operator (or attacker controlling the process environment) could otherwise
-// flip them and silently disable certificate pinning via noOpPinner.
-func isTestEnvironment() bool {
-	executable := filepath.Base(os.Args[0])
-	if strings.HasSuffix(executable, ".test") ||
-		strings.HasSuffix(executable, ".test.exe") ||
-		strings.Contains(executable, ".test.") {
-		return true
-	}
-	return false
 }

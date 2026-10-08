@@ -217,30 +217,9 @@ func TestSPKIHashPinner(t *testing.T) {
 		t.Fatalf("failed to marshal public key: %v", err)
 	}
 
-	t.Run("newSPKIHashPinner valid", func(t *testing.T) {
-		hash := base64.StdEncoding.EncodeToString([]byte("test-hash-32-bytes-long-enough!!"))
-		pinner, err := newSPKIHashPinner(hash)
-		if err != nil {
-			t.Errorf("expected no error, got %v", err)
-		}
-		if pinner == nil {
-			t.Fatal("expected non-nil pinner")
-		}
-	})
-
-	t.Run("newSPKIHashPinner invalid base64", func(t *testing.T) {
-		_, err := newSPKIHashPinner("not-valid-base64!!!")
-		if err == nil {
-			t.Error("expected error for invalid base64")
-		}
-	})
-
-	t.Run("newSPKIHashPinner empty", func(t *testing.T) {
-		_, err := newSPKIHashPinner()
-		if err == nil {
-			t.Error("expected error for empty hashes")
-		}
-	})
+	// newSPKIHashPinner construction (valid/invalid-base64/empty) is covered
+	// by TestExportedConstructors (exported wrappers) and
+	// TestSPKIHashPinnerConstruction (real certificate keys) — no third copy here.
 
 	t.Run("Pin description", func(t *testing.T) {
 		hash := base64.StdEncoding.EncodeToString([]byte("test-hash-32-bytes-long-enough!!"))
@@ -265,7 +244,8 @@ func TestSPKIHashPinner(t *testing.T) {
 	})
 
 	t.Run("VerifyPeerCertificate non-matching", func(t *testing.T) {
-		hash := base64.StdEncoding.EncodeToString([]byte("not-the-correct-hash-32-bytes!"))
+		wrong := sha256.Sum256([]byte("not-the-correct-hash"))
+		hash := base64.StdEncoding.EncodeToString(wrong[:])
 		pinner, _ := newSPKIHashPinner(hash)
 		err := pinner.VerifyPeerCertificate([][]byte{certDER}, nil)
 		if err == nil {
@@ -273,11 +253,58 @@ func TestSPKIHashPinner(t *testing.T) {
 		}
 	})
 
-	t.Run("nil pinner", func(t *testing.T) {
+	t.Run("nil pinner fails closed", func(t *testing.T) {
 		var pinner *spkiHashPinner
 		err := pinner.VerifyPeerCertificate([][]byte{certDER}, nil)
+		if err == nil {
+			t.Error("nil pinner must reject (fail closed), got nil error")
+		}
+	})
+
+	t.Run("pin stuffing: unverified chain cert must not satisfy pin", func(t *testing.T) {
+		// A MITM presents [attacker-leaf, victim-real-cert] (the victim cert
+		// is publicly downloadable). The pin targets the victim's key.
+		victimDER, victimCert, _ := generateTestCertificate(t)
+		victimSPKI := sha256.Sum256(victimCert.RawSubjectPublicKeyInfo)
+		pin := base64.StdEncoding.EncodeToString(victimSPKI[:])
+		pinner, err := newSPKIHashPinner(pin)
 		if err != nil {
-			t.Errorf("nil pinner should allow all, got error: %v", err)
+			t.Fatalf("newSPKIHashPinner failed: %v", err)
+		}
+
+		// InsecureSkipVerify mode: only the leaf is eligible, so a pin on the
+		// stuffed victim cert must fail even though rawCerts contains it.
+		err = pinner.VerifyPeerCertificate([][]byte{certDER, victimDER}, nil)
+		if err == nil {
+			t.Error("expected error: stuffed chain cert must not satisfy pin in leaf-only mode")
+		}
+
+		// Verification-on mode: attacker leaf is verified (self-signed test
+		// chain), victim cert is NOT part of any verified chain — pin must fail.
+		err = pinner.VerifyPeerCertificate(
+			[][]byte{certDER, victimDER},
+			[][]*x509.Certificate{{cert}},
+		)
+		if err == nil {
+			t.Error("expected error: cert outside verified chains must not satisfy pin")
+		}
+	})
+
+	t.Run("verified-chain pin: intermediate in verified chain satisfies pin", func(t *testing.T) {
+		// Legitimate CA/intermediate pinning: the pinned cert appears in the
+		// verified chain, so the pin must succeed.
+		spki := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
+		pin := base64.StdEncoding.EncodeToString(spki[:])
+		pinner, err := newSPKIHashPinner(pin)
+		if err != nil {
+			t.Fatalf("newSPKIHashPinner failed: %v", err)
+		}
+		err = pinner.VerifyPeerCertificate(
+			[][]byte{certDER},
+			[][]*x509.Certificate{{cert}},
+		)
+		if err != nil {
+			t.Errorf("expected verified-chain pin match to succeed, got %v", err)
 		}
 	})
 }
@@ -289,11 +316,11 @@ func TestCertificatePinnerChain(t *testing.T) {
 		t.Fatalf("failed to marshal public key: %v", err)
 	}
 
-	t.Run("nil chain", func(t *testing.T) {
+	t.Run("nil chain fails closed", func(t *testing.T) {
 		var chain *certificatePinnerChain
 		err := chain.VerifyPeerCertificate([][]byte{certDER}, nil)
-		if err != nil {
-			t.Errorf("nil chain should allow all, got error: %v", err)
+		if err == nil {
+			t.Error("nil chain must reject (fail closed), got nil error")
 		}
 	})
 
@@ -342,43 +369,17 @@ func TestCertificatePinnerChain(t *testing.T) {
 	})
 }
 
-func TestNoOpPinner(t *testing.T) {
-	certDER, _, _ := generateTestCertificate(t)
-
-	pinner := &noOpPinner{}
-
-	t.Run("Pin", func(t *testing.T) {
-		if pinner.Pin() != "no-op" {
-			t.Errorf("Pin() = %q, want %q", pinner.Pin(), "no-op")
-		}
-	})
-
-	t.Run("VerifyPeerCertificate", func(t *testing.T) {
-		err := pinner.VerifyPeerCertificate([][]byte{certDER}, nil)
-		if err != nil {
-			t.Errorf("noOpPinner should allow all, got error: %v", err)
-		}
-	})
-
-	t.Run("VerifyPeerCertificate nil", func(t *testing.T) {
-		err := pinner.VerifyPeerCertificate(nil, nil)
-		if err != nil {
-			t.Errorf("noOpPinner should allow all even nil, got error: %v", err)
-		}
-	})
-}
-
-func TestPublicKeyPinnerFromBase64(t *testing.T) {
+// TestSPKIHashPinnerConstruction covers base64 SPKI-hash construction and
+// verification semantics (replaces the former newPublicKeyPinnerFromBase64
+// tests; the hash is computed from the raw SPKI bytes, matching the verify
+// path since the M23 fix).
+func TestSPKIHashPinnerConstruction(t *testing.T) {
 	certDER, cert, _ := generateTestCertificate(t)
-	spkiBytes, err := x509.MarshalPKIXPublicKey(cert.PublicKey)
-	if err != nil {
-		t.Fatalf("failed to marshal public key: %v", err)
-	}
-	spkiHash := sha256.Sum256(spkiBytes)
+	spkiHash := sha256.Sum256(cert.RawSubjectPublicKeyInfo)
 	spkiHashBase64 := base64.StdEncoding.EncodeToString(spkiHash[:])
 
 	t.Run("valid hash", func(t *testing.T) {
-		pinner, err := newPublicKeyPinnerFromBase64(spkiHashBase64)
+		pinner, err := newSPKIHashPinner(spkiHashBase64)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -391,8 +392,9 @@ func TestPublicKeyPinnerFromBase64(t *testing.T) {
 	})
 
 	t.Run("multiple hashes", func(t *testing.T) {
-		hash2 := base64.StdEncoding.EncodeToString([]byte("another-hash-32-bytes-long-enough!"))
-		pinner, err := newPublicKeyPinnerFromBase64(spkiHashBase64, hash2)
+		second := sha256.Sum256([]byte("another-spki-hash"))
+		hash2 := base64.StdEncoding.EncodeToString(second[:])
+		pinner, err := newSPKIHashPinner(spkiHashBase64, hash2)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -402,14 +404,14 @@ func TestPublicKeyPinnerFromBase64(t *testing.T) {
 	})
 
 	t.Run("empty hash returns error", func(t *testing.T) {
-		_, err := newPublicKeyPinnerFromBase64("")
+		_, err := newSPKIHashPinner("")
 		if err == nil {
 			t.Error("expected error for empty hash")
 		}
 	})
 
 	t.Run("whitespace hash is trimmed", func(t *testing.T) {
-		pinner, err := newPublicKeyPinnerFromBase64("  " + spkiHashBase64 + "  ")
+		pinner, err := newSPKIHashPinner("  " + spkiHashBase64 + "  ")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -419,7 +421,7 @@ func TestPublicKeyPinnerFromBase64(t *testing.T) {
 	})
 
 	t.Run("verify matching certificate", func(t *testing.T) {
-		pinner, err := newPublicKeyPinnerFromBase64(spkiHashBase64)
+		pinner, err := newSPKIHashPinner(spkiHashBase64)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -430,8 +432,9 @@ func TestPublicKeyPinnerFromBase64(t *testing.T) {
 	})
 
 	t.Run("verify non-matching certificate", func(t *testing.T) {
-		wrongHash := base64.StdEncoding.EncodeToString([]byte("wrong-hash-32-bytes-long-enough!!"))
-		pinner, err := newPublicKeyPinnerFromBase64(wrongHash)
+		wrong := sha256.Sum256([]byte("wrong-hash"))
+		wrongHash := base64.StdEncoding.EncodeToString(wrong[:])
+		pinner, err := newSPKIHashPinner(wrongHash)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -441,11 +444,19 @@ func TestPublicKeyPinnerFromBase64(t *testing.T) {
 		}
 	})
 
-	t.Run("nil pinner", func(t *testing.T) {
+	t.Run("wrong-length hash rejected at construction", func(t *testing.T) {
+		notSHA256 := base64.StdEncoding.EncodeToString([]byte("wrong-hash-32-bytes-long-enough!!")) // 33 bytes
+		_, err := newSPKIHashPinner(notSHA256)
+		if err == nil {
+			t.Error("expected error for non-32-byte hash")
+		}
+	})
+
+	t.Run("nil pinner fails closed", func(t *testing.T) {
 		var pinner *publicKeyPinner
 		err := pinner.VerifyPeerCertificate([][]byte{certDER}, nil)
-		if err != nil {
-			t.Errorf("nil pinner should allow all, got error: %v", err)
+		if err == nil {
+			t.Error("nil pinner must reject (fail closed), got nil error")
 		}
 	})
 }
@@ -453,7 +464,8 @@ func TestPublicKeyPinnerFromBase64(t *testing.T) {
 // TestPinCacheEviction verifies that the certificate pin cache evicts entries
 // when it exceeds pinCacheMaxSize, preventing unbounded memory growth.
 func TestPinCacheEviction(t *testing.T) {
-	hash := base64.StdEncoding.EncodeToString([]byte("test-hash-32-bytes-long-enough!!"))
+	digest := sha256.Sum256([]byte("test-hash"))
+	hash := base64.StdEncoding.EncodeToString(digest[:])
 	pinner, err := newSPKIHashPinner(hash)
 	if err != nil {
 		t.Fatalf("newSPKIHashPinner failed: %v", err)
@@ -473,4 +485,51 @@ func TestPinCacheEviction(t *testing.T) {
 	if cacheSize > pinCacheMaxSize {
 		t.Errorf("pinCache grew to %d entries, expected max ~%d", cacheSize, pinCacheMaxSize)
 	}
+}
+
+// TestPinnerPin_NoPins pins the nil/empty-contract of the three Pin()
+// implementations: an unusable pinner must describe itself as "no-pins"
+// rather than panic or report a pin count.
+func TestPinnerPin_NoPins(t *testing.T) {
+	t.Run("nil spki hash pinner", func(t *testing.T) {
+		var p *spkiHashPinner
+		if got := p.Pin(); got != "no-pins" {
+			t.Errorf("nil spkiHashPinner.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("spki hash pinner without hashes", func(t *testing.T) {
+		p := &spkiHashPinner{hashes: map[string]bool{}}
+		if got := p.Pin(); got != "no-pins" {
+			t.Errorf("empty spkiHashPinner.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("nil public key pinner", func(t *testing.T) {
+		var p *publicKeyPinner
+		if got := p.Pin(); got != "no-pins" {
+			t.Errorf("nil publicKeyPinner.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("public key pinner without inner", func(t *testing.T) {
+		p := &publicKeyPinner{}
+		if got := p.Pin(); got != "no-pins" {
+			t.Errorf("innerless publicKeyPinner.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("nil pinner chain", func(t *testing.T) {
+		var c *certificatePinnerChain
+		if got := c.Pin(); got != "no-pins" {
+			t.Errorf("nil certificatePinnerChain.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("empty pinner chain", func(t *testing.T) {
+		c := &certificatePinnerChain{}
+		if got := c.Pin(); got != "no-pins" {
+			t.Errorf("empty certificatePinnerChain.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
 }

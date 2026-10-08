@@ -49,25 +49,25 @@ func TestDoHBodyDrain(t *testing.T) {
 						w.Header().Set("Content-Type", tt.firstContentType)
 					}
 					w.WriteHeader(tt.firstStatus)
-					w.Write([]byte(tt.firstBody))
+					_, _ = w.Write([]byte(tt.firstBody)) // best-effort test response
 					return
 				}
 
 				// Valid JSON response on second request
 				w.Header().Set("Content-Type", "application/dns-json")
 				w.WriteHeader(http.StatusOK)
-				w.Write([]byte(`{"Status":0,"Answer":[{"name":"test.local","type":1,"data":"1.2.3.4"}]}`))
+				_, _ = w.Write([]byte(`{"Status":0,"Answer":[{"name":"test.local","type":1,"data":"1.2.3.4"}]}`)) // best-effort test response
 			}))
 			defer server.Close()
 
-			provider := &DoHProvider{
+			provider := &dohProvider{
 				Name:     "test",
 				Template: server.URL + "/dns-query?name={name}&type=A",
 				Priority: 1,
 			}
 
-			resolver := NewDoHResolver([]*DoHProvider{provider}, 5*time.Minute)
-			defer resolver.Close()
+			resolver := NewDoHResolver([]*dohProvider{provider}, 5*time.Minute)
+			defer func() { _ = resolver.Close() }()
 
 			// First request fails (error status or invalid JSON) → body must be drained.
 			_, _ = resolver.LookupIPAddr(context.Background(), "test.local")

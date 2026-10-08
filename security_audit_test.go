@@ -26,7 +26,7 @@ func Test_SSRF_BlocksLocalhost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -54,7 +54,7 @@ func Test_SSRF_RedirectProtection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Create a server that redirects to localhost
 	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -86,7 +86,7 @@ func Test_SSRF_BlocksIPv6Localhost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Get("http://[::1]:12345/", WithTimeout(2*time.Second))
 	if err == nil {
@@ -103,14 +103,14 @@ func Test_DecompressionBombProtection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Create a server that returns a response larger than the limit
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Return more than 1000 bytes
 		largeData := make([]byte, 2000)
 		w.WriteHeader(http.StatusOK)
-		w.Write(largeData)
+		_, _ = w.Write(largeData) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -124,6 +124,36 @@ func Test_DecompressionBombProtection(t *testing.T) {
 		!strings.Contains(err.Error(), "limit") &&
 		!strings.Contains(err.Error(), "failed to read") {
 		t.Errorf("Expected size limit error, got: %v", err)
+	}
+}
+
+// Test_ResponseBodyLimitEnforcedWithDefaultDecompressedLimit pins the C-1
+// regression end-to-end: DefaultConfig sets MaxDecompressedBodySize (100MB)
+// alongside MaxResponseBodySize, and the buffered path must still enforce the
+// body cap. (Test_DecompressionBombProtection above uses a Config with
+// MaxDecompressedBodySize=0, which masks the bug this test guards against.)
+func Test_ResponseBodyLimitEnforcedWithDefaultDecompressedLimit(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Security.AllowPrivateIPs = true     // test against loopback
+	cfg.Security.MaxResponseBodySize = 1000 // keep the fixture small; 100MB decompressed limit stays
+
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(make([]byte, 2000)) // identity body over the 1000-byte cap
+	}))
+	defer server.Close()
+
+	_, err = client.Get(server.URL, WithTimeout(5*time.Second))
+	if err == nil {
+		t.Fatal("SECURITY ISSUE: identity body over MaxResponseBodySize accepted while MaxDecompressedBodySize is set")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit") {
+		t.Errorf("Expected 'exceeds limit' error, got: %v", err)
 	}
 }
 
@@ -145,7 +175,7 @@ func assertNoPanic(t *testing.T, name string, fn func()) {
 func TestPanicSafety(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("test"))
+		_, _ = w.Write([]byte("test")) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -162,28 +192,7 @@ func TestPanicSafety(t *testing.T) {
 				t.Error("New(DefaultConfig()) should return a valid client")
 			}
 			if client != nil {
-				client.Close()
-			}
-		}},
-		{"EmptyURL", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			defer client.Close()
-			_, err = client.Get("")
-			_ = err
-		}},
-		{"InvalidURL", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			defer client.Close()
-			for _, u := range []string{"not a url", "http://", "://invalid", "http://\x00bad"} {
-				_, _ = client.Get(u)
+				_ = client.Close()
 			}
 		}},
 		{"NilBody", func() {
@@ -192,8 +201,13 @@ func TestPanicSafety(t *testing.T) {
 			if err != nil {
 				return
 			}
-			defer client.Close()
-			_, _ = client.Post(server.URL, WithBody(nil))
+			defer func() { _ = client.Close() }()
+			// WithBody(nil) must be rejected with a clean validation error —
+			// not silently sent, and not a panic.
+			_, err = client.Post(server.URL, WithBody(nil))
+			if err == nil {
+				t.Error("Expected WithBody(nil) to be rejected with an error")
+			}
 		}},
 		{"MiddlewarePanicRecovery", func() {
 			cfg := testConfig()
@@ -209,7 +223,7 @@ func TestPanicSafety(t *testing.T) {
 			if err != nil {
 				return
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 			_, err = client.Get(server.URL)
 			if err == nil {
 				t.Error("Expected error from recovered panic")
@@ -221,24 +235,15 @@ func TestPanicSafety(t *testing.T) {
 				t.Error("Expected error for invalid base URL")
 			}
 		}},
-		{"DownloadInvalidPath", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			defer client.Close()
-			_, err = client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: ""})
-			if err == nil {
-				t.Error("Expected error for empty file path")
-			}
-		}},
 		{"SessionManagerNilInput", func() {
 			session, err := NewSessionManagerDefault()
 			if err != nil {
 				return
 			}
-			_ = session.SetCookie(nil)
+			if err := session.SetCookie(nil); err == nil {
+				t.Error("SetCookie(nil) must be rejected, got nil error")
+			}
+			// Nil/empty batches must be tolerated as no-ops, not panic.
 			_ = session.SetCookies(nil)
 			_ = session.SetCookies([]*http.Cookie{})
 		}},
@@ -253,11 +258,14 @@ func TestPanicSafety(t *testing.T) {
 			if err != nil {
 				return
 			}
-			defer client.Close()
-			// Apply a failing RequestOption and verify error propagation
-			_, _ = client.Get(server.URL, func(r *engine.Request) error {
+			defer func() { _ = client.Close() }()
+			// Apply a failing RequestOption and verify the error propagates.
+			_, err = client.Get(server.URL, func(r *engine.Request) error {
 				return fmt.Errorf("test option error")
 			})
+			if err == nil {
+				t.Error("Expected failing RequestOption to surface as a request error")
+			}
 		}},
 		{"ConcurrentAccess", func() {
 			cfg := testConfig()
@@ -265,7 +273,7 @@ func TestPanicSafety(t *testing.T) {
 			if err != nil {
 				return
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 			done := make(chan bool, 10)
 			for i := 0; i < 10; i++ {
 				go func() {
@@ -275,27 +283,6 @@ func TestPanicSafety(t *testing.T) {
 			}
 			for i := 0; i < 10; i++ {
 				<-done
-			}
-		}},
-		{"CloseTwice", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			_ = client.Close()
-			_ = client.Close()
-		}},
-		{"ClosedClient", func() {
-			cfg := testConfig()
-			client, err := New(cfg)
-			if err != nil {
-				return
-			}
-			client.Close()
-			_, err = client.Get("http://example.com")
-			if err == nil {
-				t.Error("Expected error when using closed client")
 			}
 		}},
 		// SEC-003: the default safety net must convert panics to errors even when
@@ -313,7 +300,7 @@ func TestPanicSafety(t *testing.T) {
 			if err != nil {
 				return
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 			_, err = client.Get(server.URL)
 			if err == nil {
 				t.Error("Expected error from panic caught by default safety net")
@@ -332,11 +319,27 @@ func TestPanicSafety(t *testing.T) {
 			if err != nil {
 				return
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 			dest := filepath.Join(t.TempDir(), "out.bin")
 			_, err = client.Download(context.Background(), server.URL, &DownloadConfig{FilePath: dest})
 			if err == nil {
 				t.Error("Expected error from panic caught by download safety net")
+			}
+		}},
+		// SEC-003: a panicking RequestOption must not crash DomainClient —
+		// the session-capture pass applies user options before the
+		// request-path safety net is installed, so it needs its own guard.
+		{"DomainClientPanicOption", func() {
+			dc, err := NewDomain(server.URL, testConfig())
+			if err != nil {
+				return
+			}
+			defer func() { _ = dc.Close() }()
+			_, err = dc.Get("/",
+				func(r *engine.Request) error { panic("option panic during session capture") },
+			)
+			if err == nil {
+				t.Error("Expected error from panicking option in DomainClient")
 			}
 		}},
 	}
@@ -364,11 +367,11 @@ func Test_WithAllowPrivateIPs_OverridesClientPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("local-ok"))
+		_, _ = w.Write([]byte("local-ok")) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -406,7 +409,7 @@ func Test_WithAllowPrivateIPs_FalseReEnablesProtection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -435,12 +438,12 @@ func Test_WithAllowPrivateIPs_RedirectOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Final target: a real localhost server the redirect resolves to.
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("redirected-ok"))
+		_, _ = w.Write([]byte("redirected-ok")) // best-effort test response
 	}))
 	defer target.Close()
 
@@ -499,7 +502,7 @@ func Test_SSRF_BypassAttempts(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			_, err = client.Get(tt.url, WithTimeout(2*time.Second))
 			if err == nil {

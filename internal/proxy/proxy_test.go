@@ -22,7 +22,7 @@ func saveAndClearProxyEnv() map[string]string {
 	saved := make(map[string]string, len(allProxyEnvVars))
 	for _, v := range allProxyEnvVars {
 		saved[v] = os.Getenv(v)
-		os.Unsetenv(v)
+		_ = os.Unsetenv(v)
 	}
 	return saved
 }
@@ -30,9 +30,9 @@ func saveAndClearProxyEnv() map[string]string {
 func restoreProxyEnv(env map[string]string) {
 	for _, v := range allProxyEnvVars {
 		if val, ok := env[v]; ok && val != "" {
-			os.Setenv(v, val)
+			_ = os.Setenv(v, val)
 		} else {
-			os.Unsetenv(v)
+			_ = os.Unsetenv(v)
 		}
 	}
 }
@@ -103,18 +103,27 @@ func TestDetectFromEnvironment(t *testing.T) {
 			reqHost:   "example.com",
 			wantProxy: "http://lowercase-https.example.com:9443",
 		},
-		{
-			name:      "HTTPS_PROXY not used for HTTP request",
-			env:       map[string]string{"HTTPS_PROXY": "http://https-only.example.com:8443"},
-			reqScheme: "http",
-			reqHost:   "example.com",
-			wantProxy: "http://https-only.example.com:8443", // falls back as HTTP_PROXY
-		},
+		// HTTPS_PROXY falling back for plain-HTTP requests is asserted with a
+		// dedicated test: TestDetectFromEnvironment_HTTPSProxyFallsBack.
 		{
 			name:       "localhost always direct",
 			env:        map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080"},
 			reqScheme:  "http",
 			reqHost:    "localhost",
+			wantDirect: true,
+		},
+		{
+			name:       "IPv4 loopback always direct (matches net/http)",
+			env:        map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080"},
+			reqScheme:  "http",
+			reqHost:    "127.0.0.1",
+			wantDirect: true,
+		},
+		{
+			name:       "IPv6 loopback always direct (matches net/http)",
+			env:        map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080"},
+			reqScheme:  "http",
+			reqHost:    "[::1]",
 			wantDirect: true,
 		},
 		{
@@ -125,11 +134,10 @@ func TestDetectFromEnvironment(t *testing.T) {
 			wantDirect: true,
 		},
 		{
-			name:      "NO_PROXY wildcard bypasses all",
-			env:       map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080", "NO_PROXY": "*"},
-			reqScheme: "http",
-			reqHost:   "example.com",
-			wantProxy: "http://proxy.example.com:8080", // wildcard is a NO_PROXY match — should be direct
+			name:       "NO_PROXY wildcard bypasses all",
+			env:        map[string]string{"HTTP_PROXY": "http://proxy.example.com:8080", "NO_PROXY": "*"},
+			reqScheme:  "http",
+			reqHost:    "example.com",
 			wantDirect: true,
 		},
 		{
@@ -168,7 +176,7 @@ func TestDetectFromEnvironment(t *testing.T) {
 			defer restoreProxyEnv(originalEnv)
 
 			for k, v := range tt.env {
-				os.Setenv(k, v)
+				_ = os.Setenv(k, v)
 			}
 
 			d := NewDetector()
@@ -218,10 +226,10 @@ func TestDetectFromEnvironment(t *testing.T) {
 func TestDetectFromEnvironment_CGIEnvironment(t *testing.T) {
 	originalEnv := saveAndClearProxyEnv()
 	defer restoreProxyEnv(originalEnv)
-	defer os.Unsetenv("REQUEST_METHOD") // not in allProxyEnvVars; clean up explicitly
+	defer func() { _ = os.Unsetenv("REQUEST_METHOD") }() // not in allProxyEnvVars; clean up explicitly
 
-	os.Setenv("HTTP_PROXY", "http://proxy.example.com:8080")
-	os.Setenv("REQUEST_METHOD", "GET")
+	_ = os.Setenv("HTTP_PROXY", "http://proxy.example.com:8080")
+	_ = os.Setenv("REQUEST_METHOD", "GET")
 
 	d := NewDetector()
 	proxyFunc := d.detectFromEnvironment()
@@ -245,7 +253,7 @@ func TestDetectFromEnvironment_HTTPSProxyFallsBack(t *testing.T) {
 
 	// Only HTTPS_PROXY is set; an HTTP request should still get a proxy
 	// via the fall-back branch.
-	os.Setenv("HTTPS_PROXY", "http://https-proxy.example.com:8443")
+	_ = os.Setenv("HTTPS_PROXY", "http://https-proxy.example.com:8443")
 
 	d := NewDetector()
 	proxyFunc := d.detectFromEnvironment()
@@ -274,7 +282,7 @@ func TestGetProxyFunc_Caching(t *testing.T) {
 	originalEnv := saveAndClearProxyEnv()
 	defer restoreProxyEnv(originalEnv)
 
-	os.Setenv("HTTP_PROXY", "http://cache-test.example.com:8080")
+	_ = os.Setenv("HTTP_PROXY", "http://cache-test.example.com:8080")
 
 	d := NewDetector()
 
@@ -305,15 +313,18 @@ func TestGetProxyFunc_Caching(t *testing.T) {
 	}
 }
 
-func TestGetProxyFunc_NoProxy(t *testing.T) {
+// TestDetectFromEnvironment_NoProxy verifies the environment-variable path
+// returns nil when no proxy variables are set. GetProxyFunc additionally
+// falls back to platform detection (e.g. the Windows registry), which depends
+// on machine state — asserting on it here would fail on any dev machine with
+// a system proxy enabled.
+func TestDetectFromEnvironment_NoProxy(t *testing.T) {
 	originalEnv := saveAndClearProxyEnv()
 	defer restoreProxyEnv(originalEnv)
 
 	d := NewDetector()
-	proxyFunc := d.GetProxyFunc()
-
-	if proxyFunc != nil {
-		t.Errorf("GetProxyFunc() = non-nil, want nil with no proxy env")
+	if proxyFunc := d.detectFromEnvironment(); proxyFunc != nil {
+		t.Errorf("detectFromEnvironment() = non-nil, want nil with no proxy env")
 	}
 }
 
@@ -325,7 +336,7 @@ func TestGetProxyFunc_ConcurrentAccess(t *testing.T) {
 	originalEnv := saveAndClearProxyEnv()
 	defer restoreProxyEnv(originalEnv)
 
-	os.Setenv("HTTP_PROXY", "http://concurrent.example.com:8080")
+	_ = os.Setenv("HTTP_PROXY", "http://concurrent.example.com:8080")
 
 	d := NewDetector()
 
@@ -367,11 +378,11 @@ func TestGetProxyFunc_ConcurrentAccess(t *testing.T) {
 
 func TestShouldUseProxy(t *testing.T) {
 	tests := []struct {
-		name     string
-		host     string
-		port     string
-		noProxy  string
-		wantUse  bool // true = should use proxy (NOT bypassed)
+		name    string
+		host    string
+		port    string
+		noProxy string
+		wantUse bool // true = should use proxy (NOT bypassed)
 	}{
 		// Wildcard
 		{"wildcard bypasses all", "example.com", "", "*", false},
@@ -398,6 +409,13 @@ func TestShouldUseProxy(t *testing.T) {
 		// Port-specific
 		{"host:port pattern matches same port", "example.com", "8080", "example.com:8080", false},
 		{"host:port pattern does not match different port", "example.com", "9090", "example.com:8080", true},
+
+		// IPv6 boundaries
+		{"IPv6 CIDR match", "fd00::1", "", "fd00::/8", false},
+		{"IPv6 CIDR no match", "2001:db8::1", "", "fd00::/8", true},
+		{"IPv4 CIDR matches IPv6-mapped IPv4 host", "::ffff:10.0.0.5", "", "10.0.0.0/8", false},
+		{"bracketed IPv6 host:port pattern matches", "::1", "8080", "[::1]:8080", false},
+		{"bracketed IPv6 host:port pattern port mismatch", "::1", "9090", "[::1]:8080", true},
 
 		// Multiple entries
 		{"comma-separated list first match", "localhost", "", "localhost,127.0.0.1,.example.com", false},
@@ -439,7 +457,8 @@ func TestParseProxyURL(t *testing.T) {
 		{"socks5 scheme", "socks5://proxy:1080", false, "socks5://proxy:1080", false},
 		{"bare host:port gets http prefix", "proxy:8080", false, "http://proxy:8080", false},
 		{"bare host gets http prefix", "proxy", false, "http://proxy", false},
-		{"ftp scheme gets http prefix", "ftp://proxy:21", false, "http://ftp://proxy:21", false},
+		{"credentials preserved", "http://user:pass@proxy:8080", false, "http://user:pass@proxy:8080", false},
+		{"unsupported explicit scheme is rejected", "ftp://proxy:21", true, "", true},
 	}
 
 	for _, tt := range tests {
@@ -497,6 +516,11 @@ func TestGetEnvAny(t *testing.T) {
 			t.Errorf("getEnvAny() = %q, want %q", got, "first")
 		}
 	})
+
+	// Note: an HTTP_PROXY-vs-http_proxy precedence case cannot be written
+	// portably — Windows environment variables are case-insensitive, so the
+	// second Setenv overwrites the first and both reads return the same value.
+	// The generic "prefers first" semantics above cover getEnvAny's ordering.
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +538,7 @@ func TestGetProxyFunc_IntegrationWithProxy(t *testing.T) {
 	}))
 	defer proxyServer.Close()
 
-	os.Setenv("HTTP_PROXY", proxyServer.URL)
+	_ = os.Setenv("HTTP_PROXY", proxyServer.URL)
 
 	d := NewDetector()
 	proxyFunc := d.GetProxyFunc()
@@ -541,35 +565,65 @@ func TestGetProxyFunc_IntegrationWithProxy(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// detectPlatform / getWindowsProxySettings (Windows)
+// detectPlatform
 // ---------------------------------------------------------------------------
 
-func TestDetectPlatform_NoEnvCallsPlatform(t *testing.T) {
+// TestDetect_NoEnvFallsToPlatform is the merged no-panic smoke for the
+// platform-detection chain: with no env vars, detect() falls through to
+// detectPlatform(). On a system without a configured proxy both return nil;
+// with one configured they return a usable func. The result is
+// machine-dependent by design, so the only portable assertion is the
+// no-panic contract itself. (TestDetectPlatform_NoEnvCallsPlatform was
+// retired into this test — detect() already includes detectPlatform().)
+func TestDetect_NoEnvFallsToPlatform(t *testing.T) {
 	originalEnv := saveAndClearProxyEnv()
 	defer restoreProxyEnv(originalEnv)
 
 	d := NewDetector()
-	// With no env vars, detect() falls through to detectPlatform().
-	// On a system without proxy configured, this returns nil.
-	// On a system with proxy configured, it returns a non-nil function.
-	// Either way it must not panic.
 	_ = d.detectPlatform()
+	_ = d.detect()
 }
 
-func TestGetWindowsProxySettings(t *testing.T) {
-	// Exercise the registry-reading path. On most dev machines ProxyEnable
-	// is 0, so this returns ("", false, nil). On machines with a proxy it
-	// returns the proxy details. Either way it must not panic or error.
-	server, enabled, err := getWindowsProxySettings()
-	if err != nil {
-		t.Logf("getWindowsProxySettings returned error (acceptable in CI): %v", err)
-		return
+// TestIsLoopbackRequest covers the loopback-bypass predicate shared by the
+// platform-detected proxy paths (Windows registry / macOS networksetup):
+// localhost and loopback IPs must bypass the system proxy, everything else
+// must not, matching the environment-variable path and net/http behavior.
+func TestIsLoopbackRequest(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{"localhost", "http://localhost/api", true},
+		{"loopback v4", "http://127.0.0.1:8080/health", true},
+		{"loopback v4 high segment", "http://127.255.255.254/", true},
+		{"loopback v6", "http://[::1]:9090/", true},
+		// Known limitation: net.ParseIP rejects IPv6 zone IDs, so a zoned
+		// loopback literal is NOT detected as loopback. Pinning actual
+		// behavior; zone IDs cannot appear in practice for routed requests.
+		{"v6 loopback with zone is not detected", "http://[::1%25eth0]/", false},
+		{"public hostname", "http://example.com/", false},
+		{"private but not loopback v4", "http://10.0.0.1/", false},
+		{"public v6", "http://[2606:4700::1111]/", false},
+		{"localhost subdomain is not loopback", "http://localhost.example.com/", false},
+		{"not-an-ip hostname", "http://127.0.0.1.evil.com/", false},
 	}
-	t.Logf("registry proxy: server=%q enabled=%v", server, enabled)
-	if !enabled && server != "" {
-		t.Logf("note: server=%q but enabled=false", server)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parsed, err := url.Parse(tt.url)
+			if err != nil {
+				t.Fatalf("url.Parse(%q) error: %v", tt.url, err)
+			}
+			if got := isLoopbackRequest(&http.Request{URL: parsed}); got != tt.want {
+				t.Errorf("isLoopbackRequest(%q) = %v, want %v", tt.url, got, tt.want)
+			}
+		})
 	}
 }
+
+// The registry-reading getWindowsProxySettings path is exercised in
+// proxy_windows_test.go (build-tagged windows) alongside parseWindowsProxyString.
 
 // ---------------------------------------------------------------------------
 // detect — full chain
@@ -579,7 +633,7 @@ func TestDetect_EnvProxyTakesPriority(t *testing.T) {
 	originalEnv := saveAndClearProxyEnv()
 	defer restoreProxyEnv(originalEnv)
 
-	os.Setenv("HTTP_PROXY", "http://env-proxy.example.com:8080")
+	_ = os.Setenv("HTTP_PROXY", "http://env-proxy.example.com:8080")
 
 	d := NewDetector()
 	proxyFunc := d.detect()
@@ -598,11 +652,5 @@ func TestDetect_EnvProxyTakesPriority(t *testing.T) {
 	}
 }
 
-func TestDetect_NoEnvFallsToPlatform(t *testing.T) {
-	originalEnv := saveAndClearProxyEnv()
-	defer restoreProxyEnv(originalEnv)
-
-	d := NewDetector()
-	// Should not panic; may return nil (no proxy) or non-nil (system proxy).
-	_ = d.detect()
-}
+// (The former standalone TestDetect_NoEnvFallsToPlatform lived here; it is
+// merged into the combined platform-chain smoke above.)

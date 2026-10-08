@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -223,6 +224,30 @@ func TestClientError_IsRetryable(t *testing.T) {
 			wantRetry: true,
 		},
 		{
+			// Wrapped ClientError: the classifier unwraps to the inner error and
+			// consults the inner cause message. (Rows folded in from the former
+			// standalone TestIsRetryableWrappedError.)
+			name: "Wrapped ClientError with retryable inner cause message",
+			err: &ClientError{Type: ErrorTypeNetwork, Cause: &ClientError{
+				Type: ErrorTypeNetwork, Cause: errors.New("connection reset by peer"),
+			}},
+			wantRetry: true,
+		},
+		{
+			name: "Wrapped ClientError with non-retryable inner cause",
+			err: &ClientError{Type: ErrorTypeNetwork, Cause: &ClientError{
+				Type: ErrorTypeNetwork, Cause: errors.New("something unknown"),
+			}},
+			wantRetry: false,
+		},
+		{
+			name: "Wrapped ClientError with nil inner cause and retryable type",
+			err: &ClientError{Type: ErrorTypeNetwork, Cause: &ClientError{
+				Type: ErrorTypeTimeout,
+			}},
+			wantRetry: true,
+		},
+		{
 			name:      "Response read nil cause is not retryable",
 			err:       &ClientError{Type: ErrorTypeResponseRead, Cause: nil},
 			wantRetry: false,
@@ -408,26 +433,9 @@ func TestClassifyError_NetError(t *testing.T) {
 	}
 }
 
-func TestErrorType_String(t *testing.T) {
-	// Test that ErrorType values are distinct
-	types := []ErrorType{
-		ErrorTypeUnknown,
-		ErrorTypeNetwork,
-		ErrorTypeTimeout,
-		ErrorTypeContextCanceled,
-		ErrorTypeResponseRead,
-		ErrorTypeTransport,
-		ErrorTypeRetryExhausted,
-	}
-
-	seen := make(map[ErrorType]bool)
-	for _, et := range types {
-		if seen[et] {
-			t.Errorf("Duplicate ErrorType value: %v", et)
-		}
-		seen[et] = true
-	}
-}
+// TestErrorType_String was removed: it checked a hand-written list of
+// distinct iota constants for duplicates — logically unable to fail and
+// it never called any production code.
 
 func TestClientError_Code(t *testing.T) {
 	tests := []struct {
@@ -575,7 +583,7 @@ func TestErrorHandling_IntegrationWithClient(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -834,7 +842,7 @@ func TestErrorHandling_TimeoutScenarios(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			start := time.Now()
 			ctx := context.Background()
@@ -891,20 +899,23 @@ func TestIsRetryableSyscallError_WSAErrno(t *testing.T) {
 	// These raw WSA error codes are what Windows networking functions return.
 	// They do not match syscall.ECONNREFUSED etc. on Go 1.25+ Windows.
 	wsaErrnos := []struct {
-		name  string
-		errno uintptr // raw WSA code value
+		name     string
+		errno    uintptr // raw WSA code value
+		retryabl bool
 	}{
-		{"WSAECONNRESET", 10054},
-		{"WSAETIMEDOUT", 10060},
-		{"WSAECONNREFUSED", 10061},
-		{"WSAENETUNREACH", 10051},
-		{"WSAEHOSTUNREACH", 10065},
+		{"WSAECONNRESET", 10054, true},
+		{"WSAETIMEDOUT", 10060, true},
+		{"WSAECONNREFUSED", 10061, true},
+		{"WSAENETUNREACH", 10051, true},
+		{"WSAEHOSTUNREACH", 10065, true},
+		// Non-retryable errno (folded from the retired coverage_test.go table).
+		{"EINVAL is not retryable", uintptr(syscall.EINVAL), false},
 	}
 	for _, tt := range wsaErrnos {
 		t.Run(tt.name, func(t *testing.T) {
 			errno := syscall.Errno(tt.errno)
-			if !isRetryableSyscallError(errno) {
-				t.Errorf("isRetryableSyscallError(Errno(%d)) = false, want true (WSA code %s)", tt.errno, tt.name)
+			if got := isRetryableSyscallError(errno); got != tt.retryabl {
+				t.Errorf("isRetryableSyscallError(Errno(%d)) = %v, want %v (WSA code %s)", tt.errno, got, tt.retryabl, tt.name)
 			}
 		})
 	}
@@ -943,5 +954,76 @@ func TestProxyConnectionRefused_RealDial(t *testing.T) {
 	re := newRetryEngine(&Config{MaxRetries: 3})
 	if !re.ShouldRetry(nil, urlErr, 0) {
 		t.Fatal("retryEngine.ShouldRetry should return true for proxy connection-refused")
+	}
+}
+
+// TestClassifyError_SanitizesURL pins the credential-redaction contract of the
+// classification path: the raw URL never lands in ClientError.URL.
+func TestClassifyError_SanitizesURL(t *testing.T) {
+	raw := "https://user:secret@example.com/path?token=abc&page=2"
+	ce := classifyError(errors.New("connection reset by peer"), raw, "GET", 2)
+
+	if strings.Contains(ce.URL, "secret") || strings.Contains(ce.URL, "token=abc") {
+		t.Errorf("ClientError.URL leaks credentials: %q", ce.URL)
+	}
+	if !strings.Contains(ce.URL, "example.com") {
+		t.Errorf("ClientError.URL lost the host: %q", ce.URL)
+	}
+	if ce.Method != "GET" || ce.Attempts != 2 {
+		t.Errorf("method/attempts not carried: %q/%d", ce.Method, ce.Attempts)
+	}
+
+	// Error() reuses the pre-sanitized URL without re-redacting, and must not
+	// leak either.
+	if strings.Contains(ce.Error(), "secret") {
+		t.Errorf("Error() leaks credentials: %q", ce.Error())
+	}
+}
+
+// TestClientError_IsRetryableDNSError_Causes covers the remaining branches of
+// isRetryableDNSError: nil cause, non-DNSError cause, and a DNSError that is
+// neither temporary nor a timeout must not be retryable.
+func TestClientError_IsRetryableDNSError_Causes(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *ClientError
+		want bool
+	}{
+		{
+			name: "nil cause",
+			err:  &ClientError{Type: ErrorTypeDNS},
+		},
+		{
+			name: "non-DNSError cause",
+			err:  &ClientError{Type: ErrorTypeDNS, Cause: errors.New("plain error")},
+		},
+		{
+			name: "permanent DNSError",
+			err: &ClientError{Type: ErrorTypeDNS, Cause: &net.DNSError{
+				Err: "no such host", Name: "example.invalid",
+			}},
+		},
+		{
+			name: "temporary DNSError",
+			err: &ClientError{Type: ErrorTypeDNS, Cause: &net.DNSError{
+				Err: "i/o timeout", Name: "example.com", IsTemporary: true,
+			}},
+			want: true,
+		},
+		{
+			name: "timeout DNSError",
+			err: &ClientError{Type: ErrorTypeDNS, Cause: &net.DNSError{
+				Err: "i/o timeout", Name: "example.com", IsTimeout: true,
+			}},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.isRetryableDNSError(); got != tt.want {
+				t.Errorf("isRetryableDNSError() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

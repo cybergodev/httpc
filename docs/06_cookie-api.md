@@ -17,7 +17,7 @@ Quick reference for working with cookies in httpc.
 
 Methods to access cookies returned by the server via `Set-Cookie` header:
 
-| Method | Description | Example |
+| API | Description | Example |
 |--------|-------------|---------|
 | `result.Response.Cookies` | All response cookies | `for _, c := range result.Response.Cookies { ... }` |
 | `result.ResponseCookies()` | All response cookies (method) | `cookies := result.ResponseCookies()` |
@@ -28,7 +28,7 @@ Methods to access cookies returned by the server via `Set-Cookie` header:
 
 Methods to inspect cookies that were sent in the request via `Cookie` header:
 
-| Method | Description | Example |
+| API | Description | Example |
 |--------|-------------|---------|
 | `result.Request.Cookies` | All request cookies | `for _, c := range result.Request.Cookies { ... }` |
 | `result.RequestCookies()` | All request cookies (method) | `cookies := result.RequestCookies()` |
@@ -55,8 +55,10 @@ func main() {
 
     // Send request with cookies
     result, err := client.Get("https://api.example.com",
-        httpc.WithCookie(http.Cookie{Name: "auth", Value: "token123"}),
-        httpc.WithCookie(http.Cookie{Name: "session", Value: "abc456"}),
+        httpc.WithCookies([]http.Cookie{
+            {Name: "auth", Value: "token123"},
+            {Name: "session", Value: "abc456"},
+        }),
     )
     if err != nil {
         log.Fatal(err)
@@ -106,24 +108,20 @@ func main() {
 Multiple ways to add cookies to requests:
 
 ```go
-// Method 1: http.Cookie struct (full control over attributes)
+// Method 1: WithCookies (single validation pass; full control over attributes)
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{
-        Name:  "session",
-        Value: "abc123",
-        Path:  "/",
-        Secure: true,
-        HttpOnly: true,
+    httpc.WithCookies([]http.Cookie{
+        {
+            Name:  "session",
+            Value: "abc123",
+            Path:  "/",
+            Secure: true,
+            HttpOnly: true,
+        },
     }),
 )
 
-// Method 2: Multiple cookies (use multiple WithCookie calls)
-result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "cookie1", Value: "value1"}),
-    httpc.WithCookie(http.Cookie{Name: "cookie2", Value: "value2"}),
-)
-
-// Method 3: Cookie map (convenient for simple name-value pairs)
+// Method 2: Cookie map (convenient for simple name-value pairs)
 cookies := map[string]string{
     "session_id": "abc123",
     "user_pref":  "dark_mode",
@@ -133,10 +131,23 @@ result, err := client.Get(url,
     httpc.WithCookieMap(cookies),
 )
 
-// Method 4: Cookie string (from browser dev tools)
+// Method 3: Cookie string (from browser dev tools)
 // Parse and send multiple cookies from a cookie string
 result, err := client.Get(url,
     httpc.WithCookieString("session=abc123; token=xyz789; user_id=12345"),
+)
+
+// Method 4: With security attribute validation
+// (WithSecureCookie validates cookies added so far — place it AFTER the cookie options)
+result, err := client.Get(url,
+    httpc.WithCookies([]http.Cookie{{
+        Name:     "session",
+        Value:    "abc123",
+        Secure:   true,
+        HttpOnly: true,
+        SameSite: http.SameSiteStrictMode,
+    }}),
+    httpc.WithSecureCookie(httpc.StrictCookieSecurityConfig()),
 )
 ```
 
@@ -147,6 +158,9 @@ Enable cookie jar for automatic cookie persistence:
 ```go
 config := httpc.DefaultConfig()
 config.Connection.EnableCookies = true
+// Recommended: attach a public-suffix list so the jar rejects cookies set on
+// public suffixes (e.g. Domain=com supercookies) — pass
+// golang.org/x/net/publicsuffix.List as Connection.PublicSuffixList.
 client, err := httpc.New(config)
 if err != nil {
     log.Fatal(err)
@@ -171,7 +185,7 @@ if result2.HasRequestCookie("session") {
 
 ```go
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "auth", Value: "token123"}),
+    httpc.WithCookies([]http.Cookie{{Name: "auth", Value: "token123"}}),
 )
 
 // Check if cookie was actually sent
@@ -190,7 +204,7 @@ if authCookie != nil && authCookie.Value != "token123" {
 
 ```go
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "client_cookie", Value: "value1"}),
+    httpc.WithCookies([]http.Cookie{{Name: "client_cookie", Value: "value1"}}),
 )
 
 fmt.Println("Sent to server:")
@@ -225,7 +239,7 @@ if sessionCookie == nil {
 
 // Use session cookie in subsequent requests
 profileResult, _ := client.Get("https://api.example.com/profile",
-    httpc.WithCookie(*sessionCookie),
+    httpc.WithCookies([]http.Cookie{*sessionCookie}),
 )
 
 // Verify session was sent
@@ -238,7 +252,7 @@ if !profileResult.HasRequestCookie("session") {
 
 ```go
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "required_cookie", Value: "value"}),
+    httpc.WithCookies([]http.Cookie{{Name: "required_cookie", Value: "value"}}),
 )
 
 // Validate required cookies were sent
@@ -252,11 +266,14 @@ for _, name := range requiredCookies {
 
 ## API Design
 
-All cookie inspection methods are available as Result methods for clean, intuitive API:
+Cookie data is exposed both as nested `Result` fields and as nil-safe `Result` methods:
 
 ```go
-// Result methods
-cookies := result.Request.Cookies
+// Nested fields (parsed cookie slices — nil-check the parent on error results)
+requestCookies := result.Request.Cookies
+responseCookies := result.Response.Cookies
+
+// Result methods (nil-safe accessors)
 cookie := result.GetRequestCookie("session")
 exists := result.HasRequestCookie("session")
 ```
@@ -272,8 +289,11 @@ exists := result.HasRequestCookie("session")
 For cross-request cookie persistence without a cookie jar, use `SessionManager`:
 
 ```go
-// Create a session manager
-session, err := httpc.NewSessionManagerDefault()
+// Create a session manager with strict cookie security
+// (or simply: session, err := httpc.NewSessionManagerDefault())
+config := httpc.DefaultSessionConfig()
+config.CookieSecurity = httpc.StrictCookieSecurityConfig()
+session, err := httpc.NewSessionManager(config)
 if err != nil {
     log.Fatal(err)
 }
@@ -292,13 +312,9 @@ if err := session.SetCookies([]*http.Cookie{
 allCookies := session.GetCookies()
 singleCookie := session.GetCookie("session")
 
-// Update session from a response
+// After a request, persist cookies received in the response
+// (result is the *httpc.Result returned by client.Get/Post/...)
 session.UpdateFromResult(result)
-
-// Cookie security validation
-config := httpc.DefaultSessionConfig()
-config.CookieSecurity = httpc.StrictCookieSecurityConfig()
-session, err := httpc.NewSessionManager(config)
 
 // Remove cookies
 session.DeleteCookie("session")

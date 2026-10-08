@@ -36,12 +36,21 @@ type CertificatePinner = security.CertificatePinner
 // Supply multiple hashes to support key rotation: the handshake succeeds if the
 // peer's key matches ANY pinned hash.
 //
+// TRUST MODEL: pins are matched only against certificates bound to the
+// connection — the leaf and the verified chain. When normal certificate
+// verification runs, a pin may match any certificate in the VERIFIED chain
+// (so CA/intermediate pinning works). When InsecureSkipVerify is enabled
+// (pinning as the sole gate), only the leaf certificate's key is checked —
+// a certificate merely appended to the server's presented chain can never
+// satisfy a pin ("pin stuffing" defense).
+//
 // Generate a hash from a certificate with:
 //
 //	openssl x509 -in cert.pem -pubkey -noout | openssl pkey -pubin -outform der \
 //	  | openssl dgst -sha256 -binary | openssl enc -base64
 //
-// Returns an error if no valid hash is provided or if a hash is not valid base64.
+// Returns an error if no valid hash is provided, if a hash is not valid
+// base64, or if it does not decode to exactly 32 bytes (SHA-256).
 func NewSPKIHashPinner(hashes ...string) (CertificatePinner, error) {
 	return security.NewSPKIHashPinner(hashes...)
 }

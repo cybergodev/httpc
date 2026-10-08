@@ -144,46 +144,12 @@ func TestSanitizeURL(t *testing.T) {
 	}
 }
 
-func TestSanitizeURL_NilUserCheck(t *testing.T) {
-	// Verify that URLs without user info pass through unchanged
-	urls := []string{
-		"https://example.com",
-		"http://localhost:8080",
-		"https://api.example.com/v1/resource?id=123",
-	}
+// TestSanitizeURL_NilUserCheck was removed: passthrough URLs without
+// credentials are rows of TestSanitizeURL ("No credentials*" rows).
 
-	for _, url := range urls {
-		t.Run(url, func(t *testing.T) {
-			result := SanitizeURL(url)
-			if result != url {
-				t.Errorf("URL without credentials was modified: %q -> %q", url, result)
-			}
-		})
-	}
-}
-
-func TestSanitizeURL_CredentialRemoval(t *testing.T) {
-	// Verify that credentials are always replaced with asterisks
-	urls := []string{
-		"https://admin:supersecret@example.com",
-		"https://root:password123@example.com",
-		"https://test:test@example.com",
-	}
-
-	for _, url := range urls {
-		t.Run(url, func(t *testing.T) {
-			result := SanitizeURL(url)
-			if result == url {
-				t.Errorf("Credentials were not removed from URL")
-			}
-			if len(result) > 0 && result[0] != ':' {
-				if !strings.Contains(result, "***:***@") && !strings.Contains(result, "***@") {
-					t.Errorf("Expected masked credentials in result: %q", result)
-				}
-			}
-		})
-	}
-}
+// TestSanitizeURL_CredentialRemoval was removed: credential masking is
+// asserted with exact expected outputs by TestSanitizeURL
+// ("Username and password", "Password with special characters" rows).
 
 func TestSanitizeURL_BoundaryConditions(t *testing.T) {
 	t.Run("IPv6 with zone ID", func(t *testing.T) {
@@ -258,15 +224,74 @@ func TestIsSensitiveQueryParam(t *testing.T) {
 	}
 }
 
-func TestSensitiveQueryParamDetection(t *testing.T) {
-	t.Parallel()
-	expectedKeys := []string{"token", "access_token", "api_key", "password", "secret", "jwt", "session_id"}
-	for _, key := range expectedKeys {
-		if !IsSensitiveQueryParam(key) {
-			t.Errorf("expected %q to be detected as sensitive", key)
-		}
+// TestSensitiveQueryParamDetection was removed: strict subset of
+// TestIsSensitiveQueryParam (same keys plus the case-insensitivity row).
+
+// TestSanitizeURL_FailClosed verifies the fail-closed contract: malformed or
+// opaque inputs that url.Parse cannot fully structure must still have their
+// credentials redacted instead of being returned verbatim. Returning the raw
+// string would leak user:pass@... into logs and error messages — exactly the
+// leak SanitizeURL exists to prevent — and malformed URLs are the inputs most
+// likely to originate from untrusted sources.
+func TestSanitizeURL_FailClosed(t *testing.T) {
+	tests := []struct {
+		name           string
+		input          string
+		mustNotContain []string // substrings that must NOT appear (leaks)
+		mustContain    []string // substrings that MUST appear (redaction markers)
+	}{
+		{
+			name:           "unparseable URL with credentials",
+			input:          "http://user:pass@host/\x01",
+			mustNotContain: []string{"user", "pass"},
+			mustContain:    []string{"***@"},
+		},
+		{
+			name:           "opaque URL hides userinfo in Opaque",
+			input:          "user:pass@host/path",
+			mustNotContain: []string{"user:pass", ":pass@"},
+			mustContain:    []string{"***@"},
+		},
+		{
+			name:           "scheme-less URL with credentials",
+			input:          "//u:p@h/p",
+			mustNotContain: []string{"u:p"},
+			mustContain:    []string{"***@"},
+		},
+		{
+			name:           "unparseable URL with sensitive query param",
+			input:          "http://a:b@h/p?api-key=SK123\x02",
+			mustNotContain: []string{"a:b", "SK123"},
+			mustContain:    []string{"***@", "api-key=[REDACTED]"},
+		},
 	}
-	if !IsSensitiveQueryParam("TOKEN") {
-		t.Error("expected case-insensitive detection")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := SanitizeURL(tt.input)
+			for _, leak := range tt.mustNotContain {
+				if strings.Contains(got, leak) {
+					t.Errorf("SanitizeURL(%q) = %q leaks %q", tt.input, got, leak)
+				}
+			}
+			for _, marker := range tt.mustContain {
+				if !strings.Contains(got, marker) {
+					t.Errorf("SanitizeURL(%q) = %q missing %q", tt.input, got, marker)
+				}
+			}
+		})
+	}
+}
+
+// TestSanitizeURL_APiKeyVariant covers the hyphenated spelling added to the
+// sensitive-parameter list (previously only api_key/apikey matched, so
+// "api-key=..." values reached logs unredacted).
+func TestSanitizeURL_APiKeyVariant(t *testing.T) {
+	got := SanitizeURL("https://example.com/v1?api-key=SK123")
+	if !strings.Contains(got, "api-key=[REDACTED]") {
+		t.Errorf("hyphenated api-key not redacted: %q", got)
+	}
+	if strings.Contains(got, "SK123") {
+		t.Errorf("api-key value leaked: %q", got)
 	}
 }

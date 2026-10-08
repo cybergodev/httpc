@@ -67,6 +67,10 @@ func calculateMaxRetryDelay(cfg *Config) time.Duration {
 // ProxyRotateOnStatus is set, the intent is explicitly to rotate through all
 // proxies, so the retry budget is raised to len(ProxyPool)-1 (capped at
 // maxRetryAttempts to respect the hard ceiling enforced by ValidateConfig).
+//
+// ProxyRotatePerRequest also raises the budget: its per-request rotation
+// consumes attempts from the same budget, and without the raise a large pool
+// would silently reduce the per-request retry headroom to the raw MaxRetries.
 func calculateMaxRetries(cfg *Config) int {
 	maxRetries := cfg.Retry.MaxRetries
 
@@ -90,7 +94,7 @@ func convertToEngineConfig(cfg *Config) (*engine.Config, error) {
 	minTLSVersion, maxTLSVersion := resolveTLSVersions(cfg)
 	maxRetryDelay := calculateMaxRetryDelay(cfg)
 
-	cookieJar, err := createCookieJar(cfg.Connection.EnableCookies)
+	cookieJar, err := createCookieJar(cfg.Connection.EnableCookies, cfg.Connection.PublicSuffixList)
 	if err != nil {
 		return nil, err
 	}
@@ -142,6 +146,7 @@ func convertToEngineConfig(cfg *Config) (*engine.Config, error) {
 		MaxRetryDelay:             maxRetryDelay,
 		BackoffFactor:             cfg.Retry.BackoffFactor,
 		Jitter:                    cfg.Retry.EnableJitter,
+		RetryNonIdempotent:        cfg.Retry.RetryNonIdempotent,
 		ExtraRetryableStatusCodes: cfg.Connection.ProxyRotateOnStatus,
 		CustomRetryPolicy:         cfg.Retry.CustomPolicy,
 

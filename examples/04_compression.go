@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	fmt.Println("=== HTTP Response Decompression Example ===\n ")
+	fmt.Println("=== HTTP Response Decompression Example ===")
 
 	// Example 1: Automatic gzip decompression
 	demonstrateGzipDecompression()
@@ -58,7 +58,7 @@ func demonstrateDeflateDecompression() {
 		"User-Agent":      "httpc-example/1.0",
 	}
 
-	resp, err := httpc.Get("https://httpbin.org/deflate", httpc.WithHeaderMap(headers))
+	resp, err := httpc.Get("https://httpbin.org", httpc.WithHeaderMap(headers))
 	if err != nil {
 		log.Printf("Request failed: %v\n", err)
 		return
