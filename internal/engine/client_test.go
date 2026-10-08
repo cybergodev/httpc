@@ -339,7 +339,7 @@ func TestClient_ConvenienceMethods(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewClient failed: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			resp, err := client.Request(backgroundCtx, tt.method, server.URL)
 			if err != nil {
@@ -371,7 +371,7 @@ func TestClient_IsHealthy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Make a successful request
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -405,7 +405,7 @@ func TestClient_OnRequestOnResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -558,7 +558,7 @@ func TestClient_ResponseProcessing(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			resp, err := client.Request(backgroundCtx, "GET", server.URL)
 			if err != nil {
@@ -649,7 +649,7 @@ func TestClient_ErrorHandling(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			_, err = client.Request(backgroundCtx, "GET", server.URL)
 
@@ -688,7 +688,7 @@ func TestClient_ContextCancellation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
@@ -721,7 +721,7 @@ func TestClient_OnResponseErrorReleasesResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// onResponse callback that returns an error
 	onRespOption := func(req *Request) error {
@@ -754,7 +754,7 @@ func TestClient_SetRawBodyReader(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(fmt.Sprintf("body=%s,content-type=%s", string(body), r.Header.Get("Content-Type")))) // best-effort test response
+		_, _ = fmt.Fprintf(w, "body=%s,content-type=%s", string(body), r.Header.Get("Content-Type")) // best-effort test response
 	}))
 	defer server.Close()
 
@@ -768,7 +768,7 @@ func TestClient_SetRawBodyReader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient error: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	if err != nil {
@@ -882,7 +882,7 @@ func TestExecuteWithRetry_ProxyRotationPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewClient: %v", err)
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		resp, err := client.Request(context.Background(), "GET", "https://example.com")
 		if err != nil {
@@ -901,7 +901,7 @@ func TestExecuteWithRetry_ProxyRotationPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewClient: %v", err)
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		resp, err := client.Request(context.Background(), "GET", "https://example.com")
 		if err != nil {
@@ -934,7 +934,7 @@ func TestExecuteWithRetry_CustomPolicyVetoAndSleepError(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewClient: %v", err)
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err = client.Request(context.Background(), "GET", "https://example.com")
 		if err == nil {
@@ -960,7 +960,7 @@ func TestExecuteWithRetry_CustomPolicyVetoAndSleepError(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewClient: %v", err)
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		defer cancel()
@@ -969,5 +969,49 @@ func TestExecuteWithRetry_CustomPolicyVetoAndSleepError(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error: sleep must be aborted by the deadline")
 		}
+	})
+}
+
+// TestSecurityRequestPool_FallbackAndReset covers the defensive branches of
+// getSecurityRequest/putSecurityRequest: a wrong-typed pooled value must fall
+// back to a fresh security.Request, and put must clear every field so a
+// recycled request never leaks prior-request state. Mirrors the poisoned-pool
+// tests the other engine pools already have.
+func TestSecurityRequestPool_FallbackAndReset(t *testing.T) {
+	client, err := NewClient(&Config{Timeout: 30 * time.Second, AllowPrivateIPs: true})
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	t.Run("wrong-typed pooled value falls back to fresh", func(t *testing.T) {
+		client.securityRequestPool.Put(42) //nolint:staticcheck // intentional wrong-type poisoning
+
+		req := client.getSecurityRequest()
+		if req == nil {
+			t.Fatal("getSecurityRequest returned nil from poisoned pool")
+		}
+		// Must be a usable zero value.
+		if req.Method != "" || req.URL != "" || req.Headers != nil {
+			t.Errorf("fallback request not zero-valued: %+v", req)
+		}
+	})
+
+	t.Run("put clears all fields", func(t *testing.T) {
+		req := client.getSecurityRequest()
+		req.Method = "POST"
+		req.URL = "https://example.com"
+		req.Headers = map[string]string{"X-A": "1"}
+		req.QueryParams = map[string]any{"q": 1}
+
+		client.putSecurityRequest(req)
+
+		if req.Method != "" || req.URL != "" || req.Headers != nil || req.QueryParams != nil {
+			t.Errorf("putSecurityRequest did not reset: %+v", req)
+		}
+	})
+
+	t.Run("put nil is a no-op", func(t *testing.T) {
+		client.putSecurityRequest(nil) // must not panic
 	})
 }

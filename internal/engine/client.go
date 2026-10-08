@@ -171,45 +171,14 @@ func NewClient(config *Config, opts ...clientOption) (*Client, error) {
 		client.transport = options.customTransport
 		// Connection pool not needed for custom transport
 	} else {
-		connConfig := connection.DefaultConfig()
-		connConfig.MaxIdleConns = config.MaxIdleConns
-		connConfig.MaxIdleConnsPerHost = config.MaxIdleConnsPerHost
-		connConfig.MaxConnsPerHost = config.MaxConnsPerHost
-		connConfig.MaxResponseHeaderBytes = config.MaxResponseHeaderBytes
-		connConfig.DialTimeout = config.DialTimeout
-		connConfig.KeepAlive = config.KeepAlive
-		connConfig.TLSHandshakeTimeout = config.TLSHandshakeTimeout
-		connConfig.ResponseHeaderTimeout = config.ResponseHeaderTimeout
-		connConfig.IdleConnTimeout = config.IdleConnTimeout
-		connConfig.MinTLSVersion = config.MinTLSVersion
-		connConfig.MaxTLSVersion = config.MaxTLSVersion
-		connConfig.InsecureSkipVerify = config.InsecureSkipVerify
-		connConfig.EnableHTTP2 = config.EnableHTTP2
-		connConfig.ProxyURL = config.ProxyURL
-		connConfig.EnableSystemProxy = config.EnableSystemProxy
-		connConfig.ProxyPool = config.ProxyPool
-		connConfig.ProxyPoolStrategy = config.ProxyPoolStrategy
-		connConfig.ProxyFailureThreshold = config.ProxyFailureThreshold
-		connConfig.ProxyCooldown = config.ProxyCooldown
-		connConfig.CookieJar = config.CookieJar
-		connConfig.AllowPrivateIPs = config.AllowPrivateIPs
-		connConfig.ExemptNets = config.ExemptNets
-		connConfig.EnableDoH = config.EnableDoH
-		connConfig.DoHCacheTTL = config.DoHCacheTTL
-		connConfig.TLSConfig = config.TLSConfig
-
-		if config.CertificatePinner != nil {
-			connConfig.SetCertPinner(config.CertificatePinner)
-		}
-
-		client.connectionPool, err = connection.NewPoolManager(connConfig)
+		client.connectionPool, err = connection.NewPoolManager(buildConnectionConfig(config))
 		if err != nil {
 			return nil, fmt.Errorf("failed to create connection pool: %w", err)
 		}
 
 		client.transport, err = newTransport(config, client.connectionPool)
 		if err != nil {
-			client.connectionPool.Close()
+			_ = client.connectionPool.Close() // best-effort cleanup on init failure
 			return nil, fmt.Errorf("failed to create transport: %w", err)
 		}
 	}
@@ -228,6 +197,49 @@ func NewClient(config *Config, opts ...clientOption) (*Client, error) {
 	client.validator = security.NewValidatorWithConfig(validatorConfig)
 
 	return client, nil
+}
+
+// buildConnectionConfig maps engine.Config onto connection.Config, starting
+// from connection defaults and overriding with the engine's values.
+//
+// MAINTENANCE MIRROR: engine.Config and connection.Config carry many
+// same-named fields that must be copied field-by-field here. A field added to
+// either Config but missing from this mapping compiles cleanly and silently
+// keeps its zero/default value — when adding a field, update this mapping in
+// the same change. connection.DefaultConfig fields with no engine counterpart
+// (e.g. MaxTotalConns, ExpectContinueTimeout) intentionally keep defaults.
+func buildConnectionConfig(config *Config) *connection.Config {
+	connConfig := connection.DefaultConfig()
+	connConfig.MaxIdleConns = config.MaxIdleConns
+	connConfig.MaxIdleConnsPerHost = config.MaxIdleConnsPerHost
+	connConfig.MaxConnsPerHost = config.MaxConnsPerHost
+	connConfig.MaxResponseHeaderBytes = config.MaxResponseHeaderBytes
+	connConfig.DialTimeout = config.DialTimeout
+	connConfig.KeepAlive = config.KeepAlive
+	connConfig.TLSHandshakeTimeout = config.TLSHandshakeTimeout
+	connConfig.ResponseHeaderTimeout = config.ResponseHeaderTimeout
+	connConfig.IdleConnTimeout = config.IdleConnTimeout
+	connConfig.MinTLSVersion = config.MinTLSVersion
+	connConfig.MaxTLSVersion = config.MaxTLSVersion
+	connConfig.InsecureSkipVerify = config.InsecureSkipVerify
+	connConfig.EnableHTTP2 = config.EnableHTTP2
+	connConfig.ProxyURL = config.ProxyURL
+	connConfig.EnableSystemProxy = config.EnableSystemProxy
+	connConfig.ProxyPool = config.ProxyPool
+	connConfig.ProxyPoolStrategy = config.ProxyPoolStrategy
+	connConfig.ProxyFailureThreshold = config.ProxyFailureThreshold
+	connConfig.ProxyCooldown = config.ProxyCooldown
+	connConfig.CookieJar = config.CookieJar
+	connConfig.AllowPrivateIPs = config.AllowPrivateIPs
+	connConfig.ExemptNets = config.ExemptNets
+	connConfig.EnableDoH = config.EnableDoH
+	connConfig.DoHCacheTTL = config.DoHCacheTTL
+	connConfig.TLSConfig = config.TLSConfig
+
+	if config.CertificatePinner != nil {
+		connConfig.SetCertPinner(config.CertificatePinner)
+	}
+	return connConfig
 }
 
 // ErrClientClosed is returned when attempting to use a closed client.
@@ -1000,10 +1012,14 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 			resp.SetRequestMethod(httpResp.Request.Method)
 		}
 
-		// Capture redirect metadata for streaming responses
-		if redirectChain := c.transport.GetRedirectChain(reqCopy.context); len(redirectChain) > 0 {
-			resp.SetRedirectChain(redirectChain)
-			resp.SetRedirectCount(len(redirectChain))
+		// Capture redirect metadata for streaming responses. Reading the chain
+		// straight off the settings object avoids a ctx.Value chain walk (the
+		// settings pointer is already in scope from SetRedirectPolicy).
+		if redirectSettings != nil {
+			if redirectChain := redirectSettings.getChain(); len(redirectChain) > 0 {
+				resp.SetRedirectChain(redirectChain)
+				resp.SetRedirectCount(len(redirectChain))
+			}
 		}
 
 		// Invoke OnResponse callback for streaming responses
@@ -1028,9 +1044,13 @@ func (c *Client) executeRequest(req *Request, skipCopy bool) (*Response, error) 
 		return nil, classifyErrorWithSanitizedURL(err, sanitizeOnce(), req.Method(), 0)
 	}
 
-	if redirectChain := c.transport.GetRedirectChain(reqCopy.context); len(redirectChain) > 0 {
-		resp.SetRedirectChain(redirectChain)
-		resp.SetRedirectCount(len(redirectChain))
+	// Read the chain straight off the settings object (see the streaming-path
+	// note above) rather than walking the request context.
+	if redirectSettings != nil {
+		if redirectChain := redirectSettings.getChain(); len(redirectChain) > 0 {
+			resp.SetRedirectChain(redirectChain)
+			resp.SetRedirectCount(len(redirectChain))
+		}
 	}
 
 	if httpResp.Request != nil {

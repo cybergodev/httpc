@@ -51,7 +51,7 @@ func TestData_JSON(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		data := TestData{Message: "test", Code: 200}
 		resp, err := client.Post(server.URL, WithJSON(data))
@@ -79,7 +79,7 @@ func TestData_JSON(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Post(server.URL, WithJSON(map[string]interface{}{}))
 		if err != nil {
@@ -111,7 +111,7 @@ func TestData_XML(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		data := TestData{Message: "test", Code: 200}
 		_, err := client.Post(server.URL, WithXML(data))
@@ -130,7 +130,7 @@ func TestData_XML(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		data := TestData{}
 		_, err := client.Post(server.URL, WithXML(data))
@@ -139,33 +139,11 @@ func TestData_XML(t *testing.T) {
 		}
 	})
 
-	t.Run("ReceiveXML", func(t *testing.T) {
-		xmlData := `<?xml version="1.0" encoding="UTF-8"?><TestData><message>hello</message><code>200</code></TestData>`
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/xml")
-			_, _ = w.Write([]byte(xmlData))
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		resp, err := client.Get(server.URL)
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-
-		var received TestData
-		if err := xml.Unmarshal(resp.RawBody(), &received); err != nil {
-			t.Fatalf("Failed to unmarshal XML response: %v", err)
-		}
-		if received.Message != "hello" {
-			t.Errorf("Expected message=hello, got %s", received.Message)
-		}
-		if received.Code != 200 {
-			t.Errorf("Expected code=200, got %d", received.Code)
-		}
-	})
+	// "ReceiveXML" was removed: it xml.Unmarshal'ed a literal the test itself
+	// wrote — the only httpc surface exercised was RawBody() returning bytes
+	// (covered by every response test). XML round-tripping through the real
+	// option layer is covered by TestBuildXMLWithCharsetContentType
+	// (request_test.go) and TestData_XML/SendXML above.
 }
 
 // ----------------------------------------------------------------------------
@@ -194,7 +172,7 @@ func TestData_Multipart(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		formData := &FormData{
 			Files: map[string]*FileData{
@@ -223,7 +201,7 @@ func TestData_Multipart(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		formData := &FormData{
 			Files: map[string]*FileData{
@@ -253,7 +231,7 @@ func TestData_Multipart(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		formData := &FormData{
 			Fields: map[string]string{"field1": "value1"},
@@ -277,7 +255,7 @@ func TestData_Multipart(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		formData := &FormData{
 			Files: map[string]*FileData{
@@ -324,7 +302,7 @@ func TestData_FormURLEncoded(t *testing.T) {
 	defer server.Close()
 
 	client, _ := newTestClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err := client.Post(server.URL, WithForm(map[string]string{
 		"field1": "value1",
@@ -396,7 +374,7 @@ func TestData_Compression(t *testing.T) {
 			defer server.Close()
 
 			client, _ := newTestClient()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			resp, err := client.Get(server.URL)
 			if err != nil {

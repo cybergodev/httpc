@@ -690,3 +690,45 @@ func TestValidateCookie_ControlCharsInPath(t *testing.T) {
 
 // TestValidateHeaderKeyValue_PseudoHeader is retired: the ":path" and ":method"
 // pseudo-header cases are already rows in TestValidateHeaderKeyValue_EdgeCases.
+
+// TestValidateMultipartToken covers the multipart Content-Disposition token
+// policy: control characters (the quoted-string breakout vector) and length
+// are rejected, while characters that cannot escape a quoted-string — but are
+// rejected by the stricter ValidateFieldName — remain legal.
+func TestValidateMultipartToken(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		what        string
+		wantErr     bool
+		errContains string
+	}{
+		{"plain filename", "report.pdf", "filename", false, ""},
+		{"empty string is legal", "", "filename", false, ""},
+		// Legal here but rejected by ValidateFieldName: the encoder
+		// backslash-escapes and quotes the value, so these cannot inject.
+		{"slash allowed", "sub/dir/file.txt", "filename", false, ""},
+		{"ampersand allowed", "a&b", "field name", false, ""},
+		{"quote allowed (escaped by encoder)", "he said \"hi\"", "filename", false, ""},
+		{"non-ASCII allowed", "résumé.pdf", "filename", false, ""},
+		// Breakout vectors: CR/LF inject MIME headers; other controls corrupt
+		// the part stream.
+		{"CR rejected", "file\rname", "filename", true, "control characters"},
+		{"LF rejected", "file\nname", "filename", true, "control characters"},
+		{"CRLF rejected", "file\r\nname", "filename", true, "control characters"},
+		{"NUL rejected", "file\x00name", "filename", true, "control characters"},
+		{"DEL 0x7F rejected", "file\x7fname", "filename", true, "control characters"},
+		{"first control byte 0x01", "file\x01name", "filename", true, "control characters"},
+		{"last control byte 0x1F", "file\x1fname", "filename", true, "control characters"},
+		{"space 0x20 is legal", "my file.txt", "filename", false, ""},
+		{"exact max length", strings.Repeat("a", MaxFilenameLen), "filename", false, ""},
+		{"one over max length", strings.Repeat("a", MaxFilenameLen+1), "filename", true, "too long"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateMultipartToken(tt.input, tt.what)
+			assertValidationResult(t, "ValidateMultipartToken", err, tt.wantErr, tt.errContains)
+		})
+	}
+}

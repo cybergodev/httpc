@@ -159,6 +159,7 @@ func (e *ClientError) Unwrap() error {
 }
 
 // WithType returns a copy of the error with the specified type set.
+// Currently exercised only by tests.
 func (e *ClientError) WithType(t ErrorType) *ClientError {
 	cp := &ClientError{}
 	*cp = *e

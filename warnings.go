@@ -73,12 +73,12 @@ func warnTestingConfigInProduction() {
 	if !isTestEnvironment() {
 		testingConfigWarnOnce.Do(func() {
 			w := getSecurityWarnOutput()
-			fmt.Fprintf(w, "[SECURITY WARNING] TestingConfig is being used in a non-test environment!\n")
-			fmt.Fprintf(w, "[SECURITY WARNING] This configuration disables critical security features:\n")
-			fmt.Fprintf(w, "[SECURITY WARNING]   - TLS certificate verification is DISABLED\n")
-			fmt.Fprintf(w, "[SECURITY WARNING]   - SSRF protection is DISABLED\n")
-			fmt.Fprintf(w, "[SECURITY WARNING]   - URL/Header validation is DISABLED\n")
-			fmt.Fprintf(w, "[SECURITY WARNING] Use SecureConfig() or DefaultConfig() for production!\n")
+			_, _ = fmt.Fprintf(w, "[SECURITY WARNING] TestingConfig is being used in a non-test environment!\n")  // best-effort warning
+			_, _ = fmt.Fprintf(w, "[SECURITY WARNING] This configuration disables critical security features:\n") // best-effort warning
+			_, _ = fmt.Fprintf(w, "[SECURITY WARNING]   - TLS certificate verification is DISABLED\n")            // best-effort warning
+			_, _ = fmt.Fprintf(w, "[SECURITY WARNING]   - SSRF protection is DISABLED\n")                         // best-effort warning
+			_, _ = fmt.Fprintf(w, "[SECURITY WARNING]   - URL/Header validation is DISABLED\n")                   // best-effort warning
+			_, _ = fmt.Fprintf(w, "[SECURITY WARNING] Use SecureConfig() or DefaultConfig() for production!\n")   // best-effort warning
 		})
 	}
 }

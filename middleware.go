@@ -41,7 +41,7 @@ func getOrComputeSanitizedURL(req RequestMutator) string {
 // It captures request/response details for compliance logging in financial,
 // medical, and government applications.
 type AuditEvent struct {
-	// Timestamp is when the request completed.
+	// Timestamp is when the request started; add Duration for the end time.
 	Timestamp time.Time `json:"timestamp"`
 	// Method is the HTTP method of the request.
 	Method string `json:"method"`

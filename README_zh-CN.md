@@ -259,7 +259,7 @@ httpc.WithStreamBody(true)
 
 ```go
 // 单个 Cookie
-httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"})
+httpc.WithCookies([]http.Cookie{{Name: "session", Value: "abc123"}})
 
 // 批量设置多个 Cookie (高效，预分配容量)
 httpc.WithCookies([]http.Cookie{
@@ -326,7 +326,7 @@ httpc.WithOnResponse(func(resp httpc.ResponseMutator) error {
 | **认证** | `WithBearerToken(token)`, `WithBasicAuth(user, pass)` |
 | **查询参数** | `WithQuery(key, value)`, `WithQueryMap(map)` |
 | **请求体** | `WithJSON(data)`, `WithXML(data)`, `WithForm(map)`, `WithFormData(*FormData)`, `WithFile(field, filename, content)`, `WithBody(data, ...BodyKind)`, `WithBinary([]byte, ...contentType)`, `WithStreamBody(bool)` |
-| **Cookie** | `WithCookie(cookie)`, `WithCookies([]Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
+| **Cookie** | `WithCookies([]http.Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
 | **控制** | `WithTimeout(dur)`, `WithMaxRetries(n)`, `WithContext(ctx)`, `WithAllowPrivateIPs(bool)` |
 | **重定向** | `WithFollowRedirects(bool)`, `WithMaxRedirects(n)` |
 | **回调** | `WithOnRequest(fn)`, `WithOnResponse(fn)` |

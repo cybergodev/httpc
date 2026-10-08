@@ -259,7 +259,7 @@ httpc.WithStreamBody(true)
 
 ```go
 // Single cookie
-httpc.WithCookie(http.Cookie{Name: "session", Value: "abc123"})
+httpc.WithCookies([]http.Cookie{{Name: "session", Value: "abc123"}})
 
 // Batch multiple cookies (efficient, pre-allocates capacity)
 httpc.WithCookies([]http.Cookie{
@@ -326,7 +326,7 @@ httpc.WithOnResponse(func(resp httpc.ResponseMutator) error {
 | **Auth** | `WithBearerToken(token)`, `WithBasicAuth(user, pass)` |
 | **Query** | `WithQuery(key, value)`, `WithQueryMap(map)` |
 | **Body** | `WithJSON(data)`, `WithXML(data)`, `WithForm(map)`, `WithFormData(*FormData)`, `WithFile(field, filename, content)`, `WithBody(data, ...BodyKind)`, `WithBinary([]byte, ...contentType)`, `WithStreamBody(bool)` |
-| **Cookies** | `WithCookie(cookie)`, `WithCookies([]Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
+| **Cookies** | `WithCookies([]http.Cookie)`, `WithCookieMap(map)`, `WithCookieString("a=1; b=2")`, `WithSecureCookie(config)` |
 | **Control** | `WithTimeout(dur)`, `WithMaxRetries(n)`, `WithContext(ctx)`, `WithAllowPrivateIPs(bool)` |
 | **Redirects** | `WithFollowRedirects(bool)`, `WithMaxRedirects(n)` |
 | **Callbacks** | `WithOnRequest(fn)`, `WithOnResponse(fn)` |

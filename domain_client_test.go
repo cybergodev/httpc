@@ -4,10 +4,11 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/cybergodev/httpc"
@@ -22,7 +23,7 @@ func TestNewDomainDefault(t *testing.T) {
 	if dc == nil {
 		t.Fatal("Expected non-nil DomainClienter")
 	}
-	defer dc.Close()
+	defer func() { _ = dc.Close() }()
 
 	if dc.URL() != "https://api.example.com" {
 		t.Errorf("expected base URL %q, got %q", "https://api.example.com", dc.URL())
@@ -78,7 +79,7 @@ func TestNewDomain(t *testing.T) {
 				return
 			}
 			if client != nil {
-				defer client.Close()
+				defer func() { _ = client.Close() }()
 			}
 		})
 	}
@@ -118,7 +119,7 @@ func TestDomainClient_AutomaticCookieManagement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// First request
 	resp1, err := client.Get("/")
@@ -170,7 +171,7 @@ func TestDomainClient_AutomaticHeaderManagement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// First request with initial header
 	_, err = client.Get("/", httpc.WithHeader("X-Custom", "initial"))
@@ -208,7 +209,7 @@ func TestDomainClient_CookieOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Set persistent cookie
 	err = client.SetCookie(&http.Cookie{Name: "test", Value: "persistent"})
@@ -217,7 +218,7 @@ func TestDomainClient_CookieOverride(t *testing.T) {
 	}
 
 	// Request with override cookie
-	resp, err := client.Get("/", httpc.WithCookie(http.Cookie{Name: "test", Value: "override"}))
+	resp, err := client.Get("/", httpc.WithCookies([]http.Cookie{{Name: "test", Value: "override"}}))
 	if err != nil {
 		t.Fatalf("Request error = %v", err)
 	}
@@ -239,7 +240,7 @@ func TestDomainClient_HeaderOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Set persistent header
 	err = client.SetHeader("X-Test", "persistent")
@@ -261,144 +262,17 @@ func TestDomainClient_HeaderOverride(t *testing.T) {
 // newTestDomain returns a DomainClient bound to a fixed example base URL, with
 // Close registered for automatic cleanup. It collapses the repeated
 // NewDomain + defer Close boilerplate shared by the session-accessor tests.
-func newTestDomain(t *testing.T) httpc.DomainClienter {
-	t.Helper()
-	client, err := httpc.NewDomain("https://api.example.com", httpc.DefaultConfig())
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	t.Cleanup(func() { _ = client.Close() })
-	return client
-}
+// (newTestDomain was removed with the session-accessor CRUD tests that were
+// its only callers.)
 
-func TestDomainClient_SetHeaders(t *testing.T) {
-	client := newTestDomain(t)
-
-	headers := map[string]string{
-		"X-Custom-1": "value1",
-		"X-Custom-2": "value2",
-	}
-
-	if err := client.SetHeaders(headers); err != nil {
-		t.Fatalf("SetHeaders error = %v", err)
-	}
-
-	got := client.GetHeaders()
-	if len(got) != 2 {
-		t.Errorf("Expected 2 headers, got %d", len(got))
-	}
-	if got["X-Custom-1"] != "value1" {
-		t.Errorf("X-Custom-1 = %v, want value1", got["X-Custom-1"])
-	}
-	if got["X-Custom-2"] != "value2" {
-		t.Errorf("X-Custom-2 = %v, want value2", got["X-Custom-2"])
-	}
-}
-
-func TestDomainClient_DeleteHeader(t *testing.T) {
-	client := newTestDomain(t)
-
-	if err := client.SetHeader("X-Test", "value"); err != nil {
-		t.Fatalf("SetHeader error = %v", err)
-	}
-
-	client.DeleteHeader("X-Test")
-
-	got := client.GetHeaders()
-	if len(got) != 0 {
-		t.Errorf("Expected 0 headers after delete, got %d", len(got))
-	}
-}
-
-func TestDomainClient_ClearHeaders(t *testing.T) {
-	client := newTestDomain(t)
-
-	headers := map[string]string{
-		"X-Custom-1": "value1",
-		"X-Custom-2": "value2",
-	}
-	if err := client.SetHeaders(headers); err != nil {
-		t.Fatalf("SetHeaders error = %v", err)
-	}
-
-	client.ClearHeaders()
-
-	got := client.GetHeaders()
-	if len(got) != 0 {
-		t.Errorf("Expected 0 headers after clear, got %d", len(got))
-	}
-}
-
-func TestDomainClient_SetCookies(t *testing.T) {
-	client := newTestDomain(t)
-
-	cookies := []*http.Cookie{
-		{Name: "cookie1", Value: "value1"},
-		{Name: "cookie2", Value: "value2"},
-	}
-
-	if err := client.SetCookies(cookies); err != nil {
-		t.Fatalf("SetCookies error = %v", err)
-	}
-
-	got := client.GetCookies()
-	if len(got) != 2 {
-		t.Errorf("Expected 2 cookies, got %d", len(got))
-	}
-}
-
-func TestDomainClient_GetCookie(t *testing.T) {
-	client := newTestDomain(t)
-
-	if err := client.SetCookie(&http.Cookie{Name: "test", Value: "value"}); err != nil {
-		t.Fatalf("SetCookie error = %v", err)
-	}
-
-	cookie := client.GetCookie("test")
-	if cookie == nil {
-		t.Fatal("GetCookie returned nil")
-	}
-	if cookie.Name != "test" || cookie.Value != "value" {
-		t.Errorf("GetCookie = %v/%v, want test/value", cookie.Name, cookie.Value)
-	}
-
-	if notFound := client.GetCookie("nonexistent"); notFound != nil {
-		t.Errorf("GetCookie for nonexistent cookie should return nil")
-	}
-}
-
-func TestDomainClient_DeleteCookie(t *testing.T) {
-	client := newTestDomain(t)
-
-	if err := client.SetCookie(&http.Cookie{Name: "test", Value: "value"}); err != nil {
-		t.Fatalf("SetCookie error = %v", err)
-	}
-
-	client.DeleteCookie("test")
-
-	if cookie := client.GetCookie("test"); cookie != nil {
-		t.Errorf("Cookie should be deleted")
-	}
-}
-
-func TestDomainClient_ClearCookies(t *testing.T) {
-	client := newTestDomain(t)
-
-	cookies := []*http.Cookie{
-		{Name: "cookie1", Value: "value1"},
-		{Name: "cookie2", Value: "value2"},
-	}
-	if err := client.SetCookies(cookies); err != nil {
-		t.Fatalf("SetCookies error = %v", err)
-	}
-
-	client.ClearCookies()
-
-	got := client.GetCookies()
-	if len(got) != 0 {
-		t.Errorf("Expected 0 cookies after clear, got %d", len(got))
-	}
-}
+// The session-accessor CRUD tests (SetHeaders / DeleteHeader / ClearHeaders /
+// SetCookies / GetCookie / DeleteCookie / ClearCookies) were removed:
+// DomainClient embeds *SessionManager and these methods are 1-line delegates;
+// the identical CRUD behavior is tested directly in session_test.go, and the
+// compile-time `var _ DomainClienter` assertion (domain_client.go) guarantees
+// the method set stays wired. The InvalidHeaderValidation /
+// InvalidCookieValidation variants (formerly below) were removed for the same
+// reason — validation is SessionManager's, tested in session_test.go.
 
 func TestDomainClient_PathHandling(t *testing.T) {
 	tests := []struct {
@@ -449,7 +323,7 @@ func TestDomainClient_PathHandling(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewDomain() error = %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			_, err = client.Get(tt.path)
 			if err != nil {
@@ -479,7 +353,7 @@ func TestDomainClient_FullURLHandling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	tests := []struct {
 		name     string
@@ -550,7 +424,7 @@ func TestDomainClient_SameDomainCookiePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// First request with relative path
 	resp1, err := client.Get("/login")
@@ -597,7 +471,7 @@ func TestDomainClient_HTTPMethods(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewDomain() error = %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			resp, err := tt.do(client, "/resource")
 			if err != nil {
@@ -625,7 +499,7 @@ func TestDomainClient_ConcurrentAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Set initial state
 	err = client.SetHeader("X-Test", "value")
@@ -637,338 +511,212 @@ func TestDomainClient_ConcurrentAccess(t *testing.T) {
 		t.Fatalf("SetCookie error = %v", err)
 	}
 
-	// Concurrent reads and writes
-	done := make(chan bool)
+	// Concurrent reads and writes. The goroutine bodies are a data-race probe
+	// under -race, but their failures must still be reported in normal runs
+	// (formerly discarded silently).
+	var ops int64
+	var failed int64
+	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {
+		wg.Add(1)
 		go func(id int) {
-			defer func() { done <- true }()
-
-			// Mix of operations (results discarded: this is a data-race probe)
-			_, _ = client.Get("/")
-			_ = client.SetHeader("X-Concurrent", "test")
+			defer wg.Done()
+			if _, err := client.Get("/"); err != nil {
+				atomic.AddInt64(&failed, 1)
+			}
+			if err := client.SetHeader("X-Concurrent", "test"); err != nil {
+				atomic.AddInt64(&failed, 1)
+			}
 			client.GetHeaders()
-			_ = client.SetCookie(&http.Cookie{Name: "concurrent", Value: "test"})
+			if err := client.SetCookie(&http.Cookie{Name: "concurrent", Value: "test"}); err != nil {
+				atomic.AddInt64(&failed, 1)
+			}
 			client.GetCookies()
+			atomic.AddInt64(&ops, 5)
 		}(i)
 	}
+	wg.Wait()
 
-	// Wait for all goroutines
-	for i := 0; i < 10; i++ {
-		<-done
+	if got := atomic.LoadInt64(&failed); got != 0 {
+		t.Errorf("%d concurrent operations failed", got)
+	}
+	if got := atomic.LoadInt64(&ops); got != 50 {
+		t.Errorf("completed %d operations, want 50", got)
 	}
 }
 
-func TestDomainClient_InvalidHeaderValidation(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com", httpc.DefaultConfig())
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
+// (InvalidHeaderValidation / InvalidCookieValidation removed with the other
+// session-accessor passthrough tests — see the note below.)
 
-	// Test invalid header key
-	err = client.SetHeader("", "value")
-	if err == nil {
-		t.Error("Expected error for empty header key")
-	}
-
-	// Test invalid header with control characters
-	err = client.SetHeader("X-Test\r\n", "value")
-	if err == nil {
-		t.Error("Expected error for header key with control characters")
-	}
-}
-
-func TestDomainClient_InvalidCookieValidation(t *testing.T) {
-	client, err := httpc.NewDomain("https://api.example.com", httpc.DefaultConfig())
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
-
-	// Test nil cookie
-	err = client.SetCookie(nil)
-	if err == nil {
-		t.Error("Expected error for nil cookie")
-	}
-
-	// Test empty cookie name
-	err = client.SetCookie(&http.Cookie{Name: "", Value: "value"})
-	if err == nil {
-		t.Error("Expected error for empty cookie name")
-	}
-
-	// Test cookie with invalid characters
-	err = client.SetCookie(&http.Cookie{Name: "test\r\n", Value: "value"})
-	if err == nil {
-		t.Error("Expected error for cookie name with control characters")
-	}
-}
-
-func TestDomainClient_AutoPersistRequestOptions(t *testing.T) {
-	// Test that cookies and headers passed via options are automatically persisted
-	requestCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-
-		if requestCount == 1 {
-			// First request: verify initial cookies and headers
-			cookie, err := r.Cookie("request-cookie")
-			if err != nil || cookie.Value != "request-value" {
-				t.Errorf("First request: cookie not found or incorrect")
-			}
-			if r.Header.Get("X-Request-Header") != "request-header-value" {
-				t.Errorf("First request: header not found or incorrect")
-			}
-			w.WriteHeader(http.StatusOK)
-		} else {
-			// Second request: verify cookies and headers are automatically sent
-			cookie, err := r.Cookie("request-cookie")
-			if err != nil || cookie.Value != "request-value" {
-				t.Errorf("Second request: cookie not persisted")
-			}
-			if r.Header.Get("X-Request-Header") != "request-header-value" {
-				t.Errorf("Second request: header not persisted")
-			}
-			w.WriteHeader(http.StatusOK)
+// TestDomainClient_AutoPersist consolidates the former AutoPersist family
+// (RequestOptions / WithFullURL / MultipleCookies / HeaderMap / Override —
+// five tests with identical scaffold, differing only in the options payload
+// and URL form): artifacts passed via request options are captured into the
+// session and re-sent on subsequent requests, and newer options override
+// previously persisted values.
+func TestDomainClient_AutoPersist(t *testing.T) {
+	tests := []struct {
+		name     string
+		requests []struct {
+			path string // relative path, or a full URL for the full-URL rows
+			opts []httpc.RequestOption
 		}
-	}))
-	defer server.Close()
-
-	cfg := httpc.TestingConfig()
-	cfg.Security.AllowPrivateIPs = true
-	client, err := httpc.NewDomain(server.URL, cfg)
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
-
-	// First request with cookies and headers via options
-	_, err = client.Get("/first",
-		httpc.WithCookie(http.Cookie{Name: "request-cookie", Value: "request-value"}),
-		httpc.WithHeader("X-Request-Header", "request-header-value"),
-	)
-	if err != nil {
-		t.Fatalf("First request error = %v", err)
-	}
-
-	// Second request without options - should automatically use persisted values
-	_, err = client.Get("/second")
-	if err != nil {
-		t.Fatalf("Second request error = %v", err)
-	}
-
-	if requestCount != 2 {
-		t.Errorf("Expected 2 requests, got %d", requestCount)
-	}
-}
-
-func TestDomainClient_AutoPersistWithFullURL(t *testing.T) {
-	// Test that options are persisted even when using full URLs
-	requestCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-
-		cookie, err := r.Cookie("test-cookie")
-		if err != nil || cookie.Value != "test-value" {
-			t.Errorf("Request %d: cookie not found or incorrect", requestCount)
-		}
-		if r.Header.Get("X-Test") != "test-header" {
-			t.Errorf("Request %d: header not found or incorrect", requestCount)
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	cfg := httpc.TestingConfig()
-	cfg.Security.AllowPrivateIPs = true
-	client, err := httpc.NewDomain(server.URL, cfg)
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
-
-	// First request with relative path and options
-	_, err = client.Get("/first",
-		httpc.WithCookie(http.Cookie{Name: "test-cookie", Value: "test-value"}),
-		httpc.WithHeader("X-Test", "test-header"),
-	)
-	if err != nil {
-		t.Fatalf("First request error = %v", err)
-	}
-
-	// Second request with full URL (same domain) - should use persisted options
-	_, err = client.Get(server.URL + "/second")
-	if err != nil {
-		t.Fatalf("Second request error = %v", err)
-	}
-
-	// Third request with relative path - should still use persisted options
-	_, err = client.Get("/third")
-	if err != nil {
-		t.Fatalf("Third request error = %v", err)
-	}
-
-	if requestCount != 3 {
-		t.Errorf("Expected 3 requests, got %d", requestCount)
-	}
-}
-
-func TestDomainClient_AutoPersistMultipleCookies(t *testing.T) {
-	// Test that multiple cookies are persisted correctly
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		cookie1, err1 := r.Cookie("cookie1")
-		cookie2, err2 := r.Cookie("cookie2")
-		cookie3, err3 := r.Cookie("cookie3")
-
-		if err1 != nil || cookie1.Value != "value1" {
-			t.Error("cookie1 not found or incorrect")
-		}
-		if err2 != nil || cookie2.Value != "value2" {
-			t.Error("cookie2 not found or incorrect")
-		}
-		if err3 != nil || cookie3.Value != "value3" {
-			t.Error("cookie3 not found or incorrect")
-		}
-
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	cfg := httpc.TestingConfig()
-	cfg.Security.AllowPrivateIPs = true
-	client, err := httpc.NewDomain(server.URL, cfg)
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
-
-	// First request with multiple cookies
-	_, err = client.Get("/first",
-		httpc.WithCookie(http.Cookie{Name: "cookie1", Value: "value1"}),
-		httpc.WithCookie(http.Cookie{Name: "cookie2", Value: "value2"}),
-		httpc.WithCookie(http.Cookie{Name: "cookie3", Value: "value3"}),
-	)
-	if err != nil {
-		t.Fatalf("First request error = %v", err)
+		// wantSnapshots[i] is the cookie/header snapshot the server must
+		// observe on requests[i].
+		wantSnapshots []map[string]string // merged cookie ("cookie:name") + header ("header:name") values
+	}{
+		{
+			name: "single cookie and header persist",
+			requests: []struct {
+				path string
+				opts []httpc.RequestOption
+			}{
+				{"/first", []httpc.RequestOption{
+					httpc.WithCookies([]http.Cookie{{Name: "c", Value: "v1"}}),
+					httpc.WithHeader("X-H", "h1"),
+				}},
+				{"/second", nil},
+			},
+			wantSnapshots: []map[string]string{
+				{"cookie:c": "v1", "header:X-H": "h1"},
+				{"cookie:c": "v1", "header:X-H": "h1"},
+			},
+		},
+		{
+			name: "persists across full-URL and relative requests",
+			requests: []struct {
+				path string
+				opts []httpc.RequestOption
+			}{
+				{"/first", []httpc.RequestOption{
+					httpc.WithCookies([]http.Cookie{{Name: "c", Value: "v"}}),
+					httpc.WithHeader("X-H", "h"),
+				}},
+				{"FULLURL:/second", nil}, // replaced with the server URL in the loop
+				{"/third", nil},
+			},
+			wantSnapshots: []map[string]string{
+				{"cookie:c": "v", "header:X-H": "h"},
+				{"cookie:c": "v", "header:X-H": "h"},
+				{"cookie:c": "v", "header:X-H": "h"},
+			},
+		},
+		{
+			name: "multiple cookies persist",
+			requests: []struct {
+				path string
+				opts []httpc.RequestOption
+			}{
+				{"/first", []httpc.RequestOption{
+					httpc.WithCookies([]http.Cookie{
+						{Name: "c1", Value: "v1"},
+						{Name: "c2", Value: "v2"},
+						{Name: "c3", Value: "v3"},
+					}),
+				}},
+				{"/second", nil},
+			},
+			wantSnapshots: []map[string]string{
+				{"cookie:c1": "v1", "cookie:c2": "v2", "cookie:c3": "v3"},
+				{"cookie:c1": "v1", "cookie:c2": "v2", "cookie:c3": "v3"},
+			},
+		},
+		{
+			name: "header map persists",
+			requests: []struct {
+				path string
+				opts []httpc.RequestOption
+			}{
+				{"/first", []httpc.RequestOption{
+					httpc.WithHeaderMap(map[string]string{
+						"X-H1": "v1", "X-H2": "v2", "X-H3": "v3",
+					}),
+				}},
+				{"/second", nil},
+			},
+			wantSnapshots: []map[string]string{
+				{"header:X-H1": "v1", "header:X-H2": "v2", "header:X-H3": "v3"},
+				{"header:X-H1": "v1", "header:X-H2": "v2", "header:X-H3": "v3"},
+			},
+		},
+		{
+			name: "new options override persisted values",
+			requests: []struct {
+				path string
+				opts []httpc.RequestOption
+			}{
+				{"/first", []httpc.RequestOption{
+					httpc.WithCookies([]http.Cookie{{Name: "c", Value: "v1"}}),
+					httpc.WithHeader("X-H", "h1"),
+				}},
+				{"/second", []httpc.RequestOption{
+					httpc.WithCookies([]http.Cookie{{Name: "c", Value: "v2"}}),
+					httpc.WithHeader("X-H", "h2"),
+				}},
+				{"/third", nil},
+			},
+			wantSnapshots: []map[string]string{
+				{"cookie:c": "v1", "header:X-H": "h1"},
+				{"cookie:c": "v2", "header:X-H": "h2"},
+				{"cookie:c": "v2", "header:X-H": "h2"},
+			},
+		},
 	}
 
-	// Second request - should automatically send all cookies
-	_, err = client.Get("/second")
-	if err != nil {
-		t.Fatalf("Second request error = %v", err)
-	}
-}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// The handler records a cookie/header snapshot per request.
+			var mu sync.Mutex
+			var snapshots []map[string]string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				snap := make(map[string]string, 4)
+				for _, c := range r.Cookies() {
+					snap["cookie:"+c.Name] = c.Value
+				}
+				for name, vals := range r.Header {
+					if len(vals) > 0 {
+						snap["header:"+name] = vals[0]
+					}
+				}
+				mu.Lock()
+				snapshots = append(snapshots, snap)
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
 
-func TestDomainClient_AutoPersistHeaderMap(t *testing.T) {
-	// Test that header map is persisted correctly
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Header-1") != "value1" {
-			t.Error("X-Header-1 not found or incorrect")
-		}
-		if r.Header.Get("X-Header-2") != "value2" {
-			t.Error("X-Header-2 not found or incorrect")
-		}
-		if r.Header.Get("X-Header-3") != "value3" {
-			t.Error("X-Header-3 not found or incorrect")
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	cfg := httpc.TestingConfig()
-	cfg.Security.AllowPrivateIPs = true
-	client, err := httpc.NewDomain(server.URL, cfg)
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
-
-	// First request with header map
-	_, err = client.Get("/first",
-		httpc.WithHeaderMap(map[string]string{
-			"X-Header-1": "value1",
-			"X-Header-2": "value2",
-			"X-Header-3": "value3",
-		}),
-	)
-	if err != nil {
-		t.Fatalf("First request error = %v", err)
-	}
-
-	// Second request - should automatically send all headers
-	_, err = client.Get("/second")
-	if err != nil {
-		t.Fatalf("Second request error = %v", err)
-	}
-}
-
-func TestDomainClient_AutoPersistOverride(t *testing.T) {
-	// Test that new options override persisted ones
-	requestCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-
-		cookie, _ := r.Cookie("test-cookie")
-		header := r.Header.Get("X-Test")
-
-		if requestCount == 1 {
-			if cookie.Value != "value1" {
-				t.Errorf("Request 1: expected cookie value1, got %s", cookie.Value)
+			cfg := httpc.TestingConfig()
+			cfg.Security.AllowPrivateIPs = true
+			client, err := httpc.NewDomain(server.URL, cfg)
+			if err != nil {
+				t.Fatalf("NewDomain() error = %v", err)
 			}
-			if header != "header1" {
-				t.Errorf("Request 1: expected header header1, got %s", header)
-			}
-		} else if requestCount == 2 {
-			if cookie.Value != "value2" {
-				t.Errorf("Request 2: expected cookie value2, got %s", cookie.Value)
-			}
-			if header != "header2" {
-				t.Errorf("Request 2: expected header header2, got %s", header)
-			}
-		} else {
-			// Third request should use the last persisted values
-			if cookie.Value != "value2" {
-				t.Errorf("Request 3: expected cookie value2, got %s", cookie.Value)
-			}
-			if header != "header2" {
-				t.Errorf("Request 3: expected header header2, got %s", header)
-			}
-		}
+			defer func() { _ = client.Close() }()
 
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
+			for i, req := range tt.requests {
+				path := req.path
+				if after, ok := strings.CutPrefix(path, "FULLURL:"); ok {
+					path = server.URL + after
+				}
+				if _, err := client.Get(path, req.opts...); err != nil {
+					t.Fatalf("request %d (%s) error = %v", i+1, path, err)
+				}
+			}
 
-	cfg := httpc.TestingConfig()
-	cfg.Security.AllowPrivateIPs = true
-	client, err := httpc.NewDomain(server.URL, cfg)
-	if err != nil {
-		t.Fatalf("NewDomain() error = %v", err)
-	}
-	defer client.Close()
-
-	// First request
-	_, err = client.Get("/first",
-		httpc.WithCookie(http.Cookie{Name: "test-cookie", Value: "value1"}),
-		httpc.WithHeader("X-Test", "header1"),
-	)
-	if err != nil {
-		t.Fatalf("First request error = %v", err)
-	}
-
-	// Second request with different values (should override)
-	_, err = client.Get("/second",
-		httpc.WithCookie(http.Cookie{Name: "test-cookie", Value: "value2"}),
-		httpc.WithHeader("X-Test", "header2"),
-	)
-	if err != nil {
-		t.Fatalf("Second request error = %v", err)
-	}
-
-	// Third request without options (should use last persisted values)
-	_, err = client.Get("/third")
-	if err != nil {
-		t.Fatalf("Third request error = %v", err)
+			mu.Lock()
+			defer mu.Unlock()
+			if len(snapshots) != len(tt.wantSnapshots) {
+				t.Fatalf("server saw %d requests, want %d", len(snapshots), len(tt.wantSnapshots))
+			}
+			for i, want := range tt.wantSnapshots {
+				got := snapshots[i]
+				for key, wantVal := range want {
+					if gotVal, ok := got[key]; !ok || gotVal != wantVal {
+						t.Errorf("request %d: %s = %q, want %q", i+1, key, gotVal, wantVal)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -1007,7 +755,7 @@ func TestDomainClient_RealWorldScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain() error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Step 1: Login
 	loginResp, err := client.Post("/login", httpc.WithJSON(map[string]string{
@@ -1071,7 +819,7 @@ func TestDomainClient_Download_WithAutoHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	err = client.SetHeader("Authorization", "Bearer test-token")
 	if err != nil {
@@ -1084,7 +832,7 @@ func TestDomainClient_Download_WithAutoHeaders(t *testing.T) {
 	}
 
 	tmpFile := filepath.Join(t.TempDir(), "test_download_headers.txt")
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	_, err = client.Download(context.Background(), "/file.txt", &httpc.DownloadConfig{FilePath: tmpFile})
 	if err != nil {
@@ -1118,7 +866,7 @@ func TestDomainClient_Download_WithAutoCookies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	err = client.SetCookie(&http.Cookie{
 		Name:  "session",
@@ -1129,7 +877,7 @@ func TestDomainClient_Download_WithAutoCookies(t *testing.T) {
 	}
 
 	tmpFile := filepath.Join(t.TempDir(), "test_download_cookies.txt")
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	_, err = client.Download(context.Background(), "/file.txt", &httpc.DownloadConfig{FilePath: tmpFile})
 	if err != nil {
@@ -1163,10 +911,10 @@ func TestDomainClient_Download_FullURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain error = %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	tmpFile := filepath.Join(t.TempDir(), "test_download_fullurl.txt")
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	result, err := client.Download(context.Background(), server2.URL+"/file.txt", &httpc.DownloadConfig{FilePath: tmpFile})
 	if err != nil {
@@ -1209,10 +957,10 @@ func TestDomainClient_Download_WithPathOptions(t *testing.T) {
 			defer server.Close()
 
 			client, _ := httpc.NewDomain(server.URL, httpc.TestingConfig())
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			tmpFile := filepath.Join(t.TempDir(), "test_path_"+tt.name+".txt")
-			defer os.Remove(tmpFile)
+			defer func() { _ = os.Remove(tmpFile) }()
 
 			_, err := client.Download(context.Background(), tt.path, &httpc.DownloadConfig{FilePath: tmpFile})
 			if err != nil {
@@ -1240,21 +988,10 @@ func TestDomainClient_Accessors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain failed: %v", err)
 	}
-	defer dc.Close()
+	defer func() { _ = dc.Close() }()
 
-	t.Run("URL", func(t *testing.T) {
-		if dc.URL() != server.URL {
-			t.Errorf("URL() = %q, want %q", dc.URL(), server.URL)
-		}
-	})
-
-	t.Run("Domain", func(t *testing.T) {
-		u, _ := url.Parse(server.URL)
-		if dc.Domain() != u.Hostname() {
-			t.Errorf("Domain() = %q, want %q", dc.Domain(), u.Hostname())
-		}
-	})
-
+	// URL()/Domain() are asserted by TestNewDomainDefault; this test covers
+	// the remaining accessor.
 	t.Run("Session", func(t *testing.T) {
 		if dc.Session() == nil {
 			t.Error("Session() should not be nil")
@@ -1278,11 +1015,11 @@ func TestDomainClient_BuildURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDomain failed: %v", err)
 	}
-	defer dc.Close()
+	defer func() { _ = dc.Close() }()
 
 	t.Run("empty path returns base URL", func(t *testing.T) {
 		dc2, _ := httpc.NewDomain(server.URL+"/api", cfg)
-		defer dc2.Close()
+		defer func() { _ = dc2.Close() }()
 		// Empty path should return base URL with /api
 		resp, err := dc2.Get("")
 		if err != nil {
@@ -1302,7 +1039,7 @@ func TestDomainClient_BuildURL(t *testing.T) {
 		defer qs.Close()
 
 		dc2, _ := httpc.NewDomain(qs.URL, cfg)
-		defer dc2.Close()
+		defer func() { _ = dc2.Close() }()
 
 		resp, err := dc2.Get("/search?q=test")
 		if err != nil {
@@ -1319,7 +1056,7 @@ func TestDomainClient_BuildURL(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewDomain failed: %v", err)
 		}
-		defer dc2.Close()
+		defer func() { _ = dc2.Close() }()
 
 		// "../apix" via stdpath.Join("/api", "../apix") = "/apix"
 		// Old check: HasPrefix("/apix", "/api") = true -> ALLOWED (bug!)
@@ -1335,7 +1072,7 @@ func TestDomainClient_BuildURL(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewDomain failed: %v", err)
 		}
-		defer dc2.Close()
+		defer func() { _ = dc2.Close() }()
 
 		resp, err := dc2.Get("/v1/users")
 		if err != nil {
@@ -1357,7 +1094,7 @@ func TestDomainClient_BuildURL(t *testing.T) {
 		defer ts.Close()
 
 		dc2, _ := httpc.NewDomain(ts.URL+"/api", cfg)
-		defer dc2.Close()
+		defer func() { _ = dc2.Close() }()
 
 		if _, err := dc2.Get("sub/"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1378,7 +1115,7 @@ func TestDomainClient_BuildURL(t *testing.T) {
 		// Base URL carries its own query; the request adds more. Root base path
 		// keeps the buildURL escape-check dormant so the merge branch is reached.
 		dc2, _ := httpc.NewDomain(ts.URL+"/?a=1", cfg)
-		defer dc2.Close()
+		defer func() { _ = dc2.Close() }()
 
 		if _, err := dc2.Get("/p?b=2"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -1393,7 +1130,7 @@ func TestDomainClient_BuildURL(t *testing.T) {
 		// not observable server-side; this case exists to execute buildURL's
 		// fragment branch and confirm no error.
 		dc2, _ := httpc.NewDomain(server.URL+"/api", cfg)
-		defer dc2.Close()
+		defer func() { _ = dc2.Close() }()
 
 		if _, err := dc2.Get("/v1/users#section"); err != nil {
 			t.Errorf("fragment path should not error: %v", err)
@@ -1402,7 +1139,7 @@ func TestDomainClient_BuildURL(t *testing.T) {
 
 	t.Run("invalid path rejected", func(t *testing.T) {
 		dc2, _ := httpc.NewDomain(server.URL+"/api", cfg)
-		defer dc2.Close()
+		defer func() { _ = dc2.Close() }()
 
 		_, err := dc2.Get("%zz") // invalid percent-encoding -> url.Parse error
 		if err == nil || !strings.Contains(err.Error(), "invalid path") {

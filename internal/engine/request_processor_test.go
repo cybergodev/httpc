@@ -774,3 +774,30 @@ func TestBuild_URLUserinfoBasicAuth(t *testing.T) {
 		t.Errorf("no userinfo: Authorization should be absent, got %q", got)
 	}
 }
+
+// TestIsXMLContentType covers parameter-tolerant, case-insensitive XML
+// Content-Type detection used by requestProcessor.Build.
+// (Moved from query_param_parity_test.go, which was dissolved: its wire-
+// encoding contract test is subsumed by
+// TestWriteQueryParamValue_MatchesQueryEscapeFormatQueryParam in pools_test.go.)
+func TestIsXMLContentType(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"application/xml", true},
+		{"application/xml; charset=utf-8", true},
+		{"APPLICATION/XML", true},
+		{"text/xml", true},
+		{" text/xml ; charset=iso-8859-1 ", true},
+		{"application/json", false},
+		{"", false},
+		{"application/xmlx", false},
+		{"text/xml-ish", false},
+	}
+	for _, tc := range cases {
+		if got := isXMLContentType(tc.in); got != tc.want {
+			t.Errorf("isXMLContentType(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}

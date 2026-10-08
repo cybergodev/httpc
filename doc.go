@@ -143,7 +143,7 @@
 //	httpc.WithBasicAuth(username, password)
 //
 //	// Cookies
-//	httpc.WithCookie(http.Cookie{Name: "session", Value: "abc"})
+//	httpc.WithCookies([]http.Cookie{{Name: "session", Value: "abc"}})
 //	httpc.WithCookieString("session=abc; token=xyz")
 //	httpc.WithCookieMap(map[string]string{"session": "abc"})
 //	httpc.WithSecureCookie(securityConfig)

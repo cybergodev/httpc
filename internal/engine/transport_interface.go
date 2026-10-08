@@ -11,12 +11,11 @@ type transportManager interface {
 
 	// SetRedirectPolicy configures redirect behavior for a specific request.
 	// Returns a new context with the redirect settings and the settings pointer.
-	// The caller MUST call putRedirectSettings(settings) (typically via defer) after
-	// the request completes to prevent memory leaks from pool exhaustion.
+	// The settings object carries the redirect chain for the request; callers
+	// read it directly via getChain. The caller MUST call
+	// putRedirectSettings(settings) (typically via defer) after the request
+	// completes to prevent memory leaks from pool exhaustion.
 	SetRedirectPolicy(ctx context.Context, followRedirects bool, maxRedirects int) (context.Context, *redirectSettings)
-
-	// GetRedirectChain returns the list of URLs followed during redirects.
-	GetRedirectChain(ctx context.Context) []string
 
 	// Close releases resources held by the transport.
 	Close() error

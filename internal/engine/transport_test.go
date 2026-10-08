@@ -82,7 +82,7 @@ func TestTransport_HTTPRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -130,7 +130,7 @@ func TestTransport_TLSConfiguration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("HTTPS request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != 200 {
 		t.Errorf("Expected status 200, got %d", resp.StatusCode)
@@ -229,7 +229,7 @@ func TestTransport_ConnectionReuse(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Request %d failed: %v", i, err)
 		}
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if resp.StatusCode != 200 {
 			t.Errorf("Request %d: expected status 200, got %d", i, resp.StatusCode)
@@ -317,7 +317,7 @@ func TestTransport_UserAgent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if receivedUserAgent != "TestClient/1.0" {
 		t.Errorf("Expected User-Agent 'TestClient/1.0', got '%s'", receivedUserAgent)
@@ -365,7 +365,7 @@ func TestTransport_Headers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if receivedHeaders.Get("X-Custom-Header") != "test-value" {
 		t.Errorf("Expected X-Custom-Header 'test-value', got '%s'", receivedHeaders.Get("X-Custom-Header"))
@@ -552,11 +552,13 @@ func TestTransport_SetRedirectPolicy(t *testing.T) {
 	ctx := context.Background()
 
 	// Set redirect policy - now returns settings pointer
-	ctx, settings := transport.SetRedirectPolicy(ctx, true, 5)
+	_, settings := transport.SetRedirectPolicy(ctx, true, 5)
 	defer putRedirectSettings(settings)
 
-	// Get redirect chain (should be empty initially)
-	chain := transport.GetRedirectChain(ctx)
+	// The chain lives on the settings object (should be empty initially —
+	// GetRedirectChain was removed from the transport along with the ctx.Value
+	// walk it performed; callers now read settings.getChain directly).
+	chain := settings.getChain()
 	if chain != nil {
 		t.Errorf("Expected nil chain, got %v", chain)
 	}

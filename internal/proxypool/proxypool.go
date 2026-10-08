@@ -319,6 +319,7 @@ func (p *Pool) Hosts() []string {
 }
 
 // Len returns the number of proxies in the pool.
+// Currently exercised only by tests.
 func (p *Pool) Len() int {
 	return len(p.entries)
 }

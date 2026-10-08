@@ -9,7 +9,6 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -50,7 +49,7 @@ func TestRequest_Headers(t *testing.T) {
 				defer server.Close()
 
 				client, _ := newTestClient()
-				defer client.Close()
+				defer func() { _ = client.Close() }()
 
 				_, err := client.Get(server.URL, tt.optionFunc(tt.key, tt.value))
 				if err != nil {
@@ -76,7 +75,7 @@ func TestRequest_Headers(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithHeaderMap(map[string]string{
 			"X-Header-1": "value1",
@@ -97,7 +96,7 @@ func TestRequest_Headers(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithUserAgent("custom-agent/1.0"))
 		if err != nil {
@@ -114,7 +113,7 @@ func TestRequest_Headers(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		resp, err := client.Get(server.URL,
 			WithHeader("X-Custom", "test-value"),
@@ -153,7 +152,7 @@ func TestRequest_Authentication(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		resp, err := client.Get(server.URL, WithBasicAuth("user", "pass"))
 		if err != nil {
@@ -182,7 +181,7 @@ func TestRequest_Authentication(t *testing.T) {
 			defer server.Close()
 
 			client, _ := newTestClient()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			_, err := client.Get(server.URL, tt.opt)
 			if err == nil {
@@ -202,7 +201,7 @@ func TestRequest_Authentication(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithBearerToken("test-token-123"))
 		if err != nil {
@@ -229,7 +228,7 @@ func TestRequest_QueryParameters(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		params := map[string]any{
 			"key1": "value1",
@@ -251,7 +250,7 @@ func TestRequest_QueryParameters(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithQuery("search", "test query"))
 		if err != nil {
@@ -266,7 +265,7 @@ func TestRequest_QueryParameters(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithQueryMap(nil))
 		if err != nil {
@@ -281,7 +280,7 @@ func TestRequest_QueryParameters(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithQueryMap(map[string]any{}))
 		if err != nil {
@@ -296,7 +295,7 @@ func TestRequest_QueryParameters(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithQuery("key", nil))
 		if err != nil {
@@ -473,7 +472,7 @@ func TestRequest_WithBody(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client, _ := newTestClient()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			opt := bodyOption(tt.body, tt.kinds)
 
@@ -519,34 +518,9 @@ func TestRequest_WithBody(t *testing.T) {
 // Timeout & Retry Options
 // ----------------------------------------------------------------------------
 
-func TestRequest_TimeoutAndRetry(t *testing.T) {
-	t.Run("WithMaxRetries", func(t *testing.T) {
-		attempts := int32(0)
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			count := atomic.AddInt32(&attempts, 1)
-			if count < 2 {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		resp, err := client.Get(server.URL, WithMaxRetries(3))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-		if resp.StatusCode() != http.StatusOK {
-			t.Errorf("Expected 200, got %d", resp.StatusCode())
-		}
-		if resp.Meta.Attempts < 2 {
-			t.Errorf("Expected at least 2 attempts with retries, got %d", resp.Meta.Attempts)
-		}
-	})
-}
+// TestRequest_TimeoutAndRetry was moved to retry_test.go as
+// TestRetry_PerRequestMaxRetriesOption — retry behavior belongs with the
+// other retry tests; only the knob is option-layer.
 
 // ----------------------------------------------------------------------------
 // Combined Options
@@ -570,12 +544,12 @@ func TestRequest_CombinedOptions(t *testing.T) {
 	defer server.Close()
 
 	client, _ := newTestClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err := client.Get(server.URL,
 		WithHeader("X-Custom", "value"),
 		WithQuery("param", "test"),
-		WithCookie(http.Cookie{Name: "session", Value: "abc123"}),
+		WithCookies([]http.Cookie{{Name: "session", Value: "abc123"}}),
 	)
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
@@ -608,7 +582,7 @@ func TestWithFile(t *testing.T) {
 	t.Run("path traversal rejected", func(t *testing.T) {
 		// Filename with path traversal should be rejected by validation
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Post("http://example.com", WithFile("file", "../etc/passwd", []byte("data")))
 		if err == nil {
@@ -626,7 +600,7 @@ func TestWithFile(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Post(server.URL, WithFile("upload", "test.txt", []byte("file content")))
 		if err != nil {
@@ -658,7 +632,7 @@ func TestWithContext(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx := context.Background()
 		_, err := client.Get(server.URL, WithContext(ctx))
@@ -685,14 +659,14 @@ func TestWithSecureCookie(t *testing.T) {
 
 	t.Run("insecure cookie rejected", func(t *testing.T) {
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		securityConfig := &validation.CookieSecurityConfig{
 			RequireSecure: true,
 		}
 
 		_, err := client.Get("http://example.com",
-			WithCookie(http.Cookie{Name: "test", Value: "val"}),
+			WithCookies([]http.Cookie{{Name: "test", Value: "val"}}),
 			WithSecureCookie(securityConfig),
 		)
 		if err == nil {
@@ -731,7 +705,7 @@ func TestWithTimeout_Boundaries(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithTimeout(5*time.Second))
 		if err != nil {
@@ -870,8 +844,8 @@ func TestWithFile_MultipleFilesMerge(t *testing.T) {
 			http.Error(w, fmt.Sprintf("missing file: %v / %v", errA, errB), http.StatusBadRequest)
 			return
 		}
-		defer fileA.Close() // best-effort; test server lifetime
-		defer fileB.Close() // best-effort; test server lifetime
+		defer func() { _ = fileA.Close() }() // best-effort; test server lifetime
+		defer func() { _ = fileB.Close() }() // best-effort; test server lifetime
 		contentA, _ := io.ReadAll(fileA)
 		contentB, _ := io.ReadAll(fileB)
 		_, _ = fmt.Fprintf(w, "%s|%s", contentA, contentB)
@@ -882,7 +856,7 @@ func TestWithFile_MultipleFilesMerge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newTestClient() error: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	result, err := client.Post(server.URL,
 		WithFile("fileA", "a.txt", []byte("content-A")),
@@ -904,7 +878,7 @@ func TestWithHeader_ErrorsWrapSentinel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newTestClient() error: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Get("http://example.com/x", WithHeader("Bad\r\nKey", "v"))
 	if !errors.Is(err, ErrInvalidHeader) {
@@ -1139,4 +1113,66 @@ func TestWithFormData_BoundaryConditions(t *testing.T) {
 			t.Errorf("expected no error for empty form data, got: %v", err)
 		}
 	})
+}
+
+// Moved from quality_regression_test.go (dissolved grab-bag file):
+// TestQueryValueLengthParity pins the documented invariant of queryValueLength:
+// it must return exactly len(FormatQueryParam(v)) for every supported type.
+// The MAINTENANCE note in public_options.go requires new types to be added to
+// all three formatting sites; this covers the public-package side.
+func TestQueryValueLengthParity(t *testing.T) {
+	type stringer string
+	cases := []any{
+		nil, "", "hello", true, false,
+		0, 42, -7, int64(1 << 40), int32(-5), uint(9), uint64(1 << 41), uint32(77),
+		2.5, float32(1.5), stringer("custom"), struct{ X int }{X: 1},
+	}
+	for _, v := range cases {
+		if got, want := queryValueLength(v), len(engine.FormatQueryParam(v)); got != want {
+			t.Errorf("queryValueLength(%#v) = %d, want %d", v, got, want)
+		}
+	}
+}
+
+// TestBuildXMLWithCharsetContentType guards parameter-tolerant XML
+// Content-Type detection: a struct body with an explicit
+// "application/xml; charset=utf-8" header must be XML-marshaled, not
+// JSON-marshaled under an XML header.
+func TestBuildXMLWithCharsetContentType(t *testing.T) {
+	var gotContentType string
+	var gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotContentType = r.Header.Get("Content-Type")
+		buf := make([]byte, 128)
+		n, _ := r.Body.Read(buf)
+		gotBody = string(buf[:n])
+	}))
+	defer srv.Close()
+
+	type payload struct {
+		XMLName struct{} `xml:"root"`
+		Name    string   `xml:"name"`
+	}
+
+	client, err := New(TestingConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+
+	_, err = client.Post(srv.URL,
+		WithBody(payload{Name: "x"}, BodyXML),
+		WithHeader("Content-Type", "application/xml; charset=utf-8"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "application/xml; charset=utf-8"; gotContentType != want {
+		t.Fatalf("Content-Type = %q, want %q", gotContentType, want)
+	}
+	// XML marshal produces "<root><name>x</name></root>" (plus the standard
+	// xml header); JSON would produce {"name":"x"}.
+	if !strings.Contains(gotBody, "<root>") || !strings.Contains(gotBody, "<name>x</name>") {
+		t.Fatalf("body = %q, want XML-marshaled payload", gotBody)
+	}
 }

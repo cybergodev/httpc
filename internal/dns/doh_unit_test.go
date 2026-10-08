@@ -203,7 +203,7 @@ func TestDoHResolver_CacheExpiration(t *testing.T) {
 	resolver := NewDoHResolver([]*dohProvider{
 		{Name: "local", Template: server.URL + "/dns-query?name={name}&type=A", Priority: 1},
 	}, 100*time.Millisecond)
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 	ctx := context.Background()
 
 	// One LookupIPAddr round may issue several provider queries (A + AAAA),
@@ -245,7 +245,7 @@ func TestDoHResolver_CacheExpiration(t *testing.T) {
 
 func TestDoHResolver_CacheSize(t *testing.T) {
 	resolver := NewDoHResolver(nil, 5*time.Minute)
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	// Initial cache size should be 0
 	if size := resolver.CacheSize(); size != 0 {
@@ -311,7 +311,7 @@ func TestDoHResolver_ConcurrentAccess(t *testing.T) {
 	resolver := NewDoHResolver([]*dohProvider{
 		{Name: "local", Template: server.URL + "/dns-query?name={name}&type=A", Priority: 1},
 	}, 5*time.Minute)
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
@@ -340,36 +340,43 @@ func TestDoHResolver_ConcurrentAccess(t *testing.T) {
 	}
 }
 
-func TestDoHResolver_ContextCancellation(t *testing.T) {
-	resolver := NewDoHResolver(nil, 5*time.Minute)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
-
-	_, err := resolver.LookupIPAddr(ctx, "www.google.com")
-	if err == nil {
-		t.Error("Expected error with cancelled context")
+// TestDoHResolver_BrokenContext covers context cancellation and expiry before
+// any provider is contacted (formerly two separate tests with identical
+// assertions, differing only in how the context was broken).
+func TestDoHResolver_BrokenContext(t *testing.T) {
+	tests := []struct {
+		name string
+		ctx  func() (context.Context, context.CancelFunc)
+	}{
+		{"cancelled context", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel() // Cancel immediately
+			return ctx, cancel
+		}},
+		{"expired context", func() (context.Context, context.CancelFunc) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+			time.Sleep(2 * time.Nanosecond) // Ensure the deadline has passed
+			return ctx, cancel
+		}},
 	}
-}
 
-func TestDoHResolver_ContextTimeout(t *testing.T) {
-	resolver := NewDoHResolver(nil, 5*time.Minute)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := NewDoHResolver(nil, 5*time.Minute)
+			ctx, cancel := tt.ctx()
+			defer cancel()
 
-	// Create context with very short timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Nanosecond)
-	defer cancel()
-
-	time.Sleep(2 * time.Nanosecond) // Ensure timeout
-
-	_, err := resolver.LookupIPAddr(ctx, "www.google.com")
-	if err == nil {
-		t.Error("Expected error with timed out context")
+			_, err := resolver.LookupIPAddr(ctx, "www.google.com")
+			if err == nil {
+				t.Error("Expected error with broken context")
+			}
+		})
 	}
 }
 
 func TestDoHResolver_EmptyHost(t *testing.T) {
 	resolver := NewDoHResolver(nil, 5*time.Minute)
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	// Short deadline: providers are unreachable on offline machines, and the
 	// assertion only needs the error — not a 10s provider timeout.
@@ -383,29 +390,13 @@ func TestDoHResolver_EmptyHost(t *testing.T) {
 	}
 }
 
-func TestDoHResolver_IPAddressInput(t *testing.T) {
-	resolver := NewDoHResolver(nil, 5*time.Minute)
-	defer resolver.Close()
-
-	// Note: LookupIPAddr has no IP-literal fast path — a literal is queried
-	// like any hostname (providers first, system resolver as fallback), so
-	// bound the deadline to keep offline runs fast.
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-
-	// Must not panic and must return within the deadline; a result or a
-	// deadline error are both acceptable here.
-	ips, err := resolver.LookupIPAddr(ctx, "8.8.8.8")
-	if err != nil {
-		t.Logf("IP address lookup returned error (may be expected): %v", err)
-	} else if len(ips) == 0 {
-		t.Error("Expected at least one IP for IP address input")
-	}
-}
+// TestDoHResolver_IPAddressInput is retired: its stale comment predated the
+// IP-literal fast path, and its accept-success-or-deadline assertion could not
+// fail. TestLookupIPAddr_IPLiteralFastPath pins the actual behavior.
 
 func TestDoHResolver_CacheReturnsCopy(t *testing.T) {
 	resolver := NewDoHResolver(nil, 5*time.Minute)
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	// Seed the cache directly (no network); both lookups below are cache hits.
 	resolver.cache.Store("copy.test", &cacheEntry{
@@ -513,7 +504,7 @@ func TestDoHResolver_ConcurrentClearCache(t *testing.T) {
 	resolver := NewDoHResolver([]*dohProvider{
 		{Name: "local", Template: server.URL + "/dns-query?name={name}&type=A", Priority: 1},
 	}, 5*time.Minute)
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 	ctx := context.Background()
 
 	var wg sync.WaitGroup
@@ -821,7 +812,7 @@ func TestDoHResolver_ProviderPriority(t *testing.T) {
 	}
 
 	resolver := NewDoHResolver(providers, 5*time.Minute)
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	// Verify providers are set
 	if len(resolver.providers) != 2 {
@@ -868,7 +859,7 @@ func TestDoHResolver_MultipleProvidersFailover(t *testing.T) {
 	}
 
 	resolver := NewDoHResolver(providers, 5*time.Minute)
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	ips, err := resolver.LookupIPAddr(context.Background(), "failover.test")
 	if err != nil {
@@ -1094,6 +1085,8 @@ func TestDoH_parseResponse_DispatchByContentType(t *testing.T) {
 		{"wire via application/dns-wire", "application/dns-wire", wireBody, "1.2.3.4"},
 		{"missing content-type sniffs json", "", jsonBody, "1.2.3.4"},
 		{"unknown content-type sniffs json", "text/plain", jsonBody, "1.2.3.4"},
+		{"missing content-type falls back to wire", "", wireBody, "1.2.3.4"},
+		{"unknown content-type falls back to wire", "text/plain", wireBody, "1.2.3.4"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -1112,6 +1105,65 @@ func TestDoH_parseResponse_DispatchByContentType(t *testing.T) {
 		})
 	}
 }
+
+// TestDoH_parseResponse_Boundaries covers the hardening branches of
+// parseResponse: the response-size ceiling, mid-read transport errors, and the
+// combined parser-failure error for an unknown Content-Type.
+func TestDoH_parseResponse_Boundaries(t *testing.T) {
+	r := &DoHResolver{}
+
+	t.Run("body exceeding size limit is rejected", func(t *testing.T) {
+		oversize := bytes.Repeat([]byte{0}, maxDoHResponseSize+1)
+		resp := &http.Response{
+			Header: http.Header{},
+			Body:   io.NopCloser(bytes.NewReader(oversize)),
+		}
+		_, err := r.parseResponse(resp, "example.com")
+		if err == nil {
+			t.Fatal("expected size-limit error, got nil")
+		}
+		if !strings.Contains(err.Error(), "maximum size") {
+			t.Errorf("error should mention the size limit, got: %v", err)
+		}
+	})
+
+	t.Run("body read error is surfaced", func(t *testing.T) {
+		resp := &http.Response{
+			Header: http.Header{},
+			Body:   io.NopCloser(errReader{errors.New("connection reset")}),
+		}
+		resp.Header.Set("Content-Type", "application/dns-json")
+		_, err := r.parseResponse(resp, "example.com")
+		if err == nil {
+			t.Fatal("expected read error, got nil")
+		}
+		if !strings.Contains(err.Error(), "read response body") {
+			t.Errorf("error should mention body read failure, got: %v", err)
+		}
+	})
+
+	t.Run("unknown content-type with both parsers failing reports both", func(t *testing.T) {
+		// Valid neither as JSON nor as DNS wire format.
+		resp := &http.Response{
+			Header: http.Header{},
+			Body:   io.NopCloser(bytes.NewReader([]byte("not-a-dns-response"))),
+		}
+		resp.Header.Set("Content-Type", "application/octet-stream")
+		_, err := r.parseResponse(resp, "example.com")
+		if err == nil {
+			t.Fatal("expected combined parser error, got nil")
+		}
+		if !strings.Contains(err.Error(), "unknown DoH response format") ||
+			!strings.Contains(err.Error(), "json:") || !strings.Contains(err.Error(), "wire:") {
+			t.Errorf("error should report both parser failures, got: %v", err)
+		}
+	})
+}
+
+// errReader fails every Read with err, for exercising body-read error paths.
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
 
 // TestDoH_parseResponse_CloudflareJSONNotForcedToWire is a regression guard: a
 // provider literally named "cloudflare" returning JSON (Content-Type
@@ -1236,7 +1288,7 @@ func TestLookupDedup_WaiterHonorsContext(t *testing.T) {
 		Priority: 1,
 	}
 	resolver := NewDoHResolver([]*dohProvider{provider}, 5*time.Minute)
-	defer resolver.Close()
+	defer func() { _ = resolver.Close() }()
 
 	leaderDone := make(chan struct{})
 	go func() {

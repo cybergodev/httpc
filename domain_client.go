@@ -18,7 +18,7 @@ import (
 //
 // NOTE — request options run TWICE. Every request executes in two passes: a
 // capture pass that observes the request to update the session (cookies set
-// via WithSetCookie, headers via WithSetHeader), followed by the real pass.
+// via WithCookies, headers via WithHeaderMap), followed by the real pass.
 // Per-request options are therefore invoked twice, with panics contained and
 // side-effecting callbacks disabled in the capture pass — but an option that
 // mutates shared state (counters, nonces, a *FormData reused across calls)

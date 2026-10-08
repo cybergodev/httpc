@@ -45,7 +45,7 @@ func TestResult_BasicUsage(t *testing.T) {
 			defer server.Close()
 
 			client, _ := newTestClient()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			result, err := client.Get(server.URL)
 			if err != nil {
@@ -106,7 +106,7 @@ func TestResult_StatusChecks(t *testing.T) {
 			defer server.Close()
 
 			client, _ := newTestClient()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			result, err := client.Get(server.URL)
 			if err != nil {
@@ -145,7 +145,7 @@ func TestResult_Unmarshal(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		result, err := client.Get(server.URL)
 		if err != nil {
@@ -170,7 +170,7 @@ func TestResult_Unmarshal(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		result, err := client.Get(server.URL)
 		if err != nil {

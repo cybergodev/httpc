@@ -20,7 +20,7 @@ import (
 // ----------------------------------------------------------------------------
 
 func TestCookie_RequestBasicOperations(t *testing.T) {
-	t.Run("WithCookie", func(t *testing.T) {
+	t.Run("WithCookies_single", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cookie, err := r.Cookie("test-cookie")
 			if err != nil || cookie.Value != "test-value" {
@@ -31,35 +31,12 @@ func TestCookie_RequestBasicOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
-		_, err := client.Get(server.URL, WithCookie(http.Cookie{
+		_, err := client.Get(server.URL, WithCookies([]http.Cookie{{
 			Name:  "test-cookie",
 			Value: "test-value",
-		}))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
-		}
-	})
-
-	t.Run("WithCookies", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			cookie1, _ := r.Cookie("cookie1")
-			cookie2, _ := r.Cookie("cookie2")
-			if cookie1 == nil || cookie2 == nil {
-				t.Error("Cookies not found")
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Get(server.URL,
-			WithCookie(http.Cookie{Name: "cookie1", Value: "value1"}),
-			WithCookie(http.Cookie{Name: "cookie2", Value: "value2"}),
-		)
+		}}))
 		if err != nil {
 			t.Fatalf("Request failed: %v", err)
 		}
@@ -87,7 +64,7 @@ func TestCookie_RequestBasicOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithCookies([]http.Cookie{
 			{Name: "cookie1", Value: "value1"},
@@ -99,43 +76,28 @@ func TestCookie_RequestBasicOperations(t *testing.T) {
 		}
 	})
 
-	t.Run("WithCookies_empty_slice", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			cookies := r.Cookies()
-			if len(cookies) != 0 {
-				t.Errorf("Expected 0 cookies, got %d", len(cookies))
+	t.Run("WithCookies empty and nil slice", func(t *testing.T) {
+		// Consolidates two former subtests (empty/nil slice): either must be a
+		// no-op that sends no cookies and never errors.
+		for _, cookies := range [][]http.Cookie{{}, nil} {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if cookies := r.Cookies(); len(cookies) != 0 {
+					t.Errorf("Expected 0 cookies, got %d", len(cookies))
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			client, _ := newTestClient()
+			if _, err := client.Get(server.URL, WithCookies(cookies)); err != nil {
+				t.Errorf("Request with %v should not fail: %v", cookies, err)
 			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Get(server.URL, WithCookies([]http.Cookie{}))
-		if err != nil {
-			t.Fatalf("Request with empty slice should not fail: %v", err)
-		}
-	})
-
-	t.Run("WithCookies_nil_slice", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Get(server.URL, WithCookies(nil))
-		if err != nil {
-			t.Fatalf("Request with nil slice should not fail: %v", err)
+			_ = client.Close()
+			server.Close()
 		}
 	})
 
 	t.Run("WithCookies_invalid_cookie", func(t *testing.T) {
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get("http://localhost",
 			WithCookies([]http.Cookie{
@@ -148,7 +110,7 @@ func TestCookie_RequestBasicOperations(t *testing.T) {
 		}
 	})
 
-	t.Run("WithCookies_combined_with_WithCookie", func(t *testing.T) {
+	t.Run("WithCookies_multiple_options", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cookies := r.Cookies()
 			if len(cookies) != 3 {
@@ -176,10 +138,10 @@ func TestCookie_RequestBasicOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL,
-			WithCookie(http.Cookie{Name: "cookie1", Value: "value1"}),
+			WithCookies([]http.Cookie{{Name: "cookie1", Value: "value1"}}),
 			WithCookies([]http.Cookie{
 				{Name: "cookie2", Value: "value2"},
 				{Name: "cookie3", Value: "value3"},
@@ -228,7 +190,7 @@ func TestCookie_MapOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		cookies := map[string]string{
 			"session_id": "abc123",
@@ -242,41 +204,26 @@ func TestCookie_MapOperations(t *testing.T) {
 		}
 	})
 
-	t.Run("WithCookieMap empty map", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			cookies := r.Cookies()
-			if len(cookies) != 0 {
-				t.Errorf("Expected 0 cookies, got %d", len(cookies))
+	t.Run("WithCookieMap empty and nil map", func(t *testing.T) {
+		// Consolidates two former subtests (empty/nil map): either must be a
+		// no-op that sends no cookies and never errors.
+		for _, m := range []map[string]string{{}, nil} {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if cookies := r.Cookies(); len(cookies) != 0 {
+					t.Errorf("Expected 0 cookies, got %d", len(cookies))
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			client, _ := newTestClient()
+			if _, err := client.Get(server.URL, WithCookieMap(m)); err != nil {
+				t.Errorf("Request with %v should not fail: %v", m, err)
 			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Get(server.URL, WithCookieMap(map[string]string{}))
-		if err != nil {
-			t.Fatalf("Request failed: %v", err)
+			_ = client.Close()
+			server.Close()
 		}
 	})
 
-	t.Run("WithCookieMap nil map", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-
-		client, _ := newTestClient()
-		defer client.Close()
-
-		_, err := client.Get(server.URL, WithCookieMap(nil))
-		if err != nil {
-			t.Fatalf("Request with nil map should not fail: %v", err)
-		}
-	})
-
-	t.Run("WithCookieMap combined with WithCookie", func(t *testing.T) {
+	t.Run("WithCookieMap combined with WithCookies", func(t *testing.T) {
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			cookies := r.Cookies()
 			if len(cookies) != 3 {
@@ -305,10 +252,10 @@ func TestCookie_MapOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL,
-			WithCookie(http.Cookie{Name: "cookie1", Value: "value1"}),
+			WithCookies([]http.Cookie{{Name: "cookie1", Value: "value1"}}),
 			WithCookieMap(map[string]string{
 				"cookie2": "value2",
 				"cookie3": "value3",
@@ -334,7 +281,7 @@ func TestCookie_MapOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get(server.URL, WithCookieMap(map[string]string{
 			"token": "xyz-789_ABC",
@@ -351,7 +298,7 @@ func TestCookie_MapOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		// Cookie name with invalid character (semicolon)
 		_, err := client.Get(server.URL, WithCookieMap(map[string]string{
@@ -473,7 +420,7 @@ func TestCookie_StringParsing(t *testing.T) {
 			defer server.Close()
 
 			client, _ := newTestClient()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			_, err := client.Get(server.URL, WithCookieString(tt.cookieString))
 			if err != nil {
@@ -515,7 +462,7 @@ func TestCookie_StringParsingErrors(t *testing.T) {
 			defer server.Close()
 
 			client, _ := newTestClient()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			_, err := client.Get(server.URL, WithCookieString(tt.cookieString))
 			if tt.expectError && err == nil {
@@ -546,7 +493,7 @@ func TestCookie_AutoDomain(t *testing.T) {
 	defer server.Close()
 
 	client, _ := newTestClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Create cookie without domain - should auto-extract from URL
 	cookie := http.Cookie{
@@ -554,7 +501,7 @@ func TestCookie_AutoDomain(t *testing.T) {
 		Value: "value",
 	}
 
-	_, err := client.Get(server.URL, WithCookie(cookie))
+	_, err := client.Get(server.URL, WithCookies([]http.Cookie{cookie}))
 	if err != nil {
 		t.Fatalf("Request failed: %v", err)
 	}
@@ -586,7 +533,7 @@ func TestCookie_Persistence(t *testing.T) {
 	defer server.Close()
 
 	client, _ := newTestClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// First request - server sets cookie
 	_, err := client.Get(server.URL)
@@ -615,7 +562,7 @@ func TestCookie_ResponseOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		resp, err := client.Get(server.URL)
 		if err != nil {
@@ -641,7 +588,7 @@ func TestCookie_ResponseOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		resp, err := client.Get(server.URL)
 		if err != nil {
@@ -666,7 +613,7 @@ func TestCookie_ResponseOperations(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		resp, err := client.Get(server.URL)
 		if err != nil {
@@ -730,7 +677,7 @@ func TestManualCookiesNotPersistedInJar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Request 1 carries the manual cookie.
 	if _, err := client.Get(server.URL, WithCookies([]http.Cookie{{Name: "oneoff", Value: "x"}})); err != nil {
@@ -754,7 +701,7 @@ func TestManualCookiesNotPersistedInJar(t *testing.T) {
 // (moved from boundary_test.go)
 // ----------------------------------------------------------------------------
 
-func TestWithCookie_BoundaryConditions(t *testing.T) {
+func TestWithCookies_BoundaryConditions(t *testing.T) {
 	tests := []struct {
 		name    string
 		cookie  http.Cookie
@@ -770,7 +717,7 @@ func TestWithCookie_BoundaryConditions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			req := engine.AcquireRequest()
-			err := WithCookie(tt.cookie)(req)
+			err := WithCookies([]http.Cookie{tt.cookie})(req)
 			if tt.wantErr && err == nil {
 				t.Error("expected error, got nil")
 			}
@@ -782,7 +729,7 @@ func TestWithCookie_BoundaryConditions(t *testing.T) {
 }
 
 // TestEnsureCookieCapacity pins the growth policy of the per-request cookie
-// slice: appending one cookie at a time must not pay the 0→1→2→4 regrowth
+// slice: adding cookies in small batches must not pay repeated regrowth
 // (the slice starts empty on every request), and an adequately sized slice
 // must be returned unchanged.
 func TestEnsureCookieCapacity(t *testing.T) {
@@ -810,16 +757,16 @@ func TestEnsureCookieCapacity(t *testing.T) {
 		t.Errorf("cap = %d, want exact 10 for batched growth", cap(big))
 	}
 
-	// End-to-end: three WithCookie options accumulate into the request
-	// without depending on capacity carried across requests.
+	// End-to-end: three single-cookie WithCookies options accumulate into
+	// the request without depending on capacity carried across requests.
 	var r engine.Request
 	for _, c := range []http.Cookie{
 		{Name: "session_id", Value: "abc"},
 		{Name: "csrf_token", Value: "xyz"},
 		{Name: "user_pref", Value: "dark"},
 	} {
-		if err := WithCookie(c)(&r); err != nil {
-			t.Fatalf("WithCookie(%s): %v", c.Name, err)
+		if err := WithCookies([]http.Cookie{c})(&r); err != nil {
+			t.Fatalf("WithCookies(%s): %v", c.Name, err)
 		}
 	}
 	if got := r.Cookies(); len(got) != 3 {

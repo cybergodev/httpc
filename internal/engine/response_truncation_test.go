@@ -30,7 +30,7 @@ func TestReadBody_TruncatedBodyIsError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Small declared length exercises the pre-sized fast path in readBody.
 	if _, err := client.Request(backgroundCtx, "GET", srv.URL); err == nil {
@@ -65,7 +65,7 @@ func TestReadBody_HeadRequestKeepsEmptyBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Request(backgroundCtx, "HEAD", srv.URL)
 	if err != nil {
@@ -76,20 +76,6 @@ func TestReadBody_HeadRequestKeepsEmptyBody(t *testing.T) {
 	}
 }
 
-// TestAppendQueryParams_DeterministicOrder guards the sorted-key contract of
-// appendQueryParams: identical maps must encode to identical strings.
-func TestAppendQueryParams_DeterministicOrder(t *testing.T) {
-	a := map[string]any{"z": 1, "a": 2, "m": "x", "0": true}
-	b := map[string]any{"0": true, "m": "x", "a": 2, "z": 1}
-	s1 := appendQueryParams("", a)
-	s2 := appendQueryParams("", b)
-	if s1 != s2 {
-		t.Fatalf("same params encoded differently: %q vs %q", s1, s2)
-	}
-	// Merging into an existing query must also be sorted after the existing part.
-	merged := appendQueryParams("keep=1", a)
-	want := "keep=1&0=true&a=2&m=x&z=1"
-	if merged != want {
-		t.Fatalf("merged query = %q, want %q", merged, want)
-	}
-}
+// TestAppendQueryParams_DeterministicOrder moved to pools_test.go, next to
+// the other appendQueryParams coverage (same subject area as this file's
+// readBody truncation tests was coincidental).

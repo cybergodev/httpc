@@ -48,9 +48,9 @@ func demonstrateRequestCookies() {
 	}
 	defer client.Close()
 
-	// Method 1: Single cookie using WithCookie
+	// Method 1: Single cookie using WithCookies
 	resp, err := client.Get("https://httpbin.org/cookies",
-		httpc.WithCookie(http.Cookie{Name: "session_id", Value: "abc123"}),
+		httpc.WithCookies([]http.Cookie{{Name: "session_id", Value: "abc123"}}),
 	)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
@@ -82,7 +82,7 @@ func demonstrateRequestCookies() {
 		HttpOnly: true,
 	}
 	resp, err = client.Get("https://httpbin.org/cookies",
-		httpc.WithCookie(cookie),
+		httpc.WithCookies([]http.Cookie{cookie}),
 	)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
@@ -215,7 +215,7 @@ func demonstrateCookieString() {
 	// Combine with other cookie methods
 	resp, err = client.Get("https://httpbin.org/cookies",
 		httpc.WithCookieString("session=abc123; token=xyz789"),
-		httpc.WithCookie(http.Cookie{Name: "manual", Value: "cookie"}),
+		httpc.WithCookies([]http.Cookie{{Name: "manual", Value: "cookie"}}),
 	)
 	if err != nil {
 		log.Printf("Error: %v\n", err)
@@ -246,7 +246,7 @@ func demonstrateAdvancedScenarios() {
 		SameSite: http.SameSiteStrictMode,
 	}
 	resp, err := client.Post("https://httpbin.org/post",
-		httpc.WithCookie(sessionCookie),
+		httpc.WithCookies([]http.Cookie{sessionCookie}),
 		httpc.WithJSON(map[string]string{"action": "login"}),
 	)
 	if err != nil {
@@ -271,7 +271,7 @@ func demonstrateAdvancedScenarios() {
 
 	// Scenario 3: Cookies with authentication
 	resp, err = client.Get("https://httpbin.org/cookies",
-		httpc.WithCookie(http.Cookie{Name: "session", Value: "active"}),
+		httpc.WithCookies([]http.Cookie{{Name: "session", Value: "active"}}),
 		httpc.WithBearerToken("jwt_token_here"),
 		httpc.WithHeader("X-Request-ID", "12345"),
 	)
@@ -285,13 +285,13 @@ func demonstrateAdvancedScenarios() {
 	// Note: WithSecureCookie validates cookies already on the request,
 	// so add cookies first, then validate.
 	resp, err = client.Get("https://httpbin.org/cookies",
-		httpc.WithCookie(http.Cookie{
+		httpc.WithCookies([]http.Cookie{{
 			Name:     "secure_session",
 			Value:    "encrypted_value",
 			Secure:   true,
 			HttpOnly: true,
 			SameSite: http.SameSiteStrictMode,
-		}),
+		}}),
 		httpc.WithSecureCookie(httpc.StrictCookieSecurityConfig()),
 	)
 	if err != nil {

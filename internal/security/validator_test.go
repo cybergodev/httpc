@@ -1,6 +1,7 @@
 package security
 
 import (
+	"net"
 	"net/url"
 	"strings"
 	"testing"
@@ -791,5 +792,76 @@ func TestValidateURL_IPv6Hosts(t *testing.T) {
 		}
 		// No error assertion: current contract defers portless bracketed
 		// literals to the dialer-level SSRF check.
+	})
+}
+
+// TestNewValidatorWithConfig_ExemptNetsDeepCopy pins the defensive-copy
+// contract of NewValidatorWithConfig: the validator must own its snapshot of
+// ExemptNets — mutating (or nil-ing) the caller's *net.IPNet entries after
+// construction must not affect validation, and nil entries must be tolerated.
+func TestNewValidatorWithConfig_ExemptNetsDeepCopy(t *testing.T) {
+	_, exemptNet, err := net.ParseCIDR("10.0.0.0/8")
+	if err != nil {
+		t.Fatalf("ParseCIDR: %v", err)
+	}
+	cfg := &Config{
+		ValidateURL:     true,
+		AllowPrivateIPs: false,
+		ExemptNets:      []*net.IPNet{exemptNet, nil},
+	}
+
+	validator := NewValidatorWithConfig(cfg)
+
+	// The exempt range must allow the otherwise-blocked private IP.
+	if err := validator.validateURL("http://10.1.2.3/x", nil); err != nil {
+		t.Fatalf("exempted 10/8 address rejected: %v", err)
+	}
+
+	// Caller mutates its IPNet after construction — validator must be immune.
+	exemptNet.IP = net.ParseIP("192.0.2.0")
+	exemptNet.Mask = net.CIDRMask(32, 32)
+	if err := validator.validateURL("http://10.1.2.3/x", nil); err != nil {
+		t.Fatalf("validator captured caller-owned IPNet by reference: %v", err)
+	}
+}
+
+// TestValidator_ValidateURL_CacheBehavior covers the URL-validation cache
+// branches: the hit fast path, and the two bypass conditions (per-request
+// override; userinfo embedded in the URL must not be cached).
+func TestValidator_ValidateURL_CacheBehavior(t *testing.T) {
+	t.Run("second validation hits the cache", func(t *testing.T) {
+		v := newValidator()
+		if err := v.validateURL("https://cache.example.com/a", nil); err != nil {
+			t.Fatalf("first validation: %v", err)
+		}
+		if _, ok := v.validatedURLs.Load("https://cache.example.com/a"); !ok {
+			t.Fatal("validated URL was not cached")
+		}
+		// Hit path must return nil without re-validation.
+		if err := v.validateURL("https://cache.example.com/a", nil); err != nil {
+			t.Fatalf("cache-hit validation: %v", err)
+		}
+	})
+
+	t.Run("per-request override bypasses the cache", func(t *testing.T) {
+		v := newValidator()
+		allow := true
+		// Override path: must not read or write the cache.
+		if err := v.validateURL("https://override.example.com/a", &allow); err != nil {
+			t.Fatalf("override validation: %v", err)
+		}
+		if _, ok := v.validatedURLs.Load("https://override.example.com/a"); ok {
+			t.Error("override validation must not populate the cache")
+		}
+	})
+
+	t.Run("URL with userinfo is not cached", func(t *testing.T) {
+		v := newValidator()
+		if err := v.validateURL("https://user:pass@userinfo.example.com/a", nil); err != nil {
+			t.Fatalf("userinfo validation: %v", err)
+		}
+		if _, ok := v.validatedURLs.Load("https://user:pass@userinfo.example.com/a"); ok {
+			t.Error("credentialed URL must not be cached")
+		}
 	})
 }

@@ -216,7 +216,7 @@ func TestDecompressorPoolCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Request(context.Background(), "GET", "https://example.com")
 	if err != nil {
@@ -244,7 +244,7 @@ func TestDecompressorPoolCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client2: %v", err)
 	}
-	defer client2.Close()
+	defer func() { _ = client2.Close() }()
 
 	resp2, err := client2.Request(context.Background(), "GET", "https://example.com")
 	if err != nil {

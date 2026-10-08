@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"compress/gzip"
 	"io"
 	"net/http"
 	"strconv"
@@ -256,6 +257,131 @@ func TestResponseProcessor_BodySizeExactBoundary(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestResponseProcessor_IdentityBodyCappedByResponseBodySize pins the C-1
+// regression: when both limits are configured (as DefaultConfig always does),
+// an identity (non-compressed) body is capped by MaxResponseBodySize — the
+// larger MaxDecompressedBodySize must not replace it on the buffered path.
+func TestResponseProcessor_IdentityBodyCappedByResponseBodySize(t *testing.T) {
+	config := &Config{
+		Timeout:                 30 * time.Second,
+		MaxResponseBodySize:     1024,              // the stricter cap
+		MaxDecompressedBodySize: 100 * 1024 * 1024, // DefaultConfig's value
+	}
+	processor := newResponseProcessor(config)
+
+	httpResponse := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Type": []string{"text/plain"}},
+		Body:       io.NopCloser(strings.NewReader(strings.Repeat("A", 2048))),
+		Request:    &http.Request{Method: "GET"},
+	}
+
+	_, err := processor.Process(httpResponse)
+	if err == nil {
+		t.Fatal("expected identity body over MaxResponseBodySize to fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "exceeds limit of 1024") {
+		t.Errorf("want 'exceeds limit of 1024', got: %v", err)
+	}
+}
+
+// TestResponseProcessor_FastPathSizeLimitMessage pins the fast-path fail-fast
+// guard: a known Content-Length above the cap must produce the clear
+// "exceeds limit" message, not the misleading "unexpected EOF" that
+// io.ReadFull yields when the limit reader stops it short.
+func TestResponseProcessor_FastPathSizeLimitMessage(t *testing.T) {
+	config := &Config{
+		Timeout:             30 * time.Second,
+		MaxResponseBodySize: 1024,
+	}
+	processor := newResponseProcessor(config)
+
+	httpResponse := &http.Response{
+		StatusCode:    200,
+		Header:        http.Header{"Content-Type": []string{"text/plain"}},
+		Body:          io.NopCloser(strings.NewReader(strings.Repeat("A", 4096))),
+		ContentLength: 4096, // known CL <= 512KB selects the pre-sized fast path
+		Request:       &http.Request{Method: "GET"},
+	}
+
+	_, err := processor.Process(httpResponse)
+	if err == nil {
+		t.Fatal("expected size-limit error, got nil")
+	}
+	if !strings.Contains(err.Error(), "response body exceeds limit") {
+		t.Errorf("want clear 'response body exceeds limit' message, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "unexpected EOF") {
+		t.Errorf("misleading 'unexpected EOF' leaked into the error: %v", err)
+	}
+}
+
+// TestResponseProcessor_HeadContentLengthOverLimit pins the HEAD exemption in
+// the fast-path guard: HEAD responses carry Content-Length with no body, so a
+// declared length above the cap must not be rejected.
+func TestResponseProcessor_HeadContentLengthOverLimit(t *testing.T) {
+	config := &Config{
+		Timeout:             30 * time.Second,
+		MaxResponseBodySize: 1024,
+	}
+	processor := newResponseProcessor(config)
+
+	httpResponse := &http.Response{
+		StatusCode:    200,
+		Header:        http.Header{},
+		Body:          io.NopCloser(strings.NewReader("")), // no body follows
+		ContentLength: 2048,                                // within the fast path, over the cap
+		Request:       &http.Request{Method: "HEAD"},
+	}
+
+	resp, err := processor.Process(httpResponse)
+	if err != nil {
+		t.Fatalf("HEAD with Content-Length over the cap must not be rejected: %v", err)
+	}
+	if len(resp.RawBody()) != 0 {
+		t.Errorf("HEAD body = %d bytes, want 0", len(resp.RawBody()))
+	}
+	ReleaseResponse(resp)
+}
+
+// TestResponseProcessor_CompressedUsesDecompressedCap pins Plan A semantics:
+// a compressed response is judged by MaxDecompressedBodySize even when the
+// inflated size exceeds MaxResponseBodySize — the identity cap introduced by
+// the C-1 fix must not over-restrict compressed bodies.
+func TestResponseProcessor_CompressedUsesDecompressedCap(t *testing.T) {
+	config := &Config{
+		Timeout:                 30 * time.Second,
+		MaxResponseBodySize:     1024,       // smaller than the inflated body
+		MaxDecompressedBodySize: 100 * 1024, // the cap that must govern
+	}
+	processor := newResponseProcessor(config)
+
+	var wire bytes.Buffer
+	gz := gzip.NewWriter(&wire)
+	if _, err := gz.Write(make([]byte, 8*1024)); err != nil { // inflates to 8KB
+		t.Fatalf("seed gzip writer: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
+
+	httpResponse := &http.Response{
+		StatusCode: 200,
+		Header:     http.Header{"Content-Encoding": []string{"gzip"}},
+		Body:       io.NopCloser(bytes.NewReader(wire.Bytes())),
+		Request:    &http.Request{Method: "GET"},
+	}
+
+	resp, err := processor.Process(httpResponse)
+	if err != nil {
+		t.Fatalf("compressed body must be judged by MaxDecompressedBodySize, got: %v", err)
+	}
+	if got := len(resp.RawBody()); got != 8*1024 {
+		t.Errorf("decompressed length = %d, want %d", got, 8*1024)
+	}
+	ReleaseResponse(resp)
 }
 
 func TestResponseProcessor_HeaderProcessing(t *testing.T) {

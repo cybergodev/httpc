@@ -114,9 +114,9 @@ resp, err := client.Get(url,
     httpc.WithQuery("api_key", "your-api-key"),
 )
 
-// Note: Use WithCookie for cookie-based authentication
+// Note: Use WithCookies for cookie-based authentication
 resp, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "session", Value: "your-session"}),
+    httpc.WithCookies([]http.Cookie{{Name: "session", Value: "your-session"}}),
 )
 ```
 
@@ -415,42 +415,25 @@ result, err := client.Get("http://localhost:8080/health",
 
 ## Cookies
 
-### Send Cookie
+### Send Cookies
+
+Use `WithCookies` for any number of cookies — it pre-allocates capacity and
+validates all cookies in a single pass:
 
 ```go
-cookie := http.Cookie{
-    Name:  "session_id",
-    Value: "abc123",
-}
-
+// Single cookie
 resp, err := client.Get(url,
-    httpc.WithCookie(cookie),
+    httpc.WithCookies([]http.Cookie{{Name: "session_id", Value: "abc123"}}),
 )
-```
 
-### Multiple Cookies
-
-```go
-// Use multiple WithCookie calls for multiple cookies
-resp, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "session_id", Value: "abc123"}),
-    httpc.WithCookie(http.Cookie{Name: "user_pref", Value: "dark_mode"}),
-)
-```
-
-### Multiple Cookies (Batch)
-
-Use `WithCookies` to add several cookies in a single option — more efficient
-than chaining `WithCookie` calls, as it pre-allocates and validates in one pass:
-
-```go
+// Multiple cookies
 cookies := []http.Cookie{
     {Name: "session_id", Value: "abc123"},
     {Name: "user_pref", Value: "dark_mode"},
     {Name: "lang", Value: "en"},
 }
 
-resp, err := client.Get(url,
+resp, err = client.Get(url,
     httpc.WithCookies(cookies),
 )
 ```
@@ -493,13 +476,13 @@ security := httpc.StrictCookieSecurityConfig()
 // security.RequireSecure = true
 
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{
+    httpc.WithCookies([]http.Cookie{{
         Name:     "session",
         Value:    "abc123",
         Secure:   true,
         HttpOnly: true,
         SameSite: http.SameSiteStrictMode,
-    }),
+    }}),
     httpc.WithSecureCookie(security), // must come after the cookie options
 )
 ```
@@ -616,8 +599,7 @@ result, err = client.Post(url, httpc.WithBody(data, httpc.BodyMultipart))
 | `WithContext(ctx)`               | Request context      | `WithContext(ctx)`                      |
 | `WithMaxRetries(n)`              | Max retry attempts (idempotent methods only, unless non-idempotent retry is enabled) | `WithMaxRetries(3)` |
 | `WithRetryNonIdempotent(allow)`  | Per-request override of non-idempotent retry (POST/PATCH) | `WithRetryNonIdempotent(true)` |
-| `WithCookie(cookie)`             | Add cookie           | `WithCookie(http.Cookie{Name: "n", Value: "v"})` |
-| `WithCookies(cookies)`           | Add multiple cookies | `WithCookies([]http.Cookie{...})` |
+| `WithCookies(cookies)`           | Add one or more cookies | `WithCookies([]http.Cookie{...})` |
 | `WithCookieMap(cookies)`         | Add multiple cookies | `WithCookieMap(map[string]string{...})` |
 | `WithCookieString(cookieStr)`    | Parse cookie string  | `WithCookieString("a=1; b=2")`          |
 | `WithSecureCookie(cfg)`          | Cookie security      | `WithSecureCookie(httpc.StrictCookieSecurityConfig())` |

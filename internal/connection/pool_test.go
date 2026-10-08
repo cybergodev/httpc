@@ -104,16 +104,52 @@ func TestPoolManager_GetMetrics(t *testing.T) {
 	}
 	defer func() { _ = pm.Close() }()
 
-	metrics := pm.GetMetrics()
+	t.Run("zero state", func(t *testing.T) {
+		metrics := pm.GetMetrics()
 
-	// Initially should have zero connections
-	if metrics.ActiveConnections != 0 {
-		t.Errorf("Expected 0 active connections, got %d", metrics.ActiveConnections)
-	}
+		// Initially should have zero connections
+		if metrics.ActiveConnections != 0 {
+			t.Errorf("Expected 0 active connections, got %d", metrics.ActiveConnections)
+		}
 
-	if metrics.TotalConnections != 0 {
-		t.Errorf("Expected 0 total connections, got %d", metrics.TotalConnections)
-	}
+		if metrics.TotalConnections != 0 {
+			t.Errorf("Expected 0 total connections, got %d", metrics.TotalConnections)
+		}
+
+		if metrics.ConnectionHitRate != 0 {
+			t.Errorf("Expected 0 hit rate with no connections, got %f", metrics.ConnectionHitRate)
+		}
+	})
+
+	// Hit-rate calculation (folded from the former coverage_test.go
+	// TestGetMetrics_HitRateCalculation): cumulative accepted connections vs
+	// rejected attempts.
+	t.Run("hit rate calculation", func(t *testing.T) {
+		pm.acceptedConns.Store(80)
+		pm.rejectedConns.Store(20)
+
+		m := pm.GetMetrics()
+		wantHitRate := float64(80) / float64(80+20) // 0.8
+		if m.ConnectionHitRate != wantHitRate {
+			t.Errorf("hit rate = %f, want %f", m.ConnectionHitRate, wantHitRate)
+		}
+		if m.TotalConnections != 80 {
+			t.Errorf("TotalConnections = %d, want 80 (cumulative accepted)", m.TotalConnections)
+		}
+	})
+
+	// Active gauge (folded from TestGetMetrics_ActiveConnections).
+	t.Run("active connections gauge", func(t *testing.T) {
+		pm.activeConns.Store(42)
+
+		m := pm.GetMetrics()
+		if m.ActiveConnections != 42 {
+			t.Errorf("ActiveConnections = %d, want 42", m.ActiveConnections)
+		}
+		if m.LastUpdate == 0 {
+			t.Error("LastUpdate should be non-zero")
+		}
+	})
 }
 
 func TestPoolManager_HTTPRequest(t *testing.T) {
@@ -482,83 +518,11 @@ func TestPoolManager_HTTP2Disabled(t *testing.T) {
 // Certificate Pinning Tests
 // ============================================================================
 
-func TestPoolManager_CreateVerifyPeerCertificate(t *testing.T) {
-	t.Run("WithCertPinner", func(t *testing.T) {
-		// Create a mock cert pinner
-		pinner := &mockCertPinner{}
-
-		config := &Config{
-			certPinner: pinner,
-		}
-
-		pm, err := NewPoolManager(config)
-		if err != nil {
-			t.Fatalf("Expected no error, got: %v", err)
-		}
-		defer func() { _ = pm.Close() }()
-
-		tlsConfig := pm.transport.TLSClientConfig
-		if tlsConfig == nil {
-			t.Fatal("TLS config should not be nil")
-		}
-
-		// VerifyPeerCertificate should be set when certPinner is configured
-		if tlsConfig.VerifyPeerCertificate == nil {
-			t.Error("VerifyPeerCertificate should be set when certPinner is configured")
-		}
-	})
-
-	t.Run("WithoutCertPinner", func(t *testing.T) {
-		pm, err := NewPoolManager(nil)
-		if err != nil {
-			t.Fatalf("Expected no error, got: %v", err)
-		}
-		defer func() { _ = pm.Close() }()
-
-		tlsConfig := pm.transport.TLSClientConfig
-		if tlsConfig == nil {
-			t.Fatal("TLS config should not be nil")
-		}
-
-		// VerifyPeerCertificate should not be set without certPinner
-		if tlsConfig.VerifyPeerCertificate != nil {
-			t.Error("VerifyPeerCertificate should not be set without certPinner")
-		}
-	})
-
-	t.Run("CustomTLSWithCertPinner", func(t *testing.T) {
-		pinner := &mockCertPinner{}
-		customTLS := &tls.Config{
-			MinVersion: tls.VersionTLS13,
-		}
-
-		config := &Config{
-			TLSConfig:  customTLS,
-			certPinner: pinner,
-		}
-
-		pm, err := NewPoolManager(config)
-		if err != nil {
-			t.Fatalf("Expected no error, got: %v", err)
-		}
-		defer func() { _ = pm.Close() }()
-
-		tlsConfig := pm.transport.TLSClientConfig
-		if tlsConfig == nil {
-			t.Fatal("TLS config should not be nil")
-		}
-
-		// Should preserve custom TLS config
-		if tlsConfig.MinVersion != tls.VersionTLS13 {
-			t.Errorf("Expected MinVersion TLS 1.3, got %d", tlsConfig.MinVersion)
-		}
-
-		// Should add cert pinning
-		if tlsConfig.VerifyPeerCertificate == nil {
-			t.Error("VerifyPeerCertificate should be set")
-		}
-	})
-}
+// TestPoolManager_CreateVerifyPeerCertificate was removed: all three subtests
+// (WithCertPinner / WithoutCertPinner / CustomTLSWithCertPinner) asserted only
+// non-nilness already covered — and actually invoked — by
+// TestCreateTLSConfig_Custom and TestCreateVerifyPeerCertificate in
+// coverage_test.go, which drive the verify callback itself.
 
 // mockCertPinner is a mock implementation of certificate pinner for testing
 type mockCertPinner struct {
@@ -707,44 +671,10 @@ func TestPoolManager_ConnectionMetrics(t *testing.T) {
 // TestPoolManager_ValidateAddress_DomainResolution was removed: its
 // IPv6 rows were folded into TestResolveAndValidateAddress (coverage_test.go).
 
-func TestTrackedConn_DoubleClose(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	config := DefaultConfig()
-	config.AllowPrivateIPs = true
-	pm, err := NewPoolManager(config)
-	if err != nil {
-		t.Fatalf("Expected no error, got: %v", err)
-	}
-	defer func() { _ = pm.Close() }()
-
-	client := &http.Client{
-		Transport: pm.GetTransport(),
-		Timeout:   5 * time.Second,
-	}
-
-	// Make a request to create a tracked connection
-	resp, err := client.Get(server.URL)
-	if err != nil {
-		t.Fatalf("Request failed: %v", err)
-	}
-
-	// First close
-	err = resp.Body.Close()
-	if err != nil {
-		t.Errorf("First body close failed: %v", err)
-	}
-
-	// Second close must be safe and idempotent: the body wrapper is designed so
-	// that closing an already-closed body is a no-op returning nil.
-	err = resp.Body.Close()
-	if err != nil {
-		t.Errorf("Second body close should be idempotent (nil error), got: %v", err)
-	}
-}
+// TestTrackedConn_DoubleClose was removed: the double-close idempotence and
+// no-double-decrement contract is asserted directly (and under concurrency)
+// by TestTrackedConn_Lifecycle and TestTrackedConn_ConcurrentClose in
+// coverage_test.go; the HTTP-body-close route is incidental.
 
 func TestConfig_SetCertPinner(t *testing.T) {
 	cfg := DefaultConfig()
@@ -792,7 +722,7 @@ func TestCreateDialer_ClosedPool(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPoolManager: %v", err)
 	}
-	pm.Close()
+	_ = pm.Close()
 
 	dialer := pm.createDialer()
 	_, err = dialer(context.Background(), "tcp", "example.com:80")
@@ -836,7 +766,7 @@ func TestPoolManager_ProxyCallbackRecords(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewPoolManager: %v", err)
 		}
-		defer pm.Close()
+		defer func() { _ = pm.Close() }()
 
 		rec := &ProxyRecorder{}
 		ctx := WithProxyRecorder(WithProxyAttempt(context.Background(), 0), rec)
@@ -855,7 +785,7 @@ func TestPoolManager_ProxyCallbackRecords(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewPoolManager: %v", err)
 		}
-		defer pm.Close()
+		defer func() { _ = pm.Close() }()
 
 		rec := &ProxyRecorder{}
 		// No attempt index on ctx — falls back to round-robin Select.
@@ -874,7 +804,7 @@ func TestPoolManager_ProxyCallbackRecords(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewPoolManager: %v", err)
 		}
-		defer pm.Close()
+		defer func() { _ = pm.Close() }()
 
 		rec := &ProxyRecorder{}
 		ctx := WithProxyRecorder(context.Background(), rec)
@@ -892,7 +822,7 @@ func TestPoolManager_ProxyCallbackRecords(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewPoolManager: %v", err)
 		}
-		defer pm.Close()
+		defer func() { _ = pm.Close() }()
 
 		if _, err := pm.transport.Proxy(newReq(context.Background())); err != nil {
 			t.Fatalf("Proxy without recorder: %v", err)
@@ -919,7 +849,7 @@ func TestPoolManager_HasProxy(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewPoolManager: %v", err)
 			}
-			defer pm.Close()
+			defer func() { _ = pm.Close() }()
 			if got := pm.HasProxy(); got != tt.want {
 				t.Errorf("HasProxy() = %v, want %v", got, tt.want)
 			}
@@ -978,7 +908,7 @@ func TestResolveAndValidateAddress_IPLiteralReturnsCandidate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPoolManager: %v", err)
 	}
-	defer pm.Close()
+	defer func() { _ = pm.Close() }()
 
 	addrs, err := pm.resolveAndValidateAddress(context.Background(), "8.8.8.8:443")
 	if err != nil {

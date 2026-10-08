@@ -192,6 +192,7 @@ func (w *DomainWhitelist) matchWildcard(hostname, pattern string) bool {
 
 // Add adds a domain to the whitelist.
 // Thread-safe: can be called while the whitelist is in use.
+// Currently exercised only by tests; retained for a future public API.
 func (w *DomainWhitelist) Add(domain string) {
 	if w == nil {
 		return
@@ -222,6 +223,7 @@ func (w *DomainWhitelist) Add(domain string) {
 
 // Remove removes a domain from the whitelist.
 // Thread-safe: can be called while the whitelist is in use.
+// Currently exercised only by tests; retained for a future public API.
 func (w *DomainWhitelist) Remove(domain string) {
 	if w == nil {
 		return
@@ -252,6 +254,7 @@ func (w *DomainWhitelist) Remove(domain string) {
 
 // Domains returns a copy of all domains in the whitelist.
 // Returns two slices: exact matches and wildcard patterns.
+// Currently exercised only by tests; retained for a future public API.
 func (w *DomainWhitelist) Domains() (exact []string, wildcards []string) {
 	if w == nil {
 		return nil, nil

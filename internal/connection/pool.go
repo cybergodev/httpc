@@ -718,7 +718,8 @@ func (pm *PoolManager) HasProxy() bool {
 
 // GetMetrics returns a snapshot of current connection pool statistics,
 // including active, total, and rejected connection counts and the connection
-// hit rate.
+// hit rate. Currently exercised only by tests; reserved as the basis of a
+// future public metrics API.
 func (pm *PoolManager) GetMetrics() metrics {
 	accepted := pm.acceptedConns.Load()
 	rejected := pm.rejectedConns.Load()

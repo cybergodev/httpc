@@ -135,6 +135,47 @@ func putQueryBuilder(sb *strings.Builder) {
 	queryBuilderPool.Put(sb)
 }
 
+// queryKeysPool reduces allocations for the scratch key slice used to sort
+// multi-parameter query maps in appendQueryParams. It stores a *[]string —
+// the stable pointer lets the backing array be reused across requests
+// (boxing a bare slice value into any would allocate a fresh slice header on
+// every Put, defeating the pool).
+var queryKeysPool = sync.Pool{
+	New: func() any {
+		s := make([]string, 0, 4)
+		return &s
+	},
+}
+
+// maxQueryKeys caps the pooled scratch slice to prevent memory bloat,
+// matching the entry-count guards of the map pools above.
+const maxQueryKeys = 64
+
+// getQueryKeys returns a pointer to a zero-length scratch slice for
+// collecting map keys. Append through the pointer (*kp = append(*kp, ...))
+// so growth updates the shared header.
+func getQueryKeys() *[]string {
+	kp, ok := queryKeysPool.Get().(*[]string)
+	if !ok || kp == nil {
+		s := make([]string, 0, 4)
+		return &s
+	}
+	*kp = (*kp)[:0]
+	return kp
+}
+
+// putQueryKeys returns a scratch key slice to the pool after clearing the
+// string references (pool hygiene: otherwise the recycled backing array
+// keeps the last request's keys reachable).
+func putQueryKeys(kp *[]string) {
+	if kp == nil || cap(*kp) > maxQueryKeys {
+		return // oversized scratch is left for GC
+	}
+	clear(*kp)
+	*kp = (*kp)[:0]
+	queryKeysPool.Put(kp)
+}
+
 // shouldEscape reports whether the byte needs escaping for URL query encoding.
 // Fast path: only check for characters that actually need escaping.
 func shouldEscape(c byte) bool {
@@ -240,14 +281,16 @@ func appendQueryParams(existingQuery string, params map[string]any) string {
 	// unsorted keys would make the wire format nondeterministic, which breaks
 	// request signing/HMAC, response caching keyed on the URL, and multiplies
 	// entries in the URL cache (same params, different orderings).
-	keys := make([]string, 0, len(params))
+	// The scratch slice is pooled (getQueryKeys) to avoid one allocation per
+	// multi-param request.
+	kp := getQueryKeys()
 	for key := range params {
-		keys = append(keys, key)
+		*kp = append(*kp, key)
 	}
-	slices.Sort(keys)
+	slices.Sort(*kp)
 
 	first := existingQuery == ""
-	for _, key := range keys {
+	for _, key := range *kp {
 		if first {
 			first = false
 		} else {
@@ -258,6 +301,7 @@ func appendQueryParams(existingQuery string, params map[string]any) string {
 
 		writeQueryParamValue(sb, params[key], numBuf[:0])
 	}
+	putQueryKeys(kp)
 
 	result := sb.String()
 	putQueryBuilder(sb)

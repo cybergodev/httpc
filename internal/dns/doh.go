@@ -334,7 +334,8 @@ func (r *DoHResolver) lookupViaProviders(ctx context.Context, host string) ([]ne
 	return r.fallbackLookup(ctx, host, lastErr)
 }
 
-// CacheSize returns the current number of entries in the cache (O(1) via atomic counter)
+// CacheSize returns the current number of entries in the cache (O(1) via atomic counter).
+// Currently exercised only by tests; admission control reads the atomic directly.
 func (r *DoHResolver) CacheSize() int64 {
 	return r.cacheSize.Load()
 }
@@ -839,6 +840,7 @@ func (r *DoHResolver) evictOldestEntry() {
 
 // SetCacheTTL sets the cache TTL duration.
 // Thread-safe: can be called concurrently with other operations.
+// Currently exercised only by tests; construction uses the Config field.
 func (r *DoHResolver) SetCacheTTL(ttl time.Duration) {
 	r.cacheTTL.Store(int64(ttl))
 	r.ClearCache()
@@ -846,6 +848,7 @@ func (r *DoHResolver) SetCacheTTL(ttl time.Duration) {
 
 // GetCacheTTL returns the current cache TTL duration.
 // Thread-safe: can be called concurrently with other operations.
+// Currently exercised only by tests; lookups read the atomic directly.
 func (r *DoHResolver) GetCacheTTL() time.Duration {
 	return time.Duration(r.cacheTTL.Load())
 }

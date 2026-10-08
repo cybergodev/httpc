@@ -46,7 +46,7 @@ func demonstrateResultAPI(client httpc.Client) {
 	fmt.Println("--- Result API Structure ---")
 
 	result, err := client.Post("https://echo.hoppscotch.io",
-		httpc.WithJSON(map[string]string{"name": "John"}),
+		httpc.WithJSON(map[string]any{"name": "John"}),
 		httpc.WithHeader("X-Custom", "value"),
 	)
 	if err != nil {

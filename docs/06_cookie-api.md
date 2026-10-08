@@ -55,8 +55,10 @@ func main() {
 
     // Send request with cookies
     result, err := client.Get("https://api.example.com",
-        httpc.WithCookie(http.Cookie{Name: "auth", Value: "token123"}),
-        httpc.WithCookie(http.Cookie{Name: "session", Value: "abc456"}),
+        httpc.WithCookies([]http.Cookie{
+            {Name: "auth", Value: "token123"},
+            {Name: "session", Value: "abc456"},
+        }),
     )
     if err != nil {
         log.Fatal(err)
@@ -106,24 +108,20 @@ func main() {
 Multiple ways to add cookies to requests:
 
 ```go
-// Method 1: http.Cookie struct (full control over attributes)
+// Method 1: WithCookies (single validation pass; full control over attributes)
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{
-        Name:  "session",
-        Value: "abc123",
-        Path:  "/",
-        Secure: true,
-        HttpOnly: true,
+    httpc.WithCookies([]http.Cookie{
+        {
+            Name:  "session",
+            Value: "abc123",
+            Path:  "/",
+            Secure: true,
+            HttpOnly: true,
+        },
     }),
 )
 
-// Method 2: Multiple cookies (use multiple WithCookie calls)
-result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "cookie1", Value: "value1"}),
-    httpc.WithCookie(http.Cookie{Name: "cookie2", Value: "value2"}),
-)
-
-// Method 3: Cookie map (convenient for simple name-value pairs)
+// Method 2: Cookie map (convenient for simple name-value pairs)
 cookies := map[string]string{
     "session_id": "abc123",
     "user_pref":  "dark_mode",
@@ -133,30 +131,22 @@ result, err := client.Get(url,
     httpc.WithCookieMap(cookies),
 )
 
-// Method 4: Cookie string (from browser dev tools)
+// Method 3: Cookie string (from browser dev tools)
 // Parse and send multiple cookies from a cookie string
 result, err := client.Get(url,
     httpc.WithCookieString("session=abc123; token=xyz789; user_id=12345"),
 )
 
-// Method 5: Batch slice (single validation pass — preferred over repeated WithCookie)
-result, err := client.Get(url,
-    httpc.WithCookies([]http.Cookie{
-        {Name: "cookie1", Value: "value1"},
-        {Name: "cookie2", Value: "value2"},
-    }),
-)
-
-// Method 6: With security attribute validation
+// Method 4: With security attribute validation
 // (WithSecureCookie validates cookies added so far — place it AFTER the cookie options)
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{
+    httpc.WithCookies([]http.Cookie{{
         Name:     "session",
         Value:    "abc123",
         Secure:   true,
         HttpOnly: true,
         SameSite: http.SameSiteStrictMode,
-    }),
+    }}),
     httpc.WithSecureCookie(httpc.StrictCookieSecurityConfig()),
 )
 ```
@@ -195,7 +185,7 @@ if result2.HasRequestCookie("session") {
 
 ```go
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "auth", Value: "token123"}),
+    httpc.WithCookies([]http.Cookie{{Name: "auth", Value: "token123"}}),
 )
 
 // Check if cookie was actually sent
@@ -214,7 +204,7 @@ if authCookie != nil && authCookie.Value != "token123" {
 
 ```go
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "client_cookie", Value: "value1"}),
+    httpc.WithCookies([]http.Cookie{{Name: "client_cookie", Value: "value1"}}),
 )
 
 fmt.Println("Sent to server:")
@@ -249,7 +239,7 @@ if sessionCookie == nil {
 
 // Use session cookie in subsequent requests
 profileResult, _ := client.Get("https://api.example.com/profile",
-    httpc.WithCookie(*sessionCookie),
+    httpc.WithCookies([]http.Cookie{*sessionCookie}),
 )
 
 // Verify session was sent
@@ -262,7 +252,7 @@ if !profileResult.HasRequestCookie("session") {
 
 ```go
 result, err := client.Get(url,
-    httpc.WithCookie(http.Cookie{Name: "required_cookie", Value: "value"}),
+    httpc.WithCookies([]http.Cookie{{Name: "required_cookie", Value: "value"}}),
 )
 
 // Validate required cookies were sent

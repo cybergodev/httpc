@@ -26,53 +26,11 @@ import (
 // Client Instance Tests
 // ----------------------------------------------------------------------------
 
-func TestClient_Creation(t *testing.T) {
-	t.Run("Default", func(t *testing.T) {
-		client, err := newTestClient()
-		if err != nil {
-			t.Fatalf("Failed to create client: %v", err)
-		}
-		defer client.Close()
-		if client == nil {
-			t.Fatal("Client should not be nil")
-		}
-	})
-
-	t.Run("NewDefault", func(t *testing.T) {
-		client, err := NewDefault()
-		if err != nil {
-			t.Fatalf("NewDefault() failed: %v", err)
-		}
-		defer client.Close()
-		if client == nil {
-			t.Fatal("NewDefault() returned nil client")
-		}
-	})
-
-	t.Run("WithConfig", func(t *testing.T) {
-		config := DefaultConfig()
-		config.Timeouts.Request = 10 * time.Second
-		config.Retry.MaxRetries = 2
-		client, err := New(config)
-		if err != nil {
-			t.Fatalf("Failed to create client: %v", err)
-		}
-		defer client.Close()
-	})
-
-	t.Run("WithTLSConfig", func(t *testing.T) {
-		config := DefaultConfig()
-		config.Security.TLSConfig = &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			MaxVersion: tls.VersionTLS13,
-		}
-		client, err := New(config)
-		if err != nil {
-			t.Fatalf("Failed to create client with TLS config: %v", err)
-		}
-		defer client.Close()
-	})
-}
+// TestClient_Creation was removed: all four subtests only asserted that a
+// constructor returned without error — a precondition of every other test in
+// this package. Config variety is asserted field-by-field in config_test.go
+// (TestConfig_Presets), and NewDefault's lifecycle by the GetDefaultClient
+// tests below.
 
 func TestClient_HTTPMethods(t *testing.T) {
 	tests := []struct {
@@ -104,7 +62,7 @@ func TestClient_HTTPMethods(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			resp, err := tt.fn(client, server.URL)
 			if err != nil {
@@ -125,7 +83,7 @@ func TestClient_Timeout_ContextTimeout(t *testing.T) {
 	defer server.Close()
 
 	client, _ := newTestClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -147,7 +105,7 @@ func TestClient_Concurrency(t *testing.T) {
 		defer server.Close()
 
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		const numRequests = 100
 		var wg sync.WaitGroup
@@ -196,7 +154,7 @@ func TestClient_Concurrency(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create client: %v", err)
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		var wg sync.WaitGroup
 		errChan := make(chan error, 100)
@@ -296,7 +254,7 @@ func TestPackageLevel_AllMethods(t *testing.T) {
 func TestClient_ErrorHandling(t *testing.T) {
 	t.Run("InvalidURL", func(t *testing.T) {
 		client, _ := newTestClient()
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		_, err := client.Get("://invalid-url")
 		if err == nil {
@@ -309,7 +267,7 @@ func TestClient_ErrorHandling(t *testing.T) {
 		config.Timeouts.Request = 1 * time.Second
 		config.Security.AllowPrivateIPs = true
 		client, _ := New(config)
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		// Use a non-routable IP address
 		_, err := client.Get("http://192.0.2.1:12345")
@@ -330,7 +288,7 @@ func TestRequest_WithOptions(t *testing.T) {
 	defer server.Close()
 
 	client, _ := newTestClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	t.Run("WithContext", func(t *testing.T) {
 		type ctxKey string
@@ -367,7 +325,7 @@ func TestRequest_WithCallbacks(t *testing.T) {
 	defer server.Close()
 
 	client, _ := newTestClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	result, err := client.Get(server.URL,
 		WithOnRequest(func(req RequestMutator) error {
@@ -417,7 +375,7 @@ func TestRequest_CallbackErrors(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			client, _ := newTestClient()
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 			_, err := client.Get(server.URL, tt.opt)
 			if err == nil {
 				t.Error("Expected error")
@@ -437,7 +395,7 @@ func TestSetDefaultClient_Boundaries(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.Security.AllowPrivateIPs = true
 		client, _ := New(cfg)
-		client.Close()
+		_ = client.Close()
 
 		if err := SetDefaultClient(client); err == nil {
 			t.Error("expected error for closed client")
@@ -469,21 +427,9 @@ func TestCopyConfig(t *testing.T) {
 // getDefaultClient slow path
 // ----------------------------------------------------------------------------
 
-func TestGetDefaultClient_Init(t *testing.T) {
-	// Reset default client to test the slow initialization path
-	defaultClient.Store(nil)
-
-	client, err := getDefaultClient()
-	if err != nil {
-		t.Fatalf("getDefaultClient failed: %v", err)
-	}
-	if client == nil {
-		t.Fatal("expected non-nil client")
-	}
-
-	// Clean up - close the auto-created client
-	_ = CloseDefaultClient() // best-effort cleanup
-}
+// TestGetDefaultClient_Init was removed: the fresh-reinit-after-nil path it
+// forced is the same path TestGetDefaultClient_SelfHealAfterClose exercises
+// (its c3 block), which additionally verifies the closed-client self-heal.
 
 func TestClose_DoubleClose(t *testing.T) {
 	cfg := DefaultConfig()
@@ -503,7 +449,7 @@ func TestClient_Lifecycle_AfterClose(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Security.AllowPrivateIPs = true
 	client, _ := New(cfg)
-	client.Close()
+	_ = client.Close()
 
 	_, err := client.Get("http://example.com")
 	if err == nil {
@@ -515,89 +461,69 @@ func TestClient_Lifecycle_AfterClose(t *testing.T) {
 // newFromConfig — InsecureSkipVerify warn-once path (FIX-001)
 // ----------------------------------------------------------------------------
 
+// TestNewFromPreparedConfig_InsecureSkipVerifyWarn consolidates the former
+// standalone Security-config and TLSConfig-embedded variants (byte-identical
+// scaffolding; only the flag's location differed). The warning fires once
+// per process outside a test environment; the environment is simulated and
+// the warn-once state reset per row. Mirrors the save/restore pattern in
+// TestWarnTestingConfigInProduction (config_test.go).
 func TestNewFromPreparedConfig_InsecureSkipVerifyWarn(t *testing.T) {
-	// The InsecureSkipVerify warning only fires outside a test environment; in a
-	// test binary isTestEnvironment() is true and the path is cold. Simulate a
-	// non-test environment to exercise the warn-once block. Mirrors the global
-	// save/restore pattern in TestWarnTestingConfigInProduction (config_test.go).
-	origArgs := os.Args[0]
-	origGoTest := os.Getenv("GO_TEST")
-	origGotest := os.Getenv("GOTEST")
-	defer func() {
-		os.Args[0] = origArgs
-		os.Setenv("GO_TEST", origGoTest)
-		os.Setenv("GOTEST", origGotest)
-		insecureSkipVerifyWarnOnce = sync.Once{}
-		securityWarnOutput = os.Stderr
-	}()
-
-	os.Args[0] = "/usr/bin/myapp"
-	os.Setenv("GO_TEST", "")
-	os.Setenv("GOTEST", "")
-	insecureSkipVerifyWarnOnce = sync.Once{} // reset so the warning fires this run
-
-	var buf bytes.Buffer
-	SetSecurityWarnOutput(&buf)
-
-	cfg := DefaultConfig()
-	cfg.Security.InsecureSkipVerify = true
-	client, err := newFromConfig(cfg)
-	if err != nil {
-		t.Fatalf("newFromConfig failed: %v", err)
+	tests := []struct {
+		name    string
+		setFlag func(*Config)
+	}{
+		{"Security.InsecureSkipVerify", func(c *Config) {
+			c.Security.InsecureSkipVerify = true
+		}},
+		{"TLSConfig-embedded InsecureSkipVerify", func(c *Config) {
+			c.Security.InsecureSkipVerify = false // only the embedded TLSConfig sets it
+			c.Security.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+		}},
 	}
-	defer client.Close()
 
-	output := buf.String()
-	if !strings.Contains(output, "InsecureSkipVerify is enabled") {
-		t.Errorf("expected InsecureSkipVerify warning, got: %s", output)
-	}
-	if !strings.Contains(output, "TLS certificate verification is DISABLED") {
-		t.Errorf("expected TLS-disabled warning, got: %s", output)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origArgs := os.Args[0]
+			origGoTest := os.Getenv("GO_TEST")
+			origGotest := os.Getenv("GOTEST")
+			defer func() {
+				os.Args[0] = origArgs
+				_ = os.Setenv("GO_TEST", origGoTest)
+				_ = os.Setenv("GOTEST", origGotest)
+				insecureSkipVerifyWarnOnce = sync.Once{}
+				securityWarnOutput = os.Stderr
+			}()
+
+			os.Args[0] = "/usr/bin/myapp"
+			_ = os.Setenv("GO_TEST", "")
+			_ = os.Setenv("GOTEST", "")
+			insecureSkipVerifyWarnOnce = sync.Once{} // reset so the warning fires this run
+
+			var buf bytes.Buffer
+			SetSecurityWarnOutput(&buf)
+
+			cfg := DefaultConfig()
+			tt.setFlag(&cfg)
+			client, err := newFromConfig(cfg)
+			if err != nil {
+				t.Fatalf("newFromConfig failed: %v", err)
+			}
+			defer func() { _ = client.Close() }()
+
+			output := buf.String()
+			if !strings.Contains(output, "InsecureSkipVerify is enabled") {
+				t.Errorf("expected InsecureSkipVerify warning, got: %s", output)
+			}
+			if !strings.Contains(output, "TLS certificate verification is DISABLED") {
+				t.Errorf("expected TLS-disabled warning, got: %s", output)
+			}
+		})
 	}
 
 	// The two engine.NewClient error arms (client.go:153, :166) are unreachable
 	// from a validated public Config — convertToEngineConfig/engine.NewClient only
 	// reject inputs that ValidateConfig already refuses upstream — so they are
 	// intentionally not exercised here.
-}
-
-// TestNewFromPreparedConfig_TLSConfigInsecureSkipVerifyWarn verifies the warning
-// also fires when InsecureSkipVerify is set inside a custom Security.TLSConfig
-// rather than via the top-level Security.InsecureSkipVerify flag. Before the
-// fix, only the top-level flag was checked and the embedded one silently
-// disabled verification with no warning.
-func TestNewFromPreparedConfig_TLSConfigInsecureSkipVerifyWarn(t *testing.T) {
-	origArgs := os.Args[0]
-	origGoTest := os.Getenv("GO_TEST")
-	origGotest := os.Getenv("GOTEST")
-	defer func() {
-		os.Args[0] = origArgs
-		os.Setenv("GO_TEST", origGoTest)
-		os.Setenv("GOTEST", origGotest)
-		insecureSkipVerifyWarnOnce = sync.Once{}
-		securityWarnOutput = os.Stderr
-	}()
-
-	os.Args[0] = "/usr/bin/myapp"
-	os.Setenv("GO_TEST", "")
-	os.Setenv("GOTEST", "")
-	insecureSkipVerifyWarnOnce = sync.Once{}
-
-	var buf bytes.Buffer
-	SetSecurityWarnOutput(&buf)
-
-	cfg := DefaultConfig()
-	cfg.Security.InsecureSkipVerify = false // only the embedded TLSConfig sets it
-	cfg.Security.TLSConfig = &tls.Config{InsecureSkipVerify: true}
-	client, err := newFromConfig(cfg)
-	if err != nil {
-		t.Fatalf("newFromConfig failed: %v", err)
-	}
-	defer client.Close()
-
-	if output := buf.String(); !strings.Contains(output, "InsecureSkipVerify is enabled") {
-		t.Errorf("expected warning for TLSConfig-embedded InsecureSkipVerify, got: %s", output)
-	}
 }
 
 // fakePSL is a minimal cookiejar.PublicSuffixList that treats "com" as a
@@ -613,9 +539,7 @@ func (fakePSL) PublicSuffix(domain string) string {
 func (fakePSL) String() string { return "fakepsl" }
 
 // TestCreateCookieJar_PublicSuffixList verifies Connection.PublicSuffixList is
-// forwarded to the jar. The classic PSL win: a Domain="com" supercookie (set
-// by example.com) is rejected when a PSL is configured, but stored when the
-// list is nil.
+// plumbed into the cookie jar, and that disabling cookies yields a nil jar.
 func TestCreateCookieJar_PublicSuffixList(t *testing.T) {
 	exampleURL := &url.URL{Scheme: "http", Host: "example.com"}
 	supercookie := []*http.Cookie{{Name: "a", Value: "1", Domain: "com"}}
@@ -663,7 +587,7 @@ func TestRequest_StreamBodyRejectedOnFacade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Get(ts.URL, WithStreamBody(true))
 	if !errors.Is(err, ErrStreamBodyRequiresDownload) {
@@ -812,5 +736,44 @@ func TestConvertResponseToResult_NonEngineResponse(t *testing.T) {
 	// convertResponseToResult nil early-return.
 	if convertResponseToResult(nil) != nil {
 		t.Error("convertResponseToResult(nil) should return nil")
+	}
+}
+
+// Moved from quality_regression_test.go (dissolved grab-bag file). Lives here rather
+// than domain_client_test.go because buildURL is unexported and that file is
+// the black-box httpc_test package:
+// TestBuildURLCaseInsensitiveScheme guards the case-insensitive absolute-URL
+// detection in DomainClient.buildURL: "HTTP://host" is an absolute URL per
+// url.Parse (which lowercases schemes), not a relative path to be joined.
+func TestBuildURLCaseInsensitiveScheme(t *testing.T) {
+	dc, err := NewDomain("https://api.example.com/v1", TestingConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = dc.Close() }()
+	impl := dc.(*DomainClient)
+
+	for _, abs := range []string{
+		"HTTP://other.example.com/x",
+		"http://other.example.com/x",
+		"https://other.example.com/x",
+		"HTTPS://other.example.com/x",
+	} {
+		got, err := impl.buildURL(abs)
+		if err != nil {
+			t.Fatalf("buildURL(%q): %v", abs, err)
+		}
+		if got != abs {
+			t.Errorf("buildURL(%q) = %q, want the URL used as-is", abs, got)
+		}
+	}
+
+	// Relative paths must still join onto the base path.
+	got, err := impl.buildURL("users")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "https://api.example.com/v1/users"; got != want {
+		t.Errorf("buildURL(users) = %q, want %q", got, want)
 	}
 }

@@ -67,7 +67,7 @@ func TestDoHBodyDrain(t *testing.T) {
 			}
 
 			resolver := NewDoHResolver([]*dohProvider{provider}, 5*time.Minute)
-			defer resolver.Close()
+			defer func() { _ = resolver.Close() }()
 
 			// First request fails (error status or invalid JSON) → body must be drained.
 			_, _ = resolver.LookupIPAddr(context.Background(), "test.local")

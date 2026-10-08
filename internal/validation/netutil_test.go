@@ -3,6 +3,7 @@ package validation
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -84,6 +85,13 @@ func TestIsPrivateOrReservedIP(t *testing.T) {
 		{"NAT64 mapped metadata", "64:ff9b::a9fe:a9fe", true},
 		{"NAT64 mapped private", "64:ff9b::a00:1", true},
 		{"NAT64 mapped public", "64:ff9b::808:808", false},
+
+		// Remaining SSRF bypass literals (formerly TestSSRFBypassPrevention,
+		// retired as a strict subset of this table)
+		{"IPv4-mapped loopback variant", "::ffff:127.0.0.2", true},
+		{"IPv4-mapped unspecified", "::ffff:0.0.0.0", true},
+		{"IPv4-mapped public Cloudflare", "::ffff:1.1.1.1", false},
+		{"IPv6 unique local max", "fdff:ffff:ffff:ffff::1", true},
 	}
 
 	for _, tt := range tests {
@@ -166,40 +174,48 @@ func TestIsLocalhost(t *testing.T) {
 	}
 }
 
-func TestSSRFBypassPrevention(t *testing.T) {
-	// This test specifically validates SSRF bypass prevention techniques
+// TestSSRFBypassPrevention is retired: every row was a strict subset of
+// TestIsPrivateOrReservedIP (same function, same equivalence classes); the
+// rows not already present there were folded into its table.
+
+// TestCanonicalProxyAddr verifies the host:port canonicalization against
+// net/http's dial-time address, including default-port application, explicit
+// empty port ("http://proxy:"), and the nil short-circuit.
+func TestCanonicalProxyAddr(t *testing.T) {
 	tests := []struct {
 		name    string
-		ip      string
-		blocked bool
+		rawURL  string
+		want    string
+		wantNil bool
 	}{
-		// Common SSRF bypass attempts
-		{"IPv4-mapped IPv6 localhost", "::ffff:127.0.0.1", true},
-		{"IPv4-mapped IPv6 private", "::ffff:10.0.0.1", true},
-		{"IPv4-mapped IPv6 loopback variant", "::ffff:127.0.0.2", true},
-		{"IPv4-mapped IPv6 0.0.0.0", "::ffff:0.0.0.0", true},
-		{"IPv4-mapped IPv6 169.254", "::ffff:169.254.1.1", true},
-
-		// IPv6 local ranges
-		{"IPv6 link-local fe80", "fe80::1", true},
-		{"IPv6 unique local fc00", "fc00::1", true},
-		{"IPv6 unique local fd00", "fdff:ffff:ffff:ffff::1", true},
-
-		// Should NOT be blocked
-		{"IPv4-mapped public", "::ffff:1.1.1.1", false},
-		{"IPv6 public", "2606:4700:4700::1111", false},
+		{"nil URL", "", "", true},
+		{"http with explicit port", "http://proxy:8080", "proxy:8080", false},
+		{"http default port applied", "http://proxy", "proxy:80", false},
+		{"https default port applied", "https://proxy", "proxy:443", false},
+		{"socks5 default port applied", "socks5://proxy", "proxy:1080", false},
+		{"socks5h default port applied", "socks5h://proxy", "proxy:1080", false},
+		// url.Port() returns "" for a present-but-empty port, so the scheme
+		// default must still apply (mirrors net/http canonicalAddr).
+		{"http empty port gets default", "http://proxy:", "proxy:80", false},
+		{"unknown scheme no default", "gopher://proxy", "proxy:", false},
+		{"ipv6 literal with port", "http://[::1]:3128", "[::1]:3128", false},
+		{"ipv6 literal default port", "http://[::1]", "[::1]:80", false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ip := net.ParseIP(tt.ip)
-			if ip == nil {
-				t.Fatalf("Failed to parse IP: %s", tt.ip)
+			var u *url.URL
+			if !tt.wantNil {
+				parsed, err := url.Parse(tt.rawURL)
+				if err != nil {
+					t.Fatalf("url.Parse(%q) error: %v", tt.rawURL, err)
+				}
+				u = parsed
 			}
 
-			blocked := isPrivateOrReservedIP(ip)
-			if blocked != tt.blocked {
-				t.Errorf("SSRF bypass check for %s: blocked=%v, want=%v", tt.ip, blocked, tt.blocked)
+			got := CanonicalProxyAddr(u)
+			if got != tt.want {
+				t.Errorf("CanonicalProxyAddr(%q) = %q, want %q", tt.rawURL, got, tt.want)
 			}
 		})
 	}

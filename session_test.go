@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cybergodev/httpc/internal/engine"
 	"github.com/cybergodev/httpc/internal/validation"
 )
 
@@ -51,6 +52,58 @@ func TestNewSessionManagerDefault(t *testing.T) {
 	}
 	if session.cookieSecurity != nil {
 		t.Error("Expected nil cookieSecurity with default config")
+	}
+}
+
+// TestSessionManagerZeroValue exercises the write methods on a zero-value
+// SessionManager (&SessionManager{} instead of NewSessionManager): the maps
+// are initialized lazily on first write, so a mis-constructed manager behaves
+// as an empty session instead of panicking with "assignment to entry in nil
+// map" (SEC-003 regression guard).
+func TestSessionManagerZeroValue(t *testing.T) {
+	s := &SessionManager{}
+
+	if err := s.SetHeader("Accept", "application/json"); err != nil {
+		t.Fatalf("SetHeader on zero value: %v", err)
+	}
+	if err := s.SetHeaders(map[string]string{"X-A": "b"}); err != nil {
+		t.Fatalf("SetHeaders on zero value: %v", err)
+	}
+	if err := s.SetCookie(&http.Cookie{Name: "sid", Value: "1"}); err != nil {
+		t.Fatalf("SetCookie on zero value: %v", err)
+	}
+	if err := s.SetCookies([]*http.Cookie{{Name: "c2", Value: "v"}}); err != nil {
+		t.Fatalf("SetCookies on zero value: %v", err)
+	}
+	s.UpdateFromCookies([]*http.Cookie{{Name: "c3", Value: "v"}})
+	s.UpdateFromResult(&Result{Response: &ResponseInfo{Cookies: []*http.Cookie{{Name: "c4", Value: "v"}}}})
+	s.captureFromOptions([]RequestOption{
+		WithHeader("X-Zero", "1"),
+		WithCookies([]http.Cookie{{Name: "c5", Value: "v"}}),
+	})
+
+	if got := s.GetCookie("sid"); got == nil || got.Value != "1" {
+		t.Errorf("GetCookie(sid) = %+v, want value %q", got, "1")
+	}
+	if v, ok := s.GetHeaders()["X-A"]; !ok || v != "b" {
+		t.Errorf("GetHeaders()[X-A] = %q, %v", v, ok)
+	}
+	for _, name := range []string{"c2", "c3", "c4", "c5"} {
+		if s.GetCookie(name) == nil {
+			t.Errorf("cookie %s missing after write on zero value", name)
+		}
+	}
+
+	// Reads on a never-written zero value must also work (nil-map reads).
+	s2 := &SessionManager{}
+	if h := s2.GetHeaders(); len(h) != 0 {
+		t.Errorf("GetHeaders on untouched zero value = %v, want empty", h)
+	}
+	if c := s2.GetCookies(); c != nil {
+		t.Errorf("GetCookies on untouched zero value = %v, want nil", c)
+	}
+	if c := s2.GetCookie("missing"); c != nil {
+		t.Errorf("GetCookie on untouched zero value = %v, want nil", c)
 	}
 }
 
@@ -306,7 +359,7 @@ func TestSessionManager_prepareOptions(t *testing.T) {
 	defer server.Close()
 
 	client, _ := newTestClient()
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Get(server.URL, options...)
 	if err != nil {
@@ -491,4 +544,30 @@ func TestSessionManager_NilReceiverSafety(t *testing.T) {
 			t.Errorf("expected nil, got %v", c)
 		}
 	})
+}
+
+// Moved from quality_regression_test.go (dissolved grab-bag file):
+// TestCaptureFromOptionsSkipsInvalidCookies guards the ValidateCookie gate in
+// captureFromOptions: cookies set by raw options that bypass WithCookies
+// validation must not enter the session store.
+func TestCaptureFromOptionsSkipsInvalidCookies(t *testing.T) {
+	sm, err := NewSessionManagerDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := RequestOption(func(r *engine.Request) error {
+		r.SetCookies([]http.Cookie{
+			{Name: "good", Value: "fine"},
+			{Name: "bad;name", Value: "invalid"}, // control/separator chars in name
+		})
+		return nil
+	})
+	sm.captureFromOptions([]RequestOption{raw})
+
+	if got := sm.GetCookie("good"); got == nil {
+		t.Error("valid cookie from option should be captured")
+	}
+	if got := sm.GetCookie("bad;name"); got != nil {
+		t.Errorf("invalid cookie should be rejected, got %v", got)
+	}
 }

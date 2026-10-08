@@ -825,24 +825,9 @@ func WithBinary(data []byte, contentType ...string) RequestOption {
 	}
 }
 
-// WithCookie adds a cookie to the request after validation.
-// Returns an error if the cookie name or value fails validation (empty name,
-// control characters, or invalid characters).
-func WithCookie(cookie http.Cookie) RequestOption {
-	return func(r *engine.Request) error {
-		if err := validation.ValidateCookie(&cookie); err != nil {
-			return fmt.Errorf("invalid cookie: %w", err)
-		}
-
-		existing := ensureCookieCapacity(r.Cookies(), 1)
-		r.SetCookies(append(existing, cookie))
-		return nil
-	}
-}
-
 // ensureCookieCapacity grows the slice if needed to accommodate additional entries.
-// The minimum capacity of 4 avoids the 0→1→2→4 regrowth when cookies are added
-// one at a time via WithCookie (the per-request slice starts empty every time).
+// The minimum capacity of 4 avoids repeated regrowth when cookies are added in
+// several small options (the per-request slice starts empty every time).
 func ensureCookieCapacity(existing []http.Cookie, additional int) []http.Cookie {
 	if cap(existing) < len(existing)+additional {
 		newCap := max(len(existing)+additional, 4)
@@ -853,21 +838,26 @@ func ensureCookieCapacity(existing []http.Cookie, additional int) []http.Cookie 
 	return existing
 }
 
-// WithCookies adds multiple cookies to the request after validation.
-// It is more efficient than calling WithCookie multiple times, as it
-// pre-allocates capacity and validates all cookies in a single pass.
+// WithCookies adds one or more cookies to the request after validation.
+// It pre-allocates capacity and validates all cookies in a single pass.
 // Returns an error if any cookie fails validation (empty name, control
 // characters, or invalid characters). The error message includes the
 // cookie name that failed.
 //
 // Example:
 //
+//	// Single cookie
+//	result, err := client.Get("https://api.example.com",
+//	    httpc.WithCookies([]http.Cookie{{Name: "session_id", Value: "abc123"}}),
+//	)
+//
+//	// Multiple cookies
 //	cookies := []http.Cookie{
 //	    {Name: "session_id", Value: "abc123"},
 //	    {Name: "user_pref", Value: "dark_mode"},
 //	    {Name: "lang", Value: "en"},
 //	}
-//	result, err := client.Get("https://api.example.com",
+//	result, err = client.Get("https://api.example.com",
 //	    httpc.WithCookies(cookies),
 //	)
 func WithCookies(cookies []http.Cookie) RequestOption {
@@ -893,7 +883,7 @@ func WithCookies(cookies []http.Cookie) RequestOption {
 // WithCookieMap sets multiple cookies from a map of name-value pairs.
 // This is a convenience method for setting multiple simple cookies at once.
 // For cookies with additional attributes (Domain, Path, Secure, etc.),
-// use WithCookie or WithCookieString instead.
+// use WithCookies or WithCookieString instead.
 // Returns an error if any cookie name or value fails validation. The error
 // message includes the cookie name that failed.
 //
@@ -1068,11 +1058,11 @@ func WithOnResponse(callback func(resp ResponseMutator) error) RequestOption {
 // security attributes (Secure, HttpOnly, SameSite).
 //
 // IMPORTANT: This option validates only cookies present at the time it is applied.
-// Place WithSecureCookie AFTER all WithCookie/WithCookieMap options:
+// Place WithSecureCookie AFTER all WithCookies/WithCookieMap options:
 //
 //	// Correct order: add cookies first, then validate
 //	result, err := client.Get(url,
-//	    httpc.WithCookie(sessionCookie),
+//	    httpc.WithCookies(sessionCookies),
 //	    httpc.WithCookieMap(otherCookies),
 //	    httpc.WithSecureCookie(securityConfig),
 //	)

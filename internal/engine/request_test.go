@@ -497,3 +497,51 @@ func TestBuild_MultipartCRLFInjectionRejected(t *testing.T) {
 		})
 	}
 }
+
+// TestRequest_SetHeadersAndQueryParams_Nil pins the nil-input contract of the
+// pooled-map setters: a nil map must clear the field (not allocate a pooled
+// map), and a non-nil map must be COPIED so the caller's map can never leak
+// into a recycled request (pool-poisoning guard).
+func TestRequest_SetHeadersAndQueryParams_Nil(t *testing.T) {
+	t.Run("SetHeaders nil clears", func(t *testing.T) {
+		r := AcquireRequest()
+		defer ReleaseRequest(r)
+		r.SetHeader("X-A", "1")
+		r.SetHeaders(nil)
+		if r.headers != nil {
+			t.Errorf("SetHeaders(nil) should clear headers, got %v", r.headers)
+		}
+	})
+
+	t.Run("SetHeaders copies caller map", func(t *testing.T) {
+		r := AcquireRequest()
+		defer ReleaseRequest(r)
+		src := map[string]string{"X-A": "1"}
+		r.SetHeaders(src)
+		src["X-A"] = "mutated" // caller mutates its map afterwards
+		if got := r.headers["X-A"]; got != "1" {
+			t.Errorf("SetHeaders stored caller map by reference: got %q, want %q", got, "1")
+		}
+	})
+
+	t.Run("SetQueryParams nil clears", func(t *testing.T) {
+		r := AcquireRequest()
+		defer ReleaseRequest(r)
+		r.EnsureQueryParams()["q"] = "1"
+		r.SetQueryParams(nil)
+		if r.queryParams != nil {
+			t.Errorf("SetQueryParams(nil) should clear queryParams, got %v", r.queryParams)
+		}
+	})
+
+	t.Run("SetQueryParams copies caller map", func(t *testing.T) {
+		r := AcquireRequest()
+		defer ReleaseRequest(r)
+		src := map[string]any{"page": 1}
+		r.SetQueryParams(src)
+		src["page"] = 99
+		if got := r.queryParams["page"]; got != 1 {
+			t.Errorf("SetQueryParams stored caller map by reference: got %v, want 1", got)
+		}
+	})
+}

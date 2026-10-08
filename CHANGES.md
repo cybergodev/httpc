@@ -4,6 +4,83 @@ All notable changes to the cybergodev/httpc library will be documented in this f
 
 ---
 
+## v1.6.3 - Security Hardening, Retry & Streaming Semantics, Performance (2026-10-08)
+
+### Breaking
+- Removed `WithCookie(cookie http.Cookie)` — use `WithCookies([]http.Cookie{c})`; validation semantics unchanged
+- Minimum Go version raised 1.25 → 1.26 (golang.org/x/sys v0.48.0 requires it)
+- Non-idempotent methods (POST/PATCH) are no longer retried by default — opt in via `RetryConfig.RetryNonIdempotent` or `WithRetryNonIdempotent(true)`
+- Any `Content-Encoding` other than gzip/deflate/identity (zstd, "gzip, br", …) now errors instead of silently passing compressed bytes through
+- `WithStreamBody(true)` on standard verbs (Get/Post/…) now returns `ErrStreamBodyRequiresDownload` instead of a silent empty body — use `Download`
+- Response bodies over `MaxResponseBodySize` (default 10MB) now fail with a clear error — buffered bodies were previously accepted (limit unenforced) and streaming downloads were silently truncated into corrupt files
+- `Result.String()` no longer prints a body preview — emits `Body: [N bytes omitted]` (stops OAuth tokens etc. leaking into logs)
+
+### Added
+- `Config.Validate()` method — method form of `ValidateConfig()`; both remain valid
+- `RetryConfig.RetryNonIdempotent` field + `WithRetryNonIdempotent(allow bool)` per-request option
+- `WithNoTimeout()` per-request option — lifts the client-level timeout for one call (explicit `WithTimeout` and context deadlines still apply)
+- New sentinels `ErrStreamBodyRequiresDownload`, `ErrInvalidMaxRedirects`, `ErrInvalidCredentials`, `ErrDownloadInProgress`; `ErrProxyConnectionFailed` re-exported for direct `errors.Is` use
+- 307/308 redirects now replay the request body (`http.Request.GetBody`, net/http parity) — memory-backed bodies follow redirects preserving method and body
+- `ConnectionConfig.PublicSuffixList` — inject a Public Suffix List to harden the cookie jar against supercookie leakage
+- URL userinfo credentials (`https://user:pass@host/`) now set a Basic Authorization header (net/http parity); an explicit `WithHeader`/`WithBasicAuth` always wins
+- `MinTLSVersion`/`MaxTLSVersion` validated at construction — clear config errors instead of confusing handshake failures
+- GitHub Actions CI (ubuntu/windows: vet, race tests, lint, vulncheck, examples) and tag-triggered release workflow
+
+### Changed
+- Documentation accuracy pass across README (EN/CN), docs/ and godoc: stdlib header limit is 1MB (not 10MB), decompression exceptions, streaming semantics, redirect body replay
+- All 22 examples overhauled: compile standalone, ASCII-only output for Windows consoles, real error paths exercised instead of always-success demos
+- Test suite fully offline by default; overall coverage 90.8% → 91.7%; golangci-lint at zero issues repo-wide
+
+### Security
+- SSRF: blocked short-form `inet_aton` literals ("10.1", "192.168.1", out-of-range octets), trailing-dot FQDN bypasses ("localhost."), and Teredo (2001::/32) / 6to4 (2002::/16) embedded-IP bypasses
+- Certificate pinning: pin-stuffing bypass closed — pins only match the connection-bound certificate (verified chains / handshake leaf); empty pin set is now fail-closed
+- Multipart CRLF injection: control characters in field names, filenames and per-file Content-Type rejected at the encoding layer (covers directly constructed `FormData`); nil `*FileData` now errors instead of being dropped
+- Portless proxy URLs (`socks5://internal-proxy`) keyed by canonical port (`proxy:1080`) — SSRF exemption and circuit breaking previously never matched what net/http actually dials
+- Proxy credentials redacted from `Result.Meta.ProxyURL`
+- DomainClient session state is origin-scoped — absolute-URL requests to a different host no longer send or capture session headers/cookies
+- `SanitizeURL` fail-open paths closed: unparseable and opaque URLs are best-effort redacted instead of returned verbatim
+- `InsecureSkipVerify` warning now also fires when the flag lives inside an embedded `Security.TLSConfig`
+- https→http downgrade on the same host now strips Authorization/Cookie/Proxy-Authorization (cross-origin treatment)
+- SPKI pins hash `cert.RawSubjectPublicKeyInfo`, matching the documented `openssl` command
+- Pooled cookie storage no longer retains parsed cookie values (session tokens) between requests
+
+### Fixed
+- Streaming requests send `Accept-Encoding: identity` — Download no longer writes raw gzip bytes to disk; a server that compresses anyway now triggers an explicit error
+- Downloads and `Result.SaveToFile` write atomically (`.httpc-tmp` + rename) — failed or interrupted saves never touch the target file
+- Resume + checksum mismatch no longer deletes the file — the valid prefix is kept; the 206 `Content-Range` start is validated against the local file length
+- Same-path concurrent downloads fail fast with `ErrDownloadInProgress` (lock keys case-insensitive on Windows)
+- `MaxResponseBodySize` now enforced on buffered identity bodies (previously only the 100MB decompressed cap applied)
+- Multiple `WithFile` options merge into one multipart body instead of silently dropping all but the last file
+- `WithHeader`/`WithHeaderMap` errors wrap the `ErrInvalidHeader` sentinel — the documented `errors.Is` contract now holds
+- Proxy pool: a healthy proxy is guaranteed whenever one exists (previously ~35% dead-proxy selection with 10 entries / 1 healthy); DoH providers sorted by `Priority` (previously ignored)
+- Certificate pinning chains onto a user-supplied `VerifyPeerCertificate` callback instead of silently replacing it
+- Non-DoH dialing tries every validated IP in turn (IPv6 → IPv4 failover) instead of only the first
+- DoH: SERVFAIL/REFUSED surface as errors; answers bound to the queried name (no cross-domain cache poisoning); singleflight waiters honor their own context; fallback lookup capped at 10s
+- Retry: int64 backoff overflow no longer collapses into immediate-retry storms; a custom policy with negative MaxRetries still executes the request exactly once
+- Truncated responses (declared Content-Length, early close) now error instead of returning a "successful" partial body
+- A middleware chain returning `(nil, nil)` now errors instead of yielding a nil Result reported as status-0 "success"
+- Query-string encoding is deterministic (sorted keys) — request signing/HMAC stability restored
+- Middleware passing user-owned maps to `SetHeaders`/`SetQueryParams` no longer pollutes shared pools (headers could cross-talk between concurrent requests)
+- Manual per-request cookies no longer persist into the shared cookie jar
+- `TimeoutMiddleware` rejects streaming requests up front with a clear error instead of aborting the body stream mid-read
+- Zero-value `&SessionManager{}` no longer panics on first write; `Response.RawBody()`/`RawBodyReader()` race fixed; concurrent stream-body Close returns its reader exactly once
+- A panicking user option during DomainClient capture returns an error instead of crashing the process (matches Client behavior)
+- "127.com"-style public hostnames no longer misdetected as loopback and permanently blocked
+- macOS: hung `networksetup` no longer hangs `NewClient` (2s command timeout); invalid configured proxy env vars now error instead of silently connecting direct; system-proxy detection exempts loopback
+- Dozens of smaller consistency fixes: case-insensitive XML content-type and absolute-URL scheme detection, 416/non-2xx resume diagnosis, `WithBinary` empty-data rejection, cookie-header parsing edges, error-message accuracy
+
+### Performance
+- Fixed the gzip reader pool (its New always returned nil) — compressed responses no longer allocate a full decompressor stack each time
+- Pooled bufio for decompression input: gzip −88.5% B/op / −75.8% time, deflate −41.5% B/op / −24.8% time
+- Multipart encoding rewritten as a hand-rolled pooled writer (byte-identical to stdlib): MultipartForm 156→94 allocs/op (−39.7%, −20.1% B/op)
+- Query encoding: pooled sort keys (2→1 allocs/op) and a single-parameter fast path (−15.8% ns/op)
+- URL cache rework: miss −62.9% B/op (7→3 allocs), hit −74.7% ns/op
+- Cookie header parsing: N+1 allocations → 2
+- DoH IP-literal hosts resolve in-process without a provider round trip; domain-whitelist matching −41% on uppercase hostnames
+- Redirect settings read directly from the request — no per-request `ctx.Value` chain lookups
+
+---
+
 ## v1.6.2 - Per-Request Proxy Rotation, Performance & Bug Fixes (2026-08-12)
 
 ### Added

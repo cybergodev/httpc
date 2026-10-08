@@ -367,12 +367,26 @@ func (p *responseProcessor) readBody(httpResp *http.Response, encoding string) (
 		reader = decompressor
 	}
 
-	// SECURITY: Apply decompressed size limit using pooled reader
-	// Use MaxDecompressedBodySize if set, else MaxResponseBodySize, else default
+	// SECURITY: Apply the body-size limit using a pooled reader.
+	//
+	// Compressed responses are capped by MaxDecompressedBodySize (falling back
+	// to MaxResponseBodySize, then the 100MB default) — the limit governs the
+	// inflated size. Identity (non-compressed) bodies are capped by
+	// MaxResponseBodySize alone: the decompressed limit applies only to bytes
+	// the client actually inflates, so preferring it unconditionally let the
+	// default 100MB MaxDecompressedBodySize silently replace the documented
+	// 10MB MaxResponseBodySize cap for every DefaultConfig user (verified: a
+	// 50MB identity body was accepted). This also matches the streaming path
+	// in executeRequest, which caps at MaxResponseBodySize.
 	maxSize := p.config.MaxDecompressedBodySize
+	if !isCompressed {
+		maxSize = p.config.MaxResponseBodySize
+	}
 	if maxSize <= 0 {
 		maxSize = p.config.MaxResponseBodySize
 		if maxSize <= 0 {
+			// Engine-constructed configs with no body limit keep the same
+			// 100MB ceiling the compressed fallback chain uses.
 			maxSize = defaultMaxDecompressedSize
 		}
 	}
@@ -402,6 +416,14 @@ func (p *responseProcessor) readBody(httpResp *http.Response, encoding string) (
 	// Read directly into a pre-sized slice — avoids bytes.Buffer allocation entirely.
 	// Extended to maxBufferSize (512KB) to cover most API responses without buffer pool overhead.
 	if !isCompressed && contentLength > 0 && contentLength <= int64(maxBufferSize) {
+		// Fail fast with the clear "exceeds limit" message instead of the
+		// misleading "unexpected EOF" that io.ReadFull produces when the limit
+		// reader stops it short of the declared Content-Length. HEAD responses
+		// carry Content-Length with no body and must keep passing (n==0, EOF).
+		isHead := httpResp.Request != nil && httpResp.Request.Method == http.MethodHead
+		if contentLength > maxSize && !isHead {
+			return nil, fmt.Errorf("response body exceeds limit of %d bytes", maxSize)
+		}
 		body := make([]byte, contentLength)
 		n, err := io.ReadFull(reader, body)
 		if err != nil {
@@ -415,8 +437,12 @@ func (p *responseProcessor) readBody(httpResp *http.Response, encoding string) (
 			// of defense, but it is disabled by StrictContentLength=false
 			// (e.g. PerformanceConfig), which previously let truncated bodies
 			// pass silently on this path while the slow path (io.Copy) errored.
-			if !(err == io.EOF && n == 0) {
-				return nil, fmt.Errorf("failed to read response body: %w", err)
+			if err != io.EOF || n != 0 {
+				// Return the bare error: Process wraps every readBody error
+				// with "failed to read response body: %w" — repeating that
+				// prefix here tripled it once ClientError.Error() layered the
+				// classifier's message on top.
+				return nil, err
 			}
 			n = 0
 		}
@@ -442,7 +468,7 @@ func (p *responseProcessor) readBody(httpResp *http.Response, encoding string) (
 
 	_, err := io.Copy(buf, reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
+		return nil, err // Process adds the "failed to read response body" context
 	}
 
 	body := buf.Bytes()

@@ -3,15 +3,15 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"maps"
-	"mime/multipart"
 	"net/http"
-	"net/textproto"
 	"net/url"
 	"strconv"
 	"strings"
@@ -370,58 +370,47 @@ const maxMultipartBufferSize = 256 * 1024
 // maxJSONBufferSize limits the maximum buffer size for JSON encoding (1MB)
 const maxJSONBufferSize = 1024 * 1024
 
-// mimeHeaderPool reduces allocations for textproto.MIMEHeader in multipart uploads
-var mimeHeaderPool = sync.Pool{
-	New: func() any {
-		h := make(textproto.MIMEHeader, 4) // Pre-allocate for typical multipart headers
-		return &h
-	},
+// newMultipartBoundary generates a random multipart boundary: 30 random
+// bytes, hex-encoded — the same construction as mime/multipart.randomBoundary
+// (60 chars, well under the 70-char RFC 2046 limit). The hex alphabet contains
+// no RFC 2045 tspecials, so the boundary never needs quoting in the
+// Content-Type header (see the FormDataContentType note in Build).
+// Unlike the stdlib, which panics when crypto/rand fails, the error is
+// returned to the caller.
+func newMultipartBoundary() (string, error) {
+	var b [30]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generate multipart boundary: %w", err)
+	}
+	return hex.EncodeToString(b[:]), nil
 }
 
-// getMIMEHeader retrieves a textproto.MIMEHeader from the pool
-func getMIMEHeader() *textproto.MIMEHeader {
-	h, ok := mimeHeaderPool.Get().(*textproto.MIMEHeader)
-	if !ok || h == nil {
-		tmp := make(textproto.MIMEHeader, 4)
-		return &tmp
+// writeMultipartPartHeader writes one multipart part's delimiter and MIME
+// headers directly into buf. The bytes are identical to what
+// mime/multipart.Writer.CreatePart produces for the two headers this engine
+// emits: the first part's delimiter is "--<boundary>\r\n", later parts repeat
+// "\r\n--<boundary>\r\n", headers appear as "%s: %s\r\n" lines in sorted key
+// order (Content-Disposition sorts before Content-Type), and the header block
+// ends with a blank line. Writing directly into the pooled buffer avoids
+// CreatePart's per-part allocations (an escaping bytes.Buffer, several
+// fmt.Fprintf calls, and a sorted-keys slice). TestMultipartWireParity pins
+// this byte-for-byte against the stdlib.
+// first tracks whether this is the first part of the body.
+func writeMultipartPartHeader(buf *bytes.Buffer, first *bool, boundary, disposition, contentType string) {
+	if *first {
+		buf.WriteString("--")
+		*first = false
+	} else {
+		buf.WriteString("\r\n--")
 	}
-	// Clear for reuse
-	for k := range *h {
-		delete(*h, k)
-	}
-	return h
-}
-
-// putMIMEHeader returns a textproto.MIMEHeader to the pool.
-// Keys are deleted to clear the map for reuse, matching the pattern used by
-// putHeadersMap / putQueryParamsMap / putHTTPHeader.
-func putMIMEHeader(h *textproto.MIMEHeader) {
-	if h == nil || len(*h) > 16 {
-		return // Don't pool large headers
-	}
-	for k := range *h {
-		delete(*h, k)
-	}
-	mimeHeaderPool.Put(h)
-}
-
-// createMultipartPart creates one multipart form part through a pooled
-// textproto.MIMEHeader. It reproduces the exact wire format of
-// multipart.Writer.WriteField and CreateFormFile (including the latter's
-// implicit application/octet-stream Content-Type, supplied by the caller)
-// while avoiding those methods' per-part allocations: CreateFormField and
-// CreateFormFile each allocate a fresh MIMEHeader map plus a fmt.Sprintf
-// disposition string. CreatePart serializes the header into the multipart
-// buffer, so the pooled map is safe to recycle immediately after.
-func createMultipartPart(w *multipart.Writer, disposition, contentType string) (io.Writer, error) {
-	h := getMIMEHeader()
-	h.Set("Content-Disposition", disposition)
+	buf.WriteString(boundary)
+	buf.WriteString("\r\nContent-Disposition: ")
+	buf.WriteString(disposition)
 	if contentType != "" {
-		h.Set("Content-Type", contentType)
+		buf.WriteString("\r\nContent-Type: ")
+		buf.WriteString(contentType)
 	}
-	part, err := w.CreatePart(*h)
-	putMIMEHeader(h)
-	return part, err
+	buf.WriteString("\r\n\r\n")
 }
 
 // multipartBufferPool reduces allocations for multipart form data buffers
@@ -1105,36 +1094,40 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 			} else if fd, ok := v.(*types.FormData); ok {
 				// Use pooled buffer for multipart form data
 				buf := getMultipartBuffer()
-				writer := multipart.NewWriter(buf)
+				boundary, err := newMultipartBoundary()
+				if err != nil {
+					putMultipartBuffer(buf)
+					return nil, err
+				}
 
 				// SECURITY (sink validation): *FormData is a public struct that
 				// callers can construct directly (types.go example) or via
 				// WithFormData/WithBody(BodyMultipart), bypassing the stricter
 				// option-layer checks in WithFile. Field names, filenames, and
 				// per-file Content-Types land verbatim in Content-Disposition /
-				// Content-Type header values, and mime/multipart.Writer does not
-				// reject CR/LF — so control characters here would inject
+				// Content-Type header values, and hand-rolled MIME serialization
+				// does not reject CR/LF — so control characters here would inject
 				// arbitrary MIME headers/parts into the body. Validate every
 				// token at this, the single encoding sink, so no entry path can
 				// bypass it.
+				//
+				// Parts are written directly into the pooled buffer (see
+				// writeMultipartPartHeader) instead of through
+				// mime/multipart.Writer, whose CreatePart allocates per part.
+				// Fields always precede files; within each group the map
+				// iteration order applies (part order in multipart bodies is
+				// not significant).
+				first := true
 				for key, value := range fd.Fields {
 					if err := validation.ValidateMultipartToken(key, "multipart field name"); err != nil {
 						putMultipartBuffer(buf)
 						return nil, err
 					}
 					// Byte-identical to multipart.Writer.WriteField
-					// (`form-data; name="%s"` with escapeQuotes), minus its
-					// per-field MIMEHeader and fmt.Sprintf allocations.
+					// (`form-data; name="%s"` with escapeQuotes).
 					disposition := `form-data; name="` + escapeQuotes(key) + `"`
-					part, err := createMultipartPart(writer, disposition, "")
-					if err != nil {
-						putMultipartBuffer(buf)
-						return nil, fmt.Errorf("write form field failed: %w", err)
-					}
-					if _, err := io.WriteString(part, value); err != nil {
-						putMultipartBuffer(buf)
-						return nil, fmt.Errorf("write form field failed: %w", err)
-					}
+					writeMultipartPartHeader(buf, &first, boundary, disposition, "")
+					buf.WriteString(value)
 				}
 
 				for key, fileData := range fd.Files {
@@ -1156,39 +1149,33 @@ func (p *requestProcessor) Build(req *Request) (*http.Request, error) {
 					}
 
 					// Byte-identical to multipart.Writer.CreateFormFile for the
-					// no-ContentType case (which implies application/octet-stream),
-					// routed through the same pooled-header path as explicit
-					// Content-Types.
-					contentType := fileData.ContentType
-					if contentType == "" {
-						contentType = "application/octet-stream"
+					// no-ContentType case (which implies application/octet-stream).
+					fileContentType := fileData.ContentType
+					if fileContentType == "" {
+						fileContentType = "application/octet-stream"
 					}
-					if !validation.IsValidHeaderString(contentType) {
+					if !validation.IsValidHeaderString(fileContentType) {
 						putMultipartBuffer(buf)
 						return nil, fmt.Errorf("multipart file %q: invalid Content-Type", key)
 					}
 					disposition := `form-data; name="` + escapeQuotes(key) +
 						`"; filename="` + escapeQuotes(fileData.Filename) + `"`
 
-					part, err := createMultipartPart(writer, disposition, contentType)
-					if err != nil {
-						putMultipartBuffer(buf)
-						return nil, fmt.Errorf("create form file failed: %w", err)
-					}
-
-					if _, err := part.Write(fileData.Content); err != nil {
-						putMultipartBuffer(buf)
-						return nil, fmt.Errorf("write file content failed: %w", err)
-					}
+					writeMultipartPartHeader(buf, &first, boundary, disposition, fileContentType)
+					buf.Write(fileData.Content)
 				}
 
-				if err := writer.Close(); err != nil {
-					putMultipartBuffer(buf)
-					return nil, fmt.Errorf("close multipart writer failed: %w", err)
-				}
+				// Closing delimiter — byte-identical to multipart.Writer.Close,
+				// including the leading CRLF it emits even for an empty form.
+				buf.WriteString("\r\n--")
+				buf.WriteString(boundary)
+				buf.WriteString("--\r\n")
 
 				body = getPooledMultipartBufferWrapper(buf)
-				contentType = writer.FormDataContentType()
+				// The boundary is hex (no RFC 2045 tspecials), so it never needs
+				// the quoting multipart.Writer.FormDataContentType applies —
+				// this plain concatenation matches its output byte for byte.
+				contentType = "multipart/form-data; boundary=" + boundary
 				if followRedirects {
 					replaySrc = bytes.Clone(buf.Bytes())
 				}

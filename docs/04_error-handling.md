@@ -23,7 +23,7 @@ HTTPC provides multiple layers of error handling:
 
 1. **Network-level errors** - Connection failures, timeouts, DNS errors (returned as `*ClientError`)
 2. **HTTP status codes** - 4xx/5xx responses are NOT returned as errors; check `result.IsSuccess()` / `IsClientError()` / `IsServerError()` instead
-3. **Validation errors** - URL parsing failures and redirect policy rejections (limit exceeded, circular redirect, blocked/whitelisted target) are classified as `ErrorTypeValidation`; note that request-option and pre-flight validation failures (e.g., an invalid cookie passed to `WithCookie`) return a plain wrapped `error`, **not** a `*ClientError`
+3. **Validation errors** - URL parsing failures and redirect policy rejections (limit exceeded, circular redirect, blocked/whitelisted target) are classified as `ErrorTypeValidation`; note that request-option and pre-flight validation failures (e.g., an invalid cookie passed to `WithCookies`) return a plain wrapped `error`, **not** a `*ClientError`
 4. **Response parsing errors** - JSON/XML unmarshaling failures
 
 ## Error Types

@@ -486,3 +486,50 @@ func TestPinCacheEviction(t *testing.T) {
 		t.Errorf("pinCache grew to %d entries, expected max ~%d", cacheSize, pinCacheMaxSize)
 	}
 }
+
+// TestPinnerPin_NoPins pins the nil/empty-contract of the three Pin()
+// implementations: an unusable pinner must describe itself as "no-pins"
+// rather than panic or report a pin count.
+func TestPinnerPin_NoPins(t *testing.T) {
+	t.Run("nil spki hash pinner", func(t *testing.T) {
+		var p *spkiHashPinner
+		if got := p.Pin(); got != "no-pins" {
+			t.Errorf("nil spkiHashPinner.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("spki hash pinner without hashes", func(t *testing.T) {
+		p := &spkiHashPinner{hashes: map[string]bool{}}
+		if got := p.Pin(); got != "no-pins" {
+			t.Errorf("empty spkiHashPinner.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("nil public key pinner", func(t *testing.T) {
+		var p *publicKeyPinner
+		if got := p.Pin(); got != "no-pins" {
+			t.Errorf("nil publicKeyPinner.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("public key pinner without inner", func(t *testing.T) {
+		p := &publicKeyPinner{}
+		if got := p.Pin(); got != "no-pins" {
+			t.Errorf("innerless publicKeyPinner.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("nil pinner chain", func(t *testing.T) {
+		var c *certificatePinnerChain
+		if got := c.Pin(); got != "no-pins" {
+			t.Errorf("nil certificatePinnerChain.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+
+	t.Run("empty pinner chain", func(t *testing.T) {
+		c := &certificatePinnerChain{}
+		if got := c.Pin(); got != "no-pins" {
+			t.Errorf("empty certificatePinnerChain.Pin() = %q, want %q", got, "no-pins")
+		}
+	})
+}

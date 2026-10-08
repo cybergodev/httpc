@@ -203,8 +203,8 @@ func newFromConfig(cfg Config) (Client, error) {
 	if insecureVerify && !isTestEnvironment() {
 		insecureSkipVerifyWarnOnce.Do(func() {
 			w := getSecurityWarnOutput()
-			fmt.Fprintf(w, "[SECURITY WARNING] InsecureSkipVerify is enabled - TLS certificate verification is DISABLED\n")
-			fmt.Fprintf(w, "[SECURITY WARNING] This should only be used in testing. Use SecureConfig() for production.\n")
+			_, _ = fmt.Fprintf(w, "[SECURITY WARNING] InsecureSkipVerify is enabled - TLS certificate verification is DISABLED\n") // best-effort warning
+			_, _ = fmt.Fprintf(w, "[SECURITY WARNING] This should only be used in testing. Use SecureConfig() for production.\n")  // best-effort warning
 		})
 	}
 
@@ -293,9 +293,11 @@ func copyConfig(src Config) Config {
 // Callbacks (OnRequest/OnResponse) and the per-request SSRF override (AllowPrivateIPs)
 // live on the concrete *engine.Request, not on the shared RequestMutator interface:
 // their signatures reference *engine.Request/*engine.Response, and surfacing them
-// through internal/types would create an import cycle (engine -> types). The terminal
-// handler therefore reads them via a concrete-type assertion. This is a deliberate,
-// bounded coupling to *engine.Request with a graceful fallback — see finalHandler.
+// through internal/types would create an import cycle (engine -> types). The same
+// applies to NoTimeout, RetryNonIdempotent, and the sanitized-URL cache, which the
+// shared interface does not expose at all. The terminal handler therefore reads them
+// via a concrete-type assertion. This is a deliberate, bounded coupling to
+// *engine.Request with a graceful fallback — see finalHandler.
 func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler {
 	finalHandler := func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
 		reqCtx := req.Context()
@@ -307,9 +309,12 @@ func (c *clientImpl) buildMiddlewareChain(middlewares []MiddlewareFunc) Handler 
 		// per-request SSRF override) that are not part of RequestMutator (see the
 		// buildMiddlewareChain doc above). Apply() forwards them along with every
 		// other field when the assertion succeeds. A middleware that replaces req
-		// with a non-*engine.Request value loses them; request replacement is
-		// therefore unsupported for callbacks/SSRF-override (mirrors
-		// getOrComputeSanitizedURL).
+		// with a non-*engine.Request value loses them — as do NoTimeout,
+		// RetryNonIdempotent, and the sanitized-URL cache, none of which are
+		// exposed on RequestMutator. Request replacement is therefore unsupported
+		// for ALL per-request overrides (mirrors getOrComputeSanitizedURL); a
+		// replacing middleware is limited to the fields forwarded by the
+		// fallback below.
 		engReq, isEngineReq := req.(*engine.Request)
 
 		// Single option closure forwards all mutable fields from the middleware-modified request.

@@ -98,7 +98,7 @@ func TestLoggingMiddleware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, _ = client.Get(ts.URL)
 
@@ -137,7 +137,7 @@ func TestRequestIDMiddleware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Get(ts.URL)
 	if err != nil {
@@ -166,7 +166,7 @@ func TestTimeoutMiddleware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	start := time.Now()
 	_, err = client.Get(ts.URL)
@@ -229,7 +229,7 @@ func TestMiddleware_NilConfig(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			if _, err := client.Get(ts.URL); err != nil {
 				t.Fatalf("request with nil-config middleware failed: %v", err)
@@ -256,7 +256,7 @@ func TestTimeoutMiddleware_CancelledContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Already-cancelled context should fail immediately
 	ctx, cancel := context.WithCancel(context.Background())
@@ -303,7 +303,7 @@ func TestHeaderMiddleware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Get(ts.URL)
 	if err != nil {
@@ -332,7 +332,7 @@ func TestHeaderMiddleware_InvalidHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -392,7 +392,7 @@ func TestMetricsMiddleware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Post(ts.URL)
 	if err != nil {
@@ -441,7 +441,7 @@ func TestMiddlewareCanModifyRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Get(ts.URL)
 	if err != nil {
@@ -477,7 +477,7 @@ func TestMiddlewareCanModifyResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	result, err := client.Get(ts.URL)
 	if err != nil {
@@ -488,73 +488,6 @@ func TestMiddlewareCanModifyResponse(t *testing.T) {
 	if len(modified) == 0 || modified[0] != "modified-value" {
 		t.Errorf("expected modified header, got: %v", modified)
 	}
-}
-
-func BenchmarkMiddlewareOverhead(b *testing.B) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer ts.Close()
-
-	b.Run("NoMiddleware", func(b *testing.B) {
-		cfg := testConfig()
-		client, _ := New(cfg)
-		defer client.Close()
-
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = client.Get(ts.URL)
-		}
-	})
-
-	b.Run("WithMiddleware", func(b *testing.B) {
-		cfg := testConfig()
-		cfg.Middleware.Middlewares = []MiddlewareFunc{
-			func(next Handler) Handler {
-				return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
-					return next(ctx, req)
-				}
-			},
-		}
-		client, _ := New(cfg)
-		defer client.Close()
-
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = client.Get(ts.URL)
-		}
-	})
-
-	b.Run("WithThreeMiddlewares", func(b *testing.B) {
-		cfg := testConfig()
-		cfg.Middleware.Middlewares = []MiddlewareFunc{
-			func(next Handler) Handler {
-				return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
-					return next(ctx, req)
-				}
-			},
-			func(next Handler) Handler {
-				return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
-					return next(ctx, req)
-				}
-			},
-			func(next Handler) Handler {
-				return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
-					return next(ctx, req)
-				}
-			},
-		}
-		client, _ := New(cfg)
-		defer client.Close()
-
-		b.ReportAllocs()
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			_, _ = client.Get(ts.URL)
-		}
-	})
 }
 
 // mockRequest implements RequestMutator for testing
@@ -688,7 +621,7 @@ func TestAuditMiddleware(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Get(ts.URL)
 	if err != nil {
@@ -733,7 +666,7 @@ func TestAuditMiddlewareWithContextValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Create context with audit values
 	ctx := context.WithValue(context.Background(), SourceIPKey, "192.168.1.100")
@@ -823,7 +756,7 @@ func TestAuditMiddleware_ConfigVariants(t *testing.T) {
 			if err != nil {
 				t.Fatalf("failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			_, err = client.Get(ts.URL)
 			if err != nil {
@@ -860,7 +793,7 @@ func TestAuditMiddlewareNoCallbackIsNoOp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	if _, err := client.Get(ts.URL); err != nil {
 		t.Fatalf("no-op audit middleware caused request failure: %v", err)
@@ -886,7 +819,7 @@ func TestAuditMiddlewareWithError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Request to invalid URL should error
 	_, _ = client.Get("http://invalid.invalid.unreachable/test")
@@ -939,7 +872,7 @@ func TestRequestIDMiddleware_ExistingHeader(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Set header explicitly - middleware should not overwrite
 	_, err = client.Get(ts.URL, WithHeader("X-Request-ID", "explicit-id"))
@@ -1080,19 +1013,9 @@ func TestSanitizeCallbackError(t *testing.T) {
 	}
 }
 
-func TestMiddleware_BoundaryConditions(t *testing.T) {
-	t.Parallel()
-
-	t.Run("Chain with nil middleware slice", func(t *testing.T) {
-		handler := Chain()
-		if handler == nil {
-			t.Error("Chain() with no args should return non-nil handler")
-		}
-	})
-
-	// Nil-config middleware constructors are covered table-driven in
-	// TestMiddleware_NilConfig.
-}
+// TestMiddleware_BoundaryConditions was removed: its only assertion
+// (Chain() returns non-nil) duplicates the "zero middlewares" row of
+// TestChain, and nil-config constructors are covered by TestMiddleware_NilConfig.
 
 // TestTimeoutMiddleware_RejectsStreaming verifies the middleware refuses
 // streaming requests up front instead of letting the deferred cancel() abort
@@ -1111,7 +1034,7 @@ func TestTimeoutMiddleware_RejectsStreaming(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Get(ts.URL, WithStreamBody(true))
 	if err == nil {
@@ -1189,7 +1112,7 @@ func TestBuildMiddlewareChain_RequestReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	if _, err := client.Get(server.URL); err != nil {
 		t.Fatalf("request through replaced mutator failed: %v", err)
@@ -1243,7 +1166,7 @@ func TestMiddlewareChain_RequestReplacement_ConcurrentHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	const workers = 8
 	const iterations = 50
@@ -1273,4 +1196,82 @@ func TestMiddlewareChain_RequestReplacement_ConcurrentHeaders(t *testing.T) {
 	for err := range errCh {
 		t.Error(err)
 	}
+}
+
+// Moved from quality_regression_test.go (dissolved grab-bag file):
+// TestMiddlewareReturningNilNilYieldsError guards the facade's defensive
+// fallback: a middleware that returns neither a response nor an error must
+// surface as an error, not as a nil Result that nil-safe accessors would
+// report as a status-0 "success".
+func TestMiddlewareReturningNilNilYieldsError(t *testing.T) {
+	broken := MiddlewareFunc(func(next Handler) Handler {
+		return func(ctx context.Context, req RequestMutator) (ResponseMutator, error) {
+			return nil, nil // contract violation
+		}
+	})
+
+	cfg := TestingConfig()
+	cfg.Middleware.Middlewares = []MiddlewareFunc{broken}
+	client, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close() }()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer srv.Close()
+
+	result, err := client.Get(srv.URL)
+	if err == nil {
+		t.Fatalf("expected error for (nil, nil) middleware result, got result=%v", result)
+	}
+	if result != nil {
+		t.Fatalf("expected nil result, got %v", result)
+	}
+}
+
+// TestAuditMiddlewareContextValueSources covers both context sources for
+// SourceIP/UserID: the ctx passed to Client.Request and, since the audit
+// context-value fix, the request context set via WithContext.
+func TestAuditMiddlewareContextValueSources(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	newAuditedClient := func(t *testing.T) (*clientImpl, *[]AuditEvent) {
+		events := []AuditEvent{}
+		cfg := TestingConfig()
+		cfg.Middleware.Middlewares = []MiddlewareFunc{AuditMiddleware(&AuditConfig{
+			OnAudit: func(e AuditEvent) { events = append(events, e) },
+		})}
+		client, err := New(cfg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = client.Close() })
+		return client.(*clientImpl), &events
+	}
+
+	t.Run("request ctx", func(t *testing.T) {
+		client, events := newAuditedClient(t)
+		ctx := context.WithValue(context.Background(), SourceIPKey, "10.0.0.1")
+		if _, err := client.Request(ctx, "GET", srv.URL); err != nil {
+			t.Fatal(err)
+		}
+		if got := (*events)[0].SourceIP; got != "10.0.0.1" {
+			t.Fatalf("SourceIP = %q, want 10.0.0.1", got)
+		}
+	})
+
+	t.Run("WithContext option", func(t *testing.T) {
+		client, events := newAuditedClient(t)
+		ctx := context.WithValue(context.Background(), UserIDKey, "u-123")
+		if _, err := client.Get(srv.URL, WithContext(ctx)); err != nil {
+			t.Fatal(err)
+		}
+		if got := (*events)[0].UserID; got != "u-123" {
+			t.Fatalf("UserID = %q, want u-123 (WithContext values must reach audit)", got)
+		}
+	})
 }

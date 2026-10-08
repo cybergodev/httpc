@@ -71,19 +71,12 @@ func (m *mockTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	return m.Response, nil
 }
 
-// SetRedirectPolicy implements transportManager.
+// SetRedirectPolicy implements transportManager. The mock carries no redirect
+// state (GetRedirectChain was removed from the interface with it); returning
+// nil settings matches how executeRequest treats transports without redirect
+// bookkeeping.
 func (m *mockTransport) SetRedirectPolicy(ctx context.Context, followRedirects bool, maxRedirects int) (context.Context, *redirectSettings) {
 	return ctx, nil
-}
-
-// GetRedirectChain implements transportManager.
-func (m *mockTransport) GetRedirectChain(ctx context.Context) []string {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	chain := make([]string, len(m.RedirectChain))
-	copy(chain, m.RedirectChain)
-	return chain
 }
 
 // Close implements transportManager.

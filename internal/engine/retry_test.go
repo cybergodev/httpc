@@ -762,7 +762,7 @@ func TestExecuteWithRetry_RetryableErrorExhaustsRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	_, err = client.Request(backgroundCtx, "GET", "https://example.com")
 	if err == nil {
@@ -808,7 +808,7 @@ func TestExecuteWithRetry_BodyBufferedForRetry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// Custom option sets the body as an io.Reader, triggering the buffering
 	// branch in executeWithRetry.
@@ -884,4 +884,153 @@ func TestSleepWithContext(t *testing.T) {
 			_ = c.sleepWithContext(ctx, 2*time.Millisecond)
 		}
 	})
+}
+
+// TestExecuteWithRetry_BodyBufferReadError covers the error branch of the
+// retry-body buffering (client.go: a body io.Reader that fails mid-read must
+// surface a "buffer request body failed" error instead of being silently
+// retried with an empty or partial body).
+func TestExecuteWithRetry_BodyBufferReadError(t *testing.T) {
+	mock := newMockTransport(200, "never reached")
+
+	config := &Config{
+		Timeout:         30 * time.Second,
+		AllowPrivateIPs: true,
+		MaxRetries:      1,
+		RetryDelay:      time.Millisecond,
+		BackoffFactor:   1.0,
+		UserAgent:       "test/1.0",
+	}
+	client, err := NewClient(config, func(opts *clientOptions) {
+		opts.customTransport = mock
+	})
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	bodyOption := func(r *Request) error {
+		r.SetBody(errBodyReader{})
+		return nil
+	}
+
+	_, err = client.Request(backgroundCtx, "GET", "https://example.com", bodyOption)
+	if err == nil {
+		t.Fatal("expected buffer error, got nil")
+	}
+	if !strings.Contains(err.Error(), "buffer request body failed") {
+		t.Errorf("error should mention body buffering failure, got: %v", err)
+	}
+	if got := mock.GetCallCount(); got != 0 {
+		t.Errorf("transport calls = %d, want 0 (fail before first attempt)", got)
+	}
+}
+
+// errBodyReader fails every Read, to drive the retry-body buffering error path.
+type errBodyReader struct{}
+
+func (errBodyReader) Read([]byte) (int, error) { return 0, errors.New("body stream broken") }
+
+// TestExecuteWithRetry_PerRequestRetryNonIdempotentOverride covers the
+// per-request override arm of the idempotence guard: with client-level
+// RetryNonIdempotent=false, a request-level override must still allow POST
+// retries (and vice versa the fast path applies without it).
+func TestExecuteWithRetry_PerRequestRetryNonIdempotentOverride(t *testing.T) {
+	tests := []struct {
+		name        string
+		option      func(*Request) error
+		wantCalls   int
+		wantSuccess bool
+	}{
+		{
+			name:        "override enables POST retry",
+			option:      func(r *Request) error { allow := true; r.SetRetryNonIdempotent(&allow); return nil },
+			wantCalls:   2,
+			wantSuccess: true,
+		},
+		{
+			name:        "no override keeps POST single-shot",
+			option:      func(*Request) error { return nil },
+			wantCalls:   1,
+			wantSuccess: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mock := newMockTransport(200, "recovered")
+			mock.failFirst = 1
+
+			config := &Config{
+				Timeout:         30 * time.Second,
+				AllowPrivateIPs: true,
+				MaxRetries:      1,
+				RetryDelay:      time.Millisecond,
+				BackoffFactor:   1.0,
+				UserAgent:       "test/1.0",
+				// Client-level opt-in deliberately OFF: only the per-request
+				// override may enable retries for the POST.
+				RetryNonIdempotent: false,
+			}
+			client, err := NewClient(config, func(opts *clientOptions) {
+				opts.customTransport = mock
+			})
+			if err != nil {
+				t.Fatalf("Failed to create client: %v", err)
+			}
+			defer func() { _ = client.Close() }()
+
+			resp, err := client.Request(backgroundCtx, "POST", "https://example.com", tt.option)
+			if tt.wantSuccess {
+				if err != nil {
+					t.Fatalf("expected success after retry, got: %v", err)
+				}
+				ReleaseResponse(resp)
+			} else if err == nil {
+				t.Fatal("expected single-shot failure, got success")
+			}
+			if got := mock.GetCallCount(); got != tt.wantCalls {
+				t.Errorf("transport calls = %d, want %d", got, tt.wantCalls)
+			}
+		})
+	}
+}
+
+// TestExecuteWithRetry_CustomPolicyResponseDelay covers the custom-policy arm
+// of the response-path delay computation: when a retryable *response* (not an
+// error) is retried under a custom policy, the delay comes from the policy's
+// GetDelay (the built-in GetDelayWithResponse path is for *retryEngine only).
+func TestExecuteWithRetry_CustomPolicyResponseDelay(t *testing.T) {
+	mock := newMockTransport(503, "unavailable") // always retryable response
+
+	client, err := NewClient(&Config{
+		Timeout:           30 * time.Second,
+		AllowPrivateIPs:   true,
+		MaxRetries:        1,
+		CustomRetryPolicy: &testRetryPolicy{maxRetries: 1, delay: 25 * time.Millisecond},
+	}, func(opts *clientOptions) {
+		opts.customTransport = mock
+	})
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+	defer func() { _ = client.Close() }()
+
+	start := time.Now()
+	resp, err := client.Request(backgroundCtx, "GET", "https://example.com")
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer ReleaseResponse(resp)
+	if got := mock.GetCallCount(); got != 2 {
+		t.Errorf("transport calls = %d, want 2 (503 then exhausted)", got)
+	}
+	if resp.Attempts() != 2 {
+		t.Errorf("attempts = %d, want 2", resp.Attempts())
+	}
+	// The custom policy's 25ms delay must have been honored between attempts.
+	if elapsed < 20*time.Millisecond {
+		t.Errorf("retry delay not honored: elapsed %v, want >= 20ms", elapsed)
+	}
 }

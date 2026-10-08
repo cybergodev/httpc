@@ -1,12 +1,18 @@
 package engine
 
 import (
+	"bytes"
+	"context"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"net/textproto"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/cybergodev/httpc/internal/types"
 )
 
 func TestCloneHeader(t *testing.T) {
@@ -156,6 +162,26 @@ func TestAppendQueryParams(t *testing.T) {
 	}
 }
 
+// TestAppendQueryParams_DeterministicOrder guards the sorted-key contract of
+// appendQueryParams: identical maps must encode to identical strings.
+// (Moved from response_truncation_test.go, where it sat among unrelated
+// readBody truncation tests.)
+func TestAppendQueryParams_DeterministicOrder(t *testing.T) {
+	a := map[string]any{"z": 1, "a": 2, "m": "x", "0": true}
+	b := map[string]any{"0": true, "m": "x", "a": 2, "z": 1}
+	s1 := appendQueryParams("", a)
+	s2 := appendQueryParams("", b)
+	if s1 != s2 {
+		t.Fatalf("same params encoded differently: %q vs %q", s1, s2)
+	}
+	// Merging into an existing query must also be sorted after the existing part.
+	merged := appendQueryParams("keep=1", a)
+	want := "keep=1&0=true&a=2&m=x&z=1"
+	if merged != want {
+		t.Fatalf("merged query = %q, want %q", merged, want)
+	}
+}
+
 func TestWriteQueryParamValue_Types(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -238,65 +264,123 @@ func TestWriteQueryParamValue_MatchesQueryEscapeFormatQueryParam(t *testing.T) {
 	}
 }
 
-func TestGetMIMEHeader_ReuseAndClear(t *testing.T) {
+// TestGetMIMEHeader_ReuseAndClear/TestGetMIMEHeader_PoolFallback were
+// removed: the mimeHeaderPool went away when Build's multipart encoding
+// switched from CreatePart (via a pooled textproto.MIMEHeader) to writing
+// part headers directly into the pooled buffer. The wire format those tests
+// indirectly guarded is now pinned explicitly by TestMultipartWireParity.
+
+// TestMultipartWireParity pins Build's hand-rolled multipart encoding to
+// byte-identical output with mime/multipart.Writer — the encoder it replaced
+// to avoid CreatePart's per-part allocations. Any drift changes what servers
+// parse, so a change to writeMultipartPartHeader or the Build FormData branch
+// must keep this passing. Cases are limited to one field and one file per
+// form because part order follows map iteration order (and is not
+// significant); fields-before-files is asserted by the combined case.
+func TestMultipartWireParity(t *testing.T) {
 	t.Parallel()
 
-	// Get a header, populate it, put it back, get again - should be cleared
-	h := getMIMEHeader()
-	if h == nil {
-		t.Fatal("expected non-nil MIMEHeader")
-	}
-	(*h)["Content-Type"] = []string{"application/json"}
-	(*h)["X-Custom"] = []string{"value"}
-
-	if len(*h) != 2 {
-		t.Fatalf("expected 2 headers, got %d", len(*h))
-	}
-
-	// Return to pool
-	putMIMEHeader(h)
-
-	// Get again - should be cleared
-	h2 := getMIMEHeader()
-	if len(*h2) != 0 {
-		t.Errorf("reused MIMEHeader should be cleared, got %d entries", len(*h2))
-	}
-
-	// Verify it's usable after clearing
-	(*h2)["Accept"] = []string{"text/html"}
-	if len(*h2) != 1 {
-		t.Errorf("expected 1 header after populate, got %d", len(*h2))
-	}
-	putMIMEHeader(h2)
-}
-
-// TestGetMIMEHeader_PoolFallback covers the defensive !ok and typed-nil
-// branches of getMIMEHeader (wrong-typed or nil pooled values must yield a
-// fresh, usable header).
-func TestGetMIMEHeader_PoolFallback(t *testing.T) {
-	t.Parallel()
-
-	t.Run("wrong type", func(t *testing.T) {
-		mimeHeaderPool.Put(new(int)) // wrong type, pointer-like for SA6002
-		h := getMIMEHeader()
-		if h == nil {
-			t.Fatal("expected fresh MIMEHeader from fallback")
+	buildBody := func(t *testing.T, fd *types.FormData) (body []byte, boundary string) {
+		t.Helper()
+		req := testRequestBuilder().
+			Method("POST").
+			URL("https://api.example.com/upload").
+			Context(context.Background()).
+			Body(fd).
+			Build()
+		httpReq, err := newRequestProcessor(&Config{}).Build(req)
+		if err != nil {
+			t.Fatalf("Build failed: %v", err)
 		}
-		(*h)["Content-Type"] = []string{"text/plain"}
-		if len(*h) != 1 {
-			t.Errorf("fallback header not usable, len=%d", len(*h))
+		body, err = io.ReadAll(httpReq.Body)
+		if err != nil {
+			t.Fatalf("read multipart body failed: %v", err)
 		}
-		putMIMEHeader(h)
-	})
+		ct := httpReq.Header.Get("Content-Type")
+		boundary = strings.TrimPrefix(ct, "multipart/form-data; boundary=")
+		if boundary == ct {
+			t.Fatalf("unexpected Content-Type %q", ct)
+		}
+		return body, boundary
+	}
 
-	t.Run("typed nil", func(t *testing.T) {
-		mimeHeaderPool.Put((*textproto.MIMEHeader)(nil))
-		h := getMIMEHeader()
-		if h == nil {
-			t.Fatal("expected fresh MIMEHeader for typed-nil pooled value")
+	// wantBody reproduces the same form through mime/multipart.Writer with
+	// the boundary Build chose, so the two encodings can be compared.
+	wantBody := func(t *testing.T, fd *types.FormData, boundary string) []byte {
+		t.Helper()
+		var want bytes.Buffer
+		w := multipart.NewWriter(&want)
+		if err := w.SetBoundary(boundary); err != nil {
+			t.Fatalf("SetBoundary failed: %v", err)
 		}
-		putMIMEHeader(h)
-	})
+		for k, v := range fd.Fields {
+			if err := w.WriteField(k, v); err != nil {
+				t.Fatalf("WriteField failed: %v", err)
+			}
+		}
+		for k, f := range fd.Files {
+			// Files without a ContentType go through CreateFormFile, which
+			// supplies the implicit application/octet-stream the engine's
+			// encoder also writes.
+			if f.ContentType == "" {
+				part, err := w.CreateFormFile(k, f.Filename)
+				if err != nil {
+					t.Fatalf("CreateFormFile failed: %v", err)
+				}
+				if _, err := part.Write(f.Content); err != nil {
+					t.Fatalf("write part failed: %v", err)
+				}
+				continue
+			}
+			h := make(textproto.MIMEHeader)
+			disposition := `form-data; name="` + escapeQuotes(k) +
+				`"; filename="` + escapeQuotes(f.Filename) + `"`
+			h.Set("Content-Disposition", disposition)
+			h.Set("Content-Type", f.ContentType)
+			part, err := w.CreatePart(h)
+			if err != nil {
+				t.Fatalf("CreatePart failed: %v", err)
+			}
+			if _, err := part.Write(f.Content); err != nil {
+				t.Fatalf("write part failed: %v", err)
+			}
+		}
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close failed: %v", err)
+		}
+		return want.Bytes()
+	}
+
+	cases := []struct {
+		name string
+		fd   *types.FormData
+	}{
+		{"empty form", &types.FormData{}},
+		{"single field", &types.FormData{Fields: map[string]string{"username": "testuser"}}},
+		{"field with escapes", &types.FormData{Fields: map[string]string{"na\"me\\": "a\"b"}}},
+		{"single file without content type", &types.FormData{
+			Files: map[string]*types.FileData{"file": {Filename: "data.bin", Content: []byte{0x00, 0x01, 0xFF}}},
+		}},
+		{"single file with content type", &types.FormData{
+			Files: map[string]*types.FileData{"doc": {Filename: "report.txt", Content: []byte("line1\r\nline2"), ContentType: "text/plain"}},
+		}},
+		{"filename with escapes", &types.FormData{
+			Files: map[string]*types.FileData{"f": {Filename: `we"ird\name.png`, Content: []byte("png")}},
+		}},
+		{"field plus file", &types.FormData{
+			Fields: map[string]string{"username": "john"},
+			Files:  map[string]*types.FileData{"file1": {Filename: "test.txt", Content: []byte("file content")}},
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, boundary := buildBody(t, tc.fd)
+			want := wantBody(t, tc.fd, boundary)
+			if !bytes.Equal(got, want) {
+				t.Errorf("multipart bytes diverge from mime/multipart.Writer:\ngot:  %q\nwant: %q", got, want)
+			}
+		})
+	}
 }
 
 // TestAcquireReleaseRequest_ResetContract validates the pooled-Request reset

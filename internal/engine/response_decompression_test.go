@@ -370,7 +370,7 @@ func BenchmarkResponseProcessor_GzipDecompression(b *testing.B) {
 	var buf bytes.Buffer
 	gzipWriter := gzip.NewWriter(&buf)
 	_, _ = gzipWriter.Write([]byte(originalData)) // fixed test input
-	gzipWriter.Close()
+	_ = gzipWriter.Close()
 	compressedData := buf.Bytes()
 
 	b.ResetTimer()
@@ -407,7 +407,7 @@ func BenchmarkResponseProcessor_DeflateDecompression(b *testing.B) {
 	var buf bytes.Buffer
 	deflateWriter, _ := flate.NewWriter(&buf, flate.DefaultCompression)
 	_, _ = deflateWriter.Write([]byte(originalData)) // fixed test input
-	deflateWriter.Close()
+	_ = deflateWriter.Close()
 	compressedData := buf.Bytes()
 
 	b.ResetTimer()
@@ -469,7 +469,7 @@ func TestCreateDecompressor_UnsupportedEncodings(t *testing.T) {
 				if rc == nil {
 					t.Error("expected non-nil ReadCloser")
 				} else {
-					rc.Close()
+					_ = rc.Close()
 				}
 			}
 		})

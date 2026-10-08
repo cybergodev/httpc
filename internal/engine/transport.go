@@ -79,11 +79,15 @@ func getRedirectSettings() *redirectSettings {
 	if !ok || s == nil {
 		return &redirectSettings{}
 	}
-	*s = redirectSettings{}
+	// No re-clear here: putRedirectSettings is the single reset point, so a
+	// recycled object is already zeroed. Clearing in exactly one place keeps
+	// the reset contract obvious.
 	return s
 }
 
 // putRedirectSettings returns a redirectSettings to the pool after resetting it.
+// This is the single reset point for recycled settings objects (see
+// getRedirectSettings).
 // SECURITY: Clears all redirect URLs to prevent sensitive URL leakage.
 func putRedirectSettings(s *redirectSettings) {
 	if s == nil {
@@ -339,15 +343,6 @@ func (t *transport) SetRedirectPolicy(ctx context.Context, followRedirects bool,
 	settings.maxRedirects = maxRedirects
 	newCtx := context.WithValue(ctx, redirectContextKey{}, settings)
 	return newCtx, settings
-}
-
-// GetRedirectChain returns the redirect chain from the context
-func (t *transport) GetRedirectChain(ctx context.Context) []string {
-	settings, ok := ctx.Value(redirectContextKey{}).(*redirectSettings)
-	if !ok || settings.chainLen == 0 {
-		return nil
-	}
-	return settings.getChain()
 }
 
 // RoundTrip executes an HTTP round trip

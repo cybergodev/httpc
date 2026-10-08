@@ -583,7 +583,7 @@ func TestErrorHandling_IntegrationWithClient(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 			defer cancel()
@@ -842,7 +842,7 @@ func TestErrorHandling_TimeoutScenarios(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Failed to create client: %v", err)
 			}
-			defer client.Close()
+			defer func() { _ = client.Close() }()
 
 			start := time.Now()
 			ctx := context.Background()
@@ -899,20 +899,23 @@ func TestIsRetryableSyscallError_WSAErrno(t *testing.T) {
 	// These raw WSA error codes are what Windows networking functions return.
 	// They do not match syscall.ECONNREFUSED etc. on Go 1.25+ Windows.
 	wsaErrnos := []struct {
-		name  string
-		errno uintptr // raw WSA code value
+		name     string
+		errno    uintptr // raw WSA code value
+		retryabl bool
 	}{
-		{"WSAECONNRESET", 10054},
-		{"WSAETIMEDOUT", 10060},
-		{"WSAECONNREFUSED", 10061},
-		{"WSAENETUNREACH", 10051},
-		{"WSAEHOSTUNREACH", 10065},
+		{"WSAECONNRESET", 10054, true},
+		{"WSAETIMEDOUT", 10060, true},
+		{"WSAECONNREFUSED", 10061, true},
+		{"WSAENETUNREACH", 10051, true},
+		{"WSAEHOSTUNREACH", 10065, true},
+		// Non-retryable errno (folded from the retired coverage_test.go table).
+		{"EINVAL is not retryable", uintptr(syscall.EINVAL), false},
 	}
 	for _, tt := range wsaErrnos {
 		t.Run(tt.name, func(t *testing.T) {
 			errno := syscall.Errno(tt.errno)
-			if !isRetryableSyscallError(errno) {
-				t.Errorf("isRetryableSyscallError(Errno(%d)) = false, want true (WSA code %s)", tt.errno, tt.name)
+			if got := isRetryableSyscallError(errno); got != tt.retryabl {
+				t.Errorf("isRetryableSyscallError(Errno(%d)) = %v, want %v (WSA code %s)", tt.errno, got, tt.retryabl, tt.name)
 			}
 		})
 	}
@@ -974,5 +977,53 @@ func TestClassifyError_SanitizesURL(t *testing.T) {
 	// leak either.
 	if strings.Contains(ce.Error(), "secret") {
 		t.Errorf("Error() leaks credentials: %q", ce.Error())
+	}
+}
+
+// TestClientError_IsRetryableDNSError_Causes covers the remaining branches of
+// isRetryableDNSError: nil cause, non-DNSError cause, and a DNSError that is
+// neither temporary nor a timeout must not be retryable.
+func TestClientError_IsRetryableDNSError_Causes(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *ClientError
+		want bool
+	}{
+		{
+			name: "nil cause",
+			err:  &ClientError{Type: ErrorTypeDNS},
+		},
+		{
+			name: "non-DNSError cause",
+			err:  &ClientError{Type: ErrorTypeDNS, Cause: errors.New("plain error")},
+		},
+		{
+			name: "permanent DNSError",
+			err: &ClientError{Type: ErrorTypeDNS, Cause: &net.DNSError{
+				Err: "no such host", Name: "example.invalid",
+			}},
+		},
+		{
+			name: "temporary DNSError",
+			err: &ClientError{Type: ErrorTypeDNS, Cause: &net.DNSError{
+				Err: "i/o timeout", Name: "example.com", IsTemporary: true,
+			}},
+			want: true,
+		},
+		{
+			name: "timeout DNSError",
+			err: &ClientError{Type: ErrorTypeDNS, Cause: &net.DNSError{
+				Err: "i/o timeout", Name: "example.com", IsTimeout: true,
+			}},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.isRetryableDNSError(); got != tt.want {
+				t.Errorf("isRetryableDNSError() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

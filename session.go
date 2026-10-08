@@ -32,6 +32,9 @@ func DefaultSessionConfig() SessionConfig {
 
 // SessionManager manages session state including cookies and headers
 // for DomainClient instances. It provides thread-safe access to session data.
+// Create one with NewSessionManager or NewSessionManagerDefault; a zero-value
+// SessionManager is also usable — its internal maps initialize lazily on the
+// first write.
 type SessionManager struct {
 	mu             sync.RWMutex
 	cookies        map[string]*http.Cookie
@@ -69,6 +72,22 @@ func NewSessionManagerDefault() (*SessionManager, error) {
 	return NewSessionManager(DefaultSessionConfig())
 }
 
+// ensureMaps lazily initializes the session maps. NewSessionManager allocates
+// both at construction; a SessionManager built as a zero value
+// (&SessionManager{}) would otherwise panic on the first write to a nil map.
+// Accepting the zero value here matches the nil-receiver guards on every
+// method: a mis-constructed SessionManager degrades to an empty session
+// instead of a runtime panic.
+// Caller must hold s.mu.
+func (s *SessionManager) ensureMaps() {
+	if s.cookies == nil {
+		s.cookies = make(map[string]*http.Cookie)
+	}
+	if s.headers == nil {
+		s.headers = make(map[string]string)
+	}
+}
+
 // SetCookieSecurity sets the cookie security configuration.
 // This affects all subsequent SetCookie calls.
 func (s *SessionManager) SetCookieSecurity(config *CookieSecurityConfig) {
@@ -92,6 +111,7 @@ func (s *SessionManager) SetHeader(key, value string) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureMaps()
 
 	s.headers[key] = value
 	return nil
@@ -113,6 +133,7 @@ func (s *SessionManager) SetHeaders(headers map[string]string) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureMaps()
 
 	maps.Copy(s.headers, headers)
 	return nil
@@ -169,6 +190,7 @@ func (s *SessionManager) SetCookie(cookie *http.Cookie) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureMaps()
 
 	// Apply cookie security validation if configured (inside lock for thread safety)
 	if err := s.validateCookieSecurity(cookie); err != nil {
@@ -198,6 +220,7 @@ func (s *SessionManager) SetCookies(cookies []*http.Cookie) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureMaps()
 
 	// Validate all cookies for security before storing any (atomic write)
 	for _, cookie := range cookies {
@@ -335,6 +358,7 @@ func (s *SessionManager) UpdateFromResult(result *Result) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureMaps()
 
 	s.storeCookies(result.Response.Cookies)
 }
@@ -351,6 +375,7 @@ func (s *SessionManager) UpdateFromCookies(cookies []*http.Cookie) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureMaps()
 
 	s.storeCookies(cookies)
 }
@@ -417,11 +442,12 @@ func (s *SessionManager) captureFromOptions(options []RequestOption) {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.ensureMaps()
 
 	for i := range cookies {
 		cookie := &cookies[i]
 		// Same validation gate as storeCookies: basic well-formedness first,
-		// then the optional security policy. WithCookie already validates at
+		// then the optional security policy. WithCookies already validates at
 		// option-application time, so this only matters for custom options
 		// that call SetCookies directly.
 		if err := validation.ValidateCookie(cookie); err != nil {

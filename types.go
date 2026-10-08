@@ -205,8 +205,8 @@ type SecurityConfig struct {
 
 	// MaxDecompressedBodySize limits decompressed response body size in bytes.
 	// This prevents decompression bomb (zip bomb) attacks. Default: 100MB.
-	// Only applies when MaxResponseBodySize is not explicitly set; when set,
-	// MaxResponseBodySize takes precedence as the stricter limit.
+	// It applies only to compressed responses (the size after inflation);
+	// non-compressed bodies are always limited by MaxResponseBodySize.
 	MaxDecompressedBodySize int64
 
 	// AllowPrivateIPs disables ALL SSRF protection when set to true, including
@@ -611,6 +611,24 @@ func ValidateConfig(cfg *Config) error {
 			return fmt.Errorf("Security.MinTLSVersion (%d) must not exceed MaxTLSVersion (%d)", cfg.Security.MinTLSVersion, cfg.Security.MaxTLSVersion)
 		}
 	}
+	// Reject values outside the tls.VersionTLS* constant range; crypto/tls
+	// would otherwise fail only at handshake time with a confusing error.
+	// Extend the bounds when Go defines new TLS versions.
+	for _, v := range []struct {
+		name  string
+		value uint16
+	}{
+		{"Security.MinTLSVersion", cfg.Security.MinTLSVersion},
+		{"Security.MaxTLSVersion", cfg.Security.MaxTLSVersion},
+	} {
+		if v.value != 0 && (v.value < tls.VersionTLS10 || v.value > tls.VersionTLS13) {
+			return fmt.Errorf("%w: %s must be a tls.VersionTLS* constant (TLS 1.0-1.3), got %d", ErrInvalidSecurity, v.name, v.value)
+		}
+	}
+	// Parse each CIDR solely to validate it here; parseSSRFExemptCIDRs
+	// re-parses after copyConfig to build the engine-side cache. The double
+	// parse is accepted: ValidateConfig must work standalone, and this runs
+	// only once per client construction.
 	for _, cidr := range cfg.Security.SSRFExemptCIDRs {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return fmt.Errorf("Security.SSRFExemptCIDRs: invalid CIDR %q: %w", cidr, err)
@@ -649,7 +667,9 @@ func ValidateConfig(cfg *Config) error {
 
 // parseSSRFExemptCIDRs parses and caches CIDR networks from SSRFExemptCIDRs.
 // Called after copyConfig (in validatedCopy) so the cache is stored on the
-// private copy, not the caller's original Config.
+// private copy, not the caller's original Config. ValidateConfig parses the
+// same strings independently (see the note there); this pass stores the
+// parsed *net.IPNet values for the engine.
 func (c *Config) parseSSRFExemptCIDRs() error {
 	if len(c.Security.SSRFExemptCIDRs) == 0 {
 		return nil

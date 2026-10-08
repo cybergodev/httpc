@@ -5,7 +5,6 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -14,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -518,7 +516,7 @@ func TestClient_PoolOperations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	t.Run("Request pool get/put", func(t *testing.T) {
 		req := client.getRequest()
@@ -613,28 +611,9 @@ func TestPoolLifecycle(t *testing.T) {
 	t.Run("JSONBuffer", func(t *testing.T) {
 		testBufferPoolLifecycle(t, getJSONBuffer, putJSONBuffer, maxJSONBufferSize)
 	})
-	t.Run("MIMEHeader", func(t *testing.T) {
-		t.Run("get and put", func(t *testing.T) {
-			h := getMIMEHeader()
-			if h == nil {
-				t.Fatal("getMIMEHeader returned nil")
-			}
-			h.Set("Content-Disposition", `form-data; name="field"`)
-			putMIMEHeader(h)
-		})
-
-		t.Run("put nil", func(t *testing.T) {
-			putMIMEHeader(nil) // should not panic
-		})
-
-		t.Run("oversize discarded", func(t *testing.T) {
-			h := getMIMEHeader()
-			for i := 0; i < 17; i++ {
-				h.Set("X-"+string(rune('A'+i)), "value")
-			}
-			putMIMEHeader(h) // len > 16 → discarded
-		})
-	})
+	// The MIMEHeader subtests were removed with the pool itself: Build's
+	// multipart encoding now writes part headers directly into the pooled
+	// buffer (see TestMultipartWireParity in pools_test.go).
 }
 
 // TestClient_IsClosed validates IsClosed reporting.
@@ -682,7 +661,7 @@ func TestClient_ClosedRequest(t *testing.T) {
 	}
 
 	// Close before making request
-	client.Close()
+	_ = client.Close()
 
 	_, err = client.Request(backgroundCtx, "GET", server.URL)
 	if err == nil {
@@ -690,53 +669,36 @@ func TestClient_ClosedRequest(t *testing.T) {
 	}
 }
 
-// TestPooledStringsReader validates strings reader pool behavior.
-func TestPooledStringsReader(t *testing.T) {
-	t.Run("Normal read", func(t *testing.T) {
-		reader := getPooledStringsReader("hello world")
-		data, err := io.ReadAll(reader)
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
-		if string(data) != "hello world" {
-			t.Errorf("Expected 'hello world', got %q", string(data))
-		}
-	})
-
-	t.Run("Read after EOF returns EOF", func(t *testing.T) {
-		reader := getPooledStringsReader("hi")
-		_, _ = io.ReadAll(reader)
-		// Second read should return EOF (reader is nil after first EOF)
-		p := make([]byte, 10)
-		_, err := reader.Read(p)
-		if err != io.EOF {
-			t.Errorf("Expected io.EOF on second read, got %v", err)
-		}
-	})
-}
-
-// TestPooledBytesReader validates bytes reader pool behavior.
-func TestPooledBytesReader(t *testing.T) {
-	t.Run("Normal read", func(t *testing.T) {
-		reader := getPooledBytesReader([]byte("byte data"))
-		data, err := io.ReadAll(reader)
-		if err != nil {
-			t.Errorf("Unexpected error: %v", err)
-		}
-		if string(data) != "byte data" {
-			t.Errorf("Expected 'byte data', got %q", string(data))
-		}
-	})
-
-	t.Run("Read after EOF returns EOF", func(t *testing.T) {
-		reader := getPooledBytesReader([]byte("x"))
-		_, _ = io.ReadAll(reader)
-		p := make([]byte, 10)
-		_, err := reader.Read(p)
-		if err != io.EOF {
-			t.Errorf("Expected io.EOF on second read, got %v", err)
-		}
-	})
+// TestPooledReaders_ReadEOF consolidates the former TestPooledStringsReader
+// and TestPooledBytesReader: normal reads deliver the full payload, and a
+// read after EOF returns io.EOF. The strings reader's release discipline
+// (pool return only in Close, never at EOF) is pinned separately by
+// TestPooledStringsReader_NoReleaseOnEOF in request_test.go.
+func TestPooledReaders_ReadEOF(t *testing.T) {
+	tests := []struct {
+		name   string
+		reader io.Reader
+		want   string
+	}{
+		{"strings reader", getPooledStringsReader("hello world"), "hello world"},
+		{"bytes reader", getPooledBytesReader([]byte("byte data")), "byte data"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			data, err := io.ReadAll(tt.reader)
+			if err != nil {
+				t.Fatalf("ReadAll error: %v", err)
+			}
+			if string(data) != tt.want {
+				t.Errorf("read %q, want %q", data, tt.want)
+			}
+			// Second read must return EOF (inner reader is nil after EOF).
+			p := make([]byte, 10)
+			if _, err := tt.reader.Read(p); err != io.EOF {
+				t.Errorf("read after EOF: got %v, want io.EOF", err)
+			}
+		})
+	}
 }
 
 // TestBuild_NilBody validates that nil body is handled without error.
@@ -1001,7 +963,7 @@ func TestReleaseLastResp(t *testing.T) {
 	t.Run("Non-nil response", func(t *testing.T) {
 		resp := getResponse()
 		resp.SetStatusCode(200)
-		var lastResp *Response = resp
+		var lastResp = resp
 		releaseLastResp(&lastResp)
 		if lastResp != nil {
 			t.Error("Expected pointer to be nil after release")
@@ -1083,7 +1045,7 @@ func TestClient_RetryOnServerErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	if err != nil {
@@ -1121,7 +1083,7 @@ func TestClient_OverrideMaxRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	retryOption := func(req *Request) error {
 		req.SetMaxRetries(2)
@@ -1141,76 +1103,151 @@ func TestClient_OverrideMaxRetries(t *testing.T) {
 // REDIRECT TESTS
 // ============================================================================
 
-// TestClient_RedirectFollowing validates redirect following behavior.
-func TestClient_RedirectFollowing(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/redirect":
-			http.Redirect(w, r, "/final", http.StatusFound)
-		case "/final":
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("final destination"))
-		}
-	}))
-	defer server.Close()
-
-	config := &Config{
-		Timeout:         30 * time.Second,
-		AllowPrivateIPs: true,
-		FollowRedirects: true,
-		MaxRetries:      0,
-		UserAgent:       "test/1.0",
+// TestClient_Redirects is the consolidated redirect behavior table (formerly
+// six standalone tests: RedirectFollowing, NoRedirectFollowing,
+// MultipleRedirects, MaxRedirectLimit, CircularRedirect, SSRSRedirectBlocked —
+// identical scaffolds differing only in handler, config, and expectation).
+func TestClient_Redirects(t *testing.T) {
+	tests := []struct {
+		name          string
+		handler       http.HandlerFunc
+		follow        bool
+		maxRedirects  int
+		blockPrivate  bool // SSRF protection on: redirect targets are validated
+		path          string
+		wantStatus    int    // asserted when wantErr is false
+		wantBody      string // asserted when non-empty
+		wantRedirects int    // asserted when wantErr is false
+		wantErr       bool
+		errContains   string // asserted when wantErr is true
+	}{
+		{
+			name: "single redirect is followed",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/redirect":
+					http.Redirect(w, r, "/final", http.StatusFound)
+				case "/final":
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte("final destination"))
+				}
+			},
+			follow: true, path: "/redirect",
+			wantStatus: 200, wantBody: "final destination", wantRedirects: 1,
+		},
+		{
+			name: "following disabled returns 302 as-is",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "/final", http.StatusFound)
+			},
+			follow: false, path: "/redirect",
+			wantStatus: http.StatusFound,
+		},
+		{
+			name: "multi-hop chain with mixed statuses",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/start":
+					http.Redirect(w, r, "/r1", http.StatusMovedPermanently)
+				case "/r1":
+					http.Redirect(w, r, "/r2", http.StatusFound)
+				case "/r2":
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte("final"))
+				}
+			},
+			follow: true, path: "/start",
+			wantStatus: 200, wantBody: "final", wantRedirects: 2,
+		},
+		{
+			name: "max redirect limit exceeded errors",
+			handler: func() http.HandlerFunc {
+				count := 0
+				return func(w http.ResponseWriter, r *http.Request) {
+					count++
+					if count <= 15 {
+						http.Redirect(w, r, fmt.Sprintf("/redirect/%d", count), http.StatusFound)
+						return
+					}
+					w.WriteHeader(http.StatusOK)
+				}
+			}(),
+			follow: true, maxRedirects: 3, path: "/start",
+			wantErr: true, errContains: "redirect",
+		},
+		{
+			name: "circular redirect is detected",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/a":
+					http.Redirect(w, r, "/b", http.StatusFound)
+				case "/b":
+					http.Redirect(w, r, "/a", http.StatusFound)
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			},
+			follow: true, path: "/a", // maxRedirects 0 = default limit
+			wantErr: true, errContains: "circular",
+		},
+		{
+			name: "redirect to private IP blocked under SSRF protection",
+			handler: func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/redirect-to-localhost" {
+					http.Redirect(w, r, "http://127.0.0.1:1/blocked", http.StatusFound)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+			},
+			follow: true, blockPrivate: true, path: "/redirect-to-localhost",
+			wantErr: true,
+		},
 	}
 
-	client, err := NewClient(config)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			server := httptest.NewServer(tt.handler)
+			defer server.Close()
 
-	resp, err := client.Request(backgroundCtx, "GET", server.URL+"/redirect")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if resp.StatusCode() != 200 {
-		t.Errorf("Expected status 200, got %d", resp.StatusCode())
-	}
-	if resp.Body() != "final destination" {
-		t.Errorf("Expected 'final destination', got %q", resp.Body())
-	}
-	if resp.RedirectCount() != 1 {
-		t.Errorf("Redirect count = %d, want 1", resp.RedirectCount())
-	}
-}
+			config := &Config{
+				Timeout:         30 * time.Second,
+				AllowPrivateIPs: !tt.blockPrivate,
+				FollowRedirects: tt.follow,
+				MaxRedirects:    tt.maxRedirects,
+				MaxRetries:      0,
+				UserAgent:       "test/1.0",
+			}
 
-// TestClient_NoRedirectFollowing validates disabling redirect following.
-func TestClient_NoRedirectFollowing(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/final", http.StatusFound)
-	}))
-	defer server.Close()
+			client, err := NewClient(config)
+			if err != nil {
+				t.Fatalf("Failed to create client: %v", err)
+			}
+			defer func() { _ = client.Close() }()
 
-	config := &Config{
-		Timeout:         30 * time.Second,
-		AllowPrivateIPs: true,
-		FollowRedirects: false,
-		MaxRetries:      0,
-		UserAgent:       "test/1.0",
-	}
-
-	client, err := NewClient(config)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	resp, err := client.Request(backgroundCtx, "GET", server.URL+"/redirect")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	// With FollowRedirects disabled, the 302 redirect response is returned as-is.
-	if resp.StatusCode() != http.StatusFound {
-		t.Errorf("Expected status %d (redirect not followed), got %d", http.StatusFound, resp.StatusCode())
+			resp, err := client.Request(backgroundCtx, "GET", server.URL+tt.path)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("Expected error, got nil")
+				}
+				if tt.errContains != "" && !strings.Contains(err.Error(), tt.errContains) {
+					t.Errorf("error %q does not contain %q", err, tt.errContains)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			defer ReleaseResponse(resp)
+			if resp.StatusCode() != tt.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode(), tt.wantStatus)
+			}
+			if tt.wantBody != "" && resp.Body() != tt.wantBody {
+				t.Errorf("body = %q, want %q", resp.Body(), tt.wantBody)
+			}
+			if resp.RedirectCount() != tt.wantRedirects {
+				t.Errorf("redirect count = %d, want %d", resp.RedirectCount(), tt.wantRedirects)
+			}
+		})
 	}
 }
 
@@ -1262,7 +1299,7 @@ func TestClient_OnRequestError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	errOption := func(req *Request) error {
 		req.SetOnRequest(func(r *Request) error {
@@ -1303,7 +1340,7 @@ func TestClient_ZeroTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	if err != nil {
@@ -1384,7 +1421,7 @@ func TestClient_WithCookieJar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	// First request: send a manual cookie, server sets server-cookie via jar.
 	cookieOption := func(req *Request) error {
@@ -1551,7 +1588,7 @@ func TestClient_ExecuteRetry_MaxReached(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	// After retries are exhausted, the server must have been hit exactly
@@ -1572,46 +1609,7 @@ func TestClient_ExecuteRetry_MaxReached(t *testing.T) {
 // MULTIPLE REDIRECT TEST
 // ============================================================================
 
-// TestClient_MultipleRedirects validates handling of multiple redirects.
-func TestClient_MultipleRedirects(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/start":
-			http.Redirect(w, r, "/r1", http.StatusMovedPermanently)
-		case "/r1":
-			http.Redirect(w, r, "/r2", http.StatusFound)
-		case "/r2":
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte("final"))
-		}
-	}))
-	defer server.Close()
-
-	config := &Config{
-		Timeout:         30 * time.Second,
-		AllowPrivateIPs: true,
-		FollowRedirects: true,
-		MaxRetries:      0,
-		UserAgent:       "test/1.0",
-	}
-
-	client, err := NewClient(config)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	resp, err := client.Request(backgroundCtx, "GET", server.URL+"/start")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
-	}
-	if resp.StatusCode() != 200 {
-		t.Errorf("Expected status 200, got %d", resp.StatusCode())
-	}
-	if resp.Body() != "final" {
-		t.Errorf("Expected 'final', got %q", resp.Body())
-	}
-}
+// TestClient_MultipleRedirects was folded into TestClient_Redirects above.
 
 // ============================================================================
 // REQUEST TIMEOUT OVERRIDE TEST
@@ -1636,7 +1634,7 @@ func TestClient_RequestTimeoutOverride(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	timeoutOption := func(req *Request) error {
 		req.SetTimeout(5 * time.Second)
@@ -1659,39 +1657,7 @@ func TestClient_RequestTimeoutOverride(t *testing.T) {
 // MAX REDIRECT LIMIT TEST
 // ============================================================================
 
-// TestClient_MaxRedirectLimit validates redirect count limit.
-func TestClient_MaxRedirectLimit(t *testing.T) {
-	redirectCount := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		redirectCount++
-		if redirectCount <= 15 {
-			http.Redirect(w, r, fmt.Sprintf("/redirect/%d", redirectCount), http.StatusFound)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	config := &Config{
-		Timeout:         30 * time.Second,
-		AllowPrivateIPs: true,
-		FollowRedirects: true,
-		MaxRedirects:    3,
-		MaxRetries:      0,
-		UserAgent:       "test/1.0",
-	}
-
-	client, err := NewClient(config)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	_, err = client.Request(backgroundCtx, "GET", server.URL+"/start")
-	if err == nil {
-		t.Error("Expected error due to max redirects exceeded")
-	}
-}
+// TestClient_MaxRedirectLimit was folded into TestClient_Redirects above.
 
 // ============================================================================
 // URL CACHE EVICTION TEST
@@ -1724,7 +1690,7 @@ func TestClient_NilOption(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -1771,7 +1737,7 @@ func TestClient_CustomRetryPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	if err != nil {
@@ -1826,7 +1792,7 @@ func TestClient_CustomRetryPolicy_NegativeMaxRetries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	resp, err := client.Request(backgroundCtx, "GET", server.URL)
 	if err != nil {
@@ -1893,7 +1859,7 @@ func TestClient_OptionError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1935,7 +1901,7 @@ func TestClient_PutWithBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	bodyOption := func(req *Request) error {
 		req.SetBody(map[string]string{"key": "value"})
@@ -1961,80 +1927,8 @@ func TestClient_PutWithBody(t *testing.T) {
 // CIRCULAR REDIRECT TEST
 // ============================================================================
 
-// TestClient_CircularRedirect validates circular redirect detection.
-func TestClient_CircularRedirect(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/a":
-			http.Redirect(w, r, "/b", http.StatusFound)
-		case "/b":
-			http.Redirect(w, r, "/a", http.StatusFound)
-		default:
-			w.WriteHeader(http.StatusOK)
-		}
-	}))
-	defer server.Close()
-
-	config := &Config{
-		Timeout:         30 * time.Second,
-		AllowPrivateIPs: true,
-		FollowRedirects: true,
-		MaxRedirects:    0, // Use default limit
-		MaxRetries:      0,
-		UserAgent:       "test/1.0",
-	}
-
-	client, err := NewClient(config)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	// A circular redirect must be detected and surface as an error rather than
-	// looping until the redirect cap silently truncates.
-	_, err = client.Request(backgroundCtx, "GET", server.URL+"/a")
-	if err == nil {
-		t.Fatal("Expected error for circular redirect, got nil")
-	}
-}
-
-// ============================================================================
-// SSRF PROTECTION REDIRECT TEST
-// ============================================================================
-
-// TestClient_SSRSRedirectBlocked validates that redirects to private IPs are blocked.
-func TestClient_SSRSRedirectBlocked(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/redirect-to-localhost":
-			http.Redirect(w, r, "http://127.0.0.1:1/blocked", http.StatusFound)
-		default:
-			w.WriteHeader(http.StatusOK)
-		}
-	}))
-	defer server.Close()
-
-	config := &Config{
-		Timeout:         30 * time.Second,
-		AllowPrivateIPs: false, // Enable SSRF protection
-		FollowRedirects: true,
-		MaxRetries:      0,
-		UserAgent:       "test/1.0",
-	}
-
-	client, err := NewClient(config)
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-	defer client.Close()
-
-	// The redirect target (127.0.0.1) is a private IP and SSRF protection is
-	// active, so the request must fail rather than follow the redirect.
-	_, err = client.Request(backgroundCtx, "GET", server.URL+"/redirect-to-localhost")
-	if err == nil {
-		t.Fatal("Expected error for redirect to private IP, got nil")
-	}
-}
+// TestClient_CircularRedirect and TestClient_SSRSRedirectBlocked were folded
+// into TestClient_Redirects (see the REDIRECT TESTS section above).
 
 // ============================================================================
 // MOCK TRANSPORT RETRY TESTS
@@ -2060,7 +1954,7 @@ func TestClient_MockTransportRetry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create client: %v", err)
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		resp, err := client.Request(context.Background(), "GET", "https://example.com")
 		if err != nil {
@@ -2091,7 +1985,7 @@ func TestClient_MockTransportRetry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create client: %v", err)
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		// Context canceled is non-retryable
 		mock.SetError(context.Canceled)
@@ -2120,7 +2014,7 @@ func TestClient_MockTransportRetry(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to create client: %v", err)
 		}
-		defer client.Close()
+		defer func() { _ = client.Close() }()
 
 		ctx := context.Background()
 		resp, err := client.Request(ctx, "GET", "https://example.com")
@@ -2143,80 +2037,18 @@ func TestClient_MockTransportRetry(t *testing.T) {
 // also carries the wrapped-ClientError (unwrap depth) rows.
 
 // ============================================================================
-// Task 1b: isRetryableSyscallError tests (0% coverage)
+// Task 1b/1c: isRetryableSyscallError / isRetryableDNSError
 // ============================================================================
 
-func TestIsRetryableSyscallError(t *testing.T) {
-	tests := []struct {
-		name     string
-		errno    syscall.Errno
-		expected bool
-	}{
-		{"ECONNREFUSED", syscall.ECONNREFUSED, true},
-		{"ECONNRESET", syscall.ECONNRESET, true},
-		{"EPIPE", syscall.EPIPE, true},
-		{"Non-retryable errno", syscall.EINVAL, false},
-	}
-
-	// Add platform-specific errno values
-	if errno, ok := lookupErrno("ETIMEDOUT"); ok {
-		tests = append(tests, struct {
-			name     string
-			errno    syscall.Errno
-			expected bool
-		}{"ETIMEDOUT", errno, true})
-	}
-	if errno, ok := lookupErrno("ENETUNREACH"); ok {
-		tests = append(tests, struct {
-			name     string
-			errno    syscall.Errno
-			expected bool
-		}{"ENETUNREACH", errno, true})
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := isRetryableSyscallError(tt.errno)
-			if got != tt.expected {
-				t.Errorf("isRetryableSyscallError(%v) = %v, want %v", tt.errno, got, tt.expected)
-			}
-		})
-	}
-}
-
-// lookupErrno tries to find a syscall errno by name using platform-specific values.
-func lookupErrno(name string) (syscall.Errno, bool) {
-	switch name {
-	case "ETIMEDOUT":
-		// Windows: WSAETIMEDOUT = 10060, Unix: ETIMEDOUT varies
-		for _, errno := range []syscall.Errno{syscall.ETIMEDOUT} {
-			if errno != 0 {
-				return errno, true
-			}
-		}
-	case "ENETUNREACH":
-		for _, errno := range []syscall.Errno{syscall.ENETUNREACH} {
-			if errno != 0 {
-				return errno, true
-			}
-		}
-	}
-	return 0, false
-}
-
-// ============================================================================
-// Task 1c: isRetryableDNSError additional case (non-DNSError cause)
-// ============================================================================
-
-func TestIsRetryableDNSError_NonDNSCause(t *testing.T) {
-	err := &ClientError{
-		Type:  ErrorTypeDNS,
-		Cause: errors.New("not a DNS error"),
-	}
-	if err.IsRetryable() {
-		t.Error("Expected non-retryable for non-DNSError cause in DNS type")
-	}
-}
+// TestIsRetryableSyscallError was removed: its POSIX-constant rows are
+// unreliable on Go 1.25+ Windows (see the comment on
+// TestIsRetryableSyscallError_WSAErrno in errors_test.go, which carries the
+// platform-correct superset, including the non-retryable negative row).
+//
+// TestIsRetryableDNSError_NonDNSCause was removed: the same contract
+// (ErrorTypeDNS + non-DNSError cause → not retryable) is the
+// "DNS permanent is not retryable" row of TestClientError_IsRetryable
+// (errors_test.go).
 
 // ============================================================================
 // Task 2: Streaming body tests (0% coverage)
@@ -2240,7 +2072,7 @@ func TestStreamingBody(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	t.Run("SetStreamBody true returns raw body reader", func(t *testing.T) {
 		streamOption := func(req *Request) error {
@@ -2333,7 +2165,7 @@ func TestStreamingBody_ExceedsLimit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewClient failed: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
